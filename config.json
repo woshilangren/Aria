@@ -1,0 +1,32 @@
+{
+  "llm": {
+    "temperature": 0.8,
+    "max_tokens": 1024,
+    "fallback": {
+      "max_errors": 2
+    },
+    "enable_thinking": false
+  },
+  "memory": {
+    "max_turns_short_term": 12,
+    "recall_top_k": 5,
+    "portrait_tag_limit": 20,
+    "profile_confidence_threshold": 0.6,
+    "persona_decay_days": 14,
+    "diary_max_entries": 30,
+    "session_update_interval": 5
+  },
+  "proactive": {
+    "idle_minutes": 30
+  },
+  "tools": {
+    "max_retry": 2,
+    "max_tool_loop_rounds": 4
+  },
+  "personality": {
+    "quirk_rate": 0.12
+  },
+  "log": {
+    "level": "INFO"
+  }
+}

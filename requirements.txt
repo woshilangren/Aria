@@ -1,0 +1,27 @@
+# ===== Web 服务与界面（交互层）=====
+fastapi
+uvicorn[standard]
+gradio
+websockets
+
+# ===== 编排（调度层）=====
+langgraph
+
+# ===== 向量记忆（工具层 / 数据层）=====
+chromadb
+
+# ===== 数据模型与配置（基础设施）=====
+pydantic
+python-dotenv
+
+# ===== 语音 / 向量 / 画图（dashscope SDK，百炼原生接口那一族全靠它）=====
+dashscope
+
+# ===== HTTP 客户端（工具层调用外部 API：天气/搜索/图片生成）=====
+httpx
+
+# ===== 联网搜索兜底（ddgs，DuckDuckGo，不要 key）=====
+ddgs
+
+# ===== LLM SDK（OpenAI 兼容接口连 GLM 等）=====
+openai

@@ -1,0 +1,17 @@
+# 密钥与本地数据（绝不允许上传到 GitHub）
+.env
+
+# 运行时生成的数据（记忆库是私人数据，也不该公开）
+storage/
+logs/
+
+# Python 运行产物
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+
+# IDE 本地配置
+.vscode/
+.idea/
