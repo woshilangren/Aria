@@ -17,6 +17,10 @@ dashscope
 # ===== HTTP 客户端（工具层调用外部 API：天气/搜索/图片生成）=====
 httpx
 
+# ===== 本地 CA + HTTPS 证书（tools/certgen.py）=====
+# 缺了它 ensure_cert() 会静默降级成纯 HTTP：HTTPS 和手机 PWA 直接失效，很难发现
+cryptography
+
 # ===== 联网搜索兜底（ddgs，DuckDuckGo，不要 key）=====
 ddgs
 

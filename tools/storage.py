@@ -33,18 +33,29 @@ class VectorStoreTool:
     """
 
     def __init__(self):
-        cfg = get_settings()
+        # 构造只做便宜且无副作用的事：建 client 和 embedder。
+        # 建集合（可能触发"换模型 -> 删库重建"的重活）挪到 ensure_ready()，
+        # 由组合根显式调一次——否则任何人 new 一下都可能悄悄删库，这是个陷阱。
         self._chroma = ChromaClient()
         self._embedder = QwenEmbedding()
         self._cols = {}  # 集合名 -> Collection，用的时候现取
+
+    def ensure_ready(self) -> None:
+        """建好两个集合（含维度守护），由组合根在装配时显式调用一次。
+
+        与改造前的行为等价：都在 lifespan startup 阶段跑一次；区别只是
+        "隐式藏在构造函数里"变成"组合根里看得见、grep 得到的一步"。
+        """
+        cfg = get_settings()
         # key 没配（还是占位符）或 Chroma 挂了，都降级成"记忆不可用"，聊天不受影响
         has_key = bool(cfg.embedding_api_key) and not cfg.embedding_api_key.startswith("your-")
-        if self._chroma.available and has_key:
-            for name in (_DISTILLED_COLLECTION, _DIARY_COLLECTION):
-                try:
-                    self._cols[name] = self._ensure_collection(name, cfg)
-                except Exception as exc:
-                    print(f"[memory] 集合 {name} 初始化失败，暂时不可用: {exc}")
+        if not (self._chroma.available and has_key):
+            return
+        for name in (_DISTILLED_COLLECTION, _DIARY_COLLECTION):
+            try:
+                self._cols[name] = self._ensure_collection(name, cfg)
+            except Exception as exc:
+                print(f"[memory] 集合 {name} 初始化失败，暂时不可用: {exc}")
 
     def _col_of(self, collection_name: str):
         """拿某个集合，没建出来（初始化失败/降级中）就返回 None。"""
@@ -252,6 +263,25 @@ class VectorStoreTool:
             return False
 
 
+# KV 路由表：store 名 -> (读函数, 写函数)。read/write 都走这张表，加新存储只改这里。
+#
+# 注意：read 和 write 的 key 集合**故意不对称**，别顺手"对齐"成一样：
+#   - read 有 persona_config、write 没有 —— 因为 persona_config 的正主是
+#     data/persona_config.json，人设配置本来就不该经 KV 写入，只许读。
+#   - read 里的 image 是"列出全部图片"（无 key 概念），write 是"存一张"，
+#     两边语义本就不是一对，所以写函数签名上留了 value。
+# 真要新加可写的存储，请同时确认它是不是也有"正主在别处"的问题。
+_KV_DISPATCH = {
+    "profile": ("_profile", True),
+    "portrait": ("_portrait", True),
+    "relationship": ("_relationship", True),
+    "session": ("_session", True),
+    "image": ("_image", True),
+    "route_config": ("_route", True),
+    "persona_config": ("_persona_config", False),  # 只读：正主在 data/persona_config.json
+}
+
+
 class KVStoreTool:
     """各类 JSON 存储的统一入口，按 store 名字路由到对应的 Store。"""
 
@@ -266,39 +296,35 @@ class KVStoreTool:
         self._persona_config = PersonaConfigStore()
 
     def read(self, store: str, key: str, default=None):
-        if store == "profile":
-            return self._profile.load(key)
-        if store == "portrait":
-            return self._portrait.load(key)
-        if store == "relationship":
-            return self._relationship.load(key)
+        entry = _KV_DISPATCH.get(store)
+        if entry is None:
+            return default
+        attr, _writable = entry
+        target = getattr(self, attr)
+        # session 是聊天记录：按条存，读的时候取最近 20 条（要自定义条数走 recent_chat）
         if store == "session":
-            # 聊天记录按条存，读的时候取最近 20 条
-            return self._session.get_recent(key, 20)
-        if store == "route_config":
-            return self._route.load(key)
-        if store == "persona_config":
-            return self._persona_config.load()
+            return target.get_recent(key, 20)
+        # image 是列表式资源：读即列出全部，没有 key 的概念
         if store == "image":
-            return self._image.list_images()
-        return default
+            return target.list_images()
+        # persona_config 整包一份，没有 key
+        if store == "persona_config":
+            return target.load()
+        return target.load(key)
 
     def write(self, store: str, key: str, value) -> bool:
-        if store == "profile":
-            self._profile.save(key, value)
-        elif store == "portrait":
-            self._portrait.save(key, value)
-        elif store == "relationship":
-            self._relationship.save(key, value)
-        elif store == "session":
-            # value 是一条记录的 dict，进来就追加
-            self._session.append(key, DialogueRecord(**value))
-        elif store == "image":
-            self._image.save(value)
-        elif store == "route_config":
-            self._route.save(key, value)
-        else:
+        entry = _KV_DISPATCH.get(store)
+        # 未知 store、或表里标明只读的（persona_config），一律拒绝
+        if entry is None or not entry[1]:
             return False
+        target = getattr(self, entry[0])
+        if store == "session":
+            # value 是一条记录的 dict，进来就追加
+            target.append(key, DialogueRecord(**value))
+        elif store == "image":
+            target.save(value)
+        else:
+            target.save(key, value)
         return True
 
     def log(self, entry: dict) -> None:

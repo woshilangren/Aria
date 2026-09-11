@@ -550,7 +550,9 @@ async function resetAvatar() {
 }
 
 const $ = id => document.getElementById(id);
-const esc = s => (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+// 单引号也要转义：esc 的结果会被塞进单引号包起来的 JS 字符串里
+// （如 onclick="saveProfile('${field}')"），漏了 ' 就是一个注入面
+const esc = s => (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const nowT = () => { const d = new Date(); const p = n => String(n).padStart(2,"0"); return p(d.getHours()) + ":" + p(d.getMinutes()); };
 // 历史里的时间戳是 ISO（带 T），格式化成「M.d HH:MM」，去 T、与实时条一致
 function fmtTime(s) {

@@ -17,6 +17,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 import wave
 
 import dashscope
@@ -24,6 +25,17 @@ from dashscope.audio.asr import Recognition, RecognitionCallback
 from dashscope.audio.tts_v2 import SpeechSynthesizer
 
 from config.settings import get_settings
+
+# dashscope 的 key 是模块级全局（dashscope.api_key），而这版 SDK 的
+# Recognition / SpeechSynthesizer 构造函数都不收 key，只能在调用前设全局。
+# ASR 和 TTS 各配各的 key（ASR_API_KEY / TTS_API_KEY），两者又都跑在
+# asyncio.to_thread 里 —— 并发时后设的 key 会覆盖先设的，先那个请求就拿到错 key。
+# 所以"设 key + 发起调用"必须整段串行：只锁赋值不够，锁在调用返回前都得拿着。
+#
+# 代价：所有 dashscope 调用被串行化，ASR 和 TTS 也会互相等。
+# 对单用户应用可接受（语音交互本来就是一轮一轮来的）；
+# 真要并发上去，得换成每个请求独立 client（SDK 支持了再改这里，只动这一处）。
+_DASHSCOPE_LOCK = threading.Lock()
 
 # 情绪标签白名单：prompt 里给过示例（开心/得意/生气/难过），再补几个常见的语气词。
 # 收紧成白名单的好处：正文里的 [1]（如"第[1]点"）和普通括号（如"他（我朋友）"）
@@ -128,7 +140,6 @@ class ASRTool:
         if not _has_key(cfg.asr_api_key):
             raise RuntimeError("语音识别服务没配置（ASR_API_KEY）")
         # 这版 SDK 的 key 不走构造参数，走全局设置（和 TTS 同一套路，调用前各设各的）
-        dashscope.api_key = cfg.asr_api_key
         # 格式判定：显式参数 > 魔数嗅探 > 文件名后缀
         fmt = (fmt or "").lower().strip() or sniff_audio_format(audio) or (
             filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
@@ -149,13 +160,16 @@ class ASRTool:
         try:
             tmp.write(audio)
             tmp.close()
-            recognition = Recognition(
-                model=cfg.asr_model,
-                callback=_QuietCallback(),
-                format=fmt,
-                sample_rate=sr,
-            )
-            result = recognition.call(file=tmp.name)
+            # 设 key -> 构造 -> 发起调用，整段持锁（见 _DASHSCOPE_LOCK 的注释）
+            with _DASHSCOPE_LOCK:
+                dashscope.api_key = cfg.asr_api_key
+                recognition = Recognition(
+                    model=cfg.asr_model,
+                    callback=_QuietCallback(),
+                    format=fmt,
+                    sample_rate=sr,
+                )
+                result = recognition.call(file=tmp.name)
             return _extract_text(result.get_sentence() if result else None)
         finally:
             try:
@@ -187,7 +201,6 @@ class TTSTool:
                 bits.append("，" + "，".join(desc))
             instruction = "".join(bits)
         # 这版 SDK 的合成器构造函数不收 key，key 走全局设置
-        dashscope.api_key = cfg.tts_api_key
         kwargs = {
             "model": cfg.tts_model,
             "voice": cfg.tts_voice or _DEFAULT_VOICE,
@@ -195,5 +208,8 @@ class TTSTool:
         # 情绪指令可选：比如"用轻快的语气，压低声音"，不传就正常念
         if instruction:
             kwargs["instruction"] = instruction
-        synthesizer = SpeechSynthesizer(**kwargs)
-        return synthesizer.call(clean)
+        # 设 key -> 构造 -> 发起调用，整段持锁（见 _DASHSCOPE_LOCK 的注释）
+        with _DASHSCOPE_LOCK:
+            dashscope.api_key = cfg.tts_api_key
+            synthesizer = SpeechSynthesizer(**kwargs)
+            return synthesizer.call(clean)

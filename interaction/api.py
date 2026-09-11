@@ -633,8 +633,17 @@ async def health() -> dict:
     return {"status": "ok", "services": status}
 
 
-# ---------- 头像管理：读写 storage/avatar.json ----------
-_AVATAR_FILE = Path(__file__).resolve().parent.parent / "storage" / "avatar.json"
+# ---------- 头像管理：读写 DATA_DIR/avatar.json ----------
+def _avatar_file() -> Path:
+    """头像文件路径，跟着 DATA_DIR 走。
+
+    不能硬编码 `Path(__file__).../storage/`——那样配了 DATA_DIR 就会读写错目录：
+    读读不到、写写到别处，还很难发现。这里用函数而不是模块级常量，
+    是为了在真正用的那一刻才取配置（常量在 import 时就定型了）。
+    """
+    from config.settings import get_settings
+
+    return get_settings().data_dir / "avatar.json"
 
 
 class _AvatarUpdate(BaseModel):
@@ -642,9 +651,10 @@ class _AvatarUpdate(BaseModel):
 
 
 def _read_avatar(default: str = "") -> dict:
+    path = _avatar_file()
     try:
-        if _AVATAR_FILE.exists():
-            return json.loads(_AVATAR_FILE.read_text(encoding="utf-8"))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {"avatar_url": default}
@@ -658,10 +668,11 @@ async def get_avatar() -> dict:
 
 @system_router.put("/avatar")
 async def set_avatar(payload: _AvatarUpdate) -> dict:
-    """设置角色的头像 URL。URL 会存进 storage/avatar.json，下次启动也记得。"""
+    """设置角色的头像 URL。URL 会存进 DATA_DIR/avatar.json，下次启动也记得。"""
     data = {"avatar_url": (payload.avatar_url or "").strip()}
-    _AVATAR_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _AVATAR_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = _avatar_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "avatar_url": data["avatar_url"]}
 
 

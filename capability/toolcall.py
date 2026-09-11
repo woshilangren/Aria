@@ -204,6 +204,24 @@ class ToolCallOrchestrator:
             )
 
             # 工具结果用普通文本回填，不走 tool role，兼容 GLM 这类接口
+            #
+            # ===== 这是一个有意取舍，不是写漏了，别顺手"修"成标准写法 =====
+            # 标准写法是 {"role": "tool", "tool_call_id": <id>, "content": ...}，
+            # 但当前接的 GLM 接口不吃 role:"tool"，传过去会直接报错，
+            # 所以这里把结果降级成一条 role:"user" 的普通文本塞回去。
+            #
+            # 代价（已知，接受）：
+            #   1. 丢掉了 call_id。模型看不出"这条结果对应哪次调用"，
+            #      多轮多工具时它可能重复调同一个工具，或把结果张冠李戴。
+            #   2. llm_client.py:128 只取首个 tool_calls（resp["tool_calls"][0]），
+            #      模型一次想调多个工具时，后面的会被丢掉。
+            # 这两条对现有场景（单用户、一轮基本一个工具）够用，所以留着。
+            #
+            # 将来要换成标准 tool role，动这三处：
+            #   1. 这里：messages.append 改成 role:"tool" + tool_call_id；
+            #   2. llm_client.py：chat_with_tools 要把 call_id 从响应里取出来往回传
+            #      （现在 resp 里根本没有这个字段），并且别再只取 [0]；
+            #   3. 确认目标模型真的支持 tool role —— 换成 OpenAI 系就可以，GLM 不行。
             messages.append(
                 {"role": "assistant", "content": f"[调用工具 {spec.tool_name}]"}
             )

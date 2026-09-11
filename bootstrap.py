@@ -28,13 +28,26 @@ def bootstrap() -> None:
     except Exception as exc:
         services.mark_error("logger", str(exc))
 
+    # kv_store 和 vector_store 各走各的 try：以前两个共用同一个 try，
+    # vector_store 初始化一失败就把 kv_store 一起带走，等于全部持久化失效。
     try:
-        from tools.storage import KVStoreTool, VectorStoreTool
+        from tools.storage import KVStoreTool
 
         services.register("kv_store", KVStoreTool())
-        services.register("vector_store", VectorStoreTool())
     except Exception as exc:
         services.mark_error("kv_store", str(exc))
+
+    try:
+        from tools.storage import VectorStoreTool
+
+        vector_store = VectorStoreTool()
+        services.register("vector_store", vector_store)
+        # 建集合（含"换模型 -> 删库重建"的维度守护）显式做一次。
+        # 构造函数里只建 client/embedder，免得任何人 new 一下就悄悄触发重建。
+        # 时机与改造前一致（都在 lifespan startup），所以不是行为变化。
+        vector_store.ensure_ready()
+    except Exception as exc:
+        services.mark_error("vector_store", str(exc))
 
     try:
         from tools.registry import ToolExecutor, ToolRegistry

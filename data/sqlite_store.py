@@ -194,11 +194,19 @@ class SQLiteStorage:
 
 # 全项目共用一个 SQLite 连接，别到处 new
 _db: Optional[SQLiteStorage] = None
+_db_lock = threading.Lock()
 
 
 def get_db() -> SQLiteStorage:
-    """懒加载单例：第一次用时建库建表，之后一直用同一份连接。"""
+    """懒加载单例：第一次用时建库建表，之后一直用同一份连接。
+
+    双重检查锁：首次并发调用时，只判一次空会建出两份连接（各写各的、互相覆盖），
+    所以拿到锁之后必须再判一次空。锁只在"还没建好"这条路上生效，
+    建好之后的每次调用都只是读一次全局变量，不进锁。
+    """
     global _db
     if _db is None:
-        _db = SQLiteStorage()
+        with _db_lock:
+            if _db is None:
+                _db = SQLiteStorage()
     return _db
