@@ -9,6 +9,8 @@
 """
 
 import re
+import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -20,27 +22,53 @@ from tools.misc import ClockTool, parse_llm_json
 
 
 class SessionMemoryKeeper:
-    """短期记忆管家：一个会话一份上下文，原文放内存里。"""
+    """短期记忆管家：一个会话一份上下文，原文放内存里。
+
+    线程安全：append/get_context/restore/reset 会被不同线程（主图节点跑在
+    asyncio/线程池里）并发调用，对三张字典的读写统一在同一把锁下完成；
+    LLM 摘要这种慢调用一律放到锁外做，避免把会话串行化。
+    另带会话上限 + LRU 淘汰，避免多会话长跑时内存只增不减。
+    """
 
     def __init__(self):
         cfg = load_app_config()["memory"]
         self._max_turns = cfg["max_turns_short_term"]
+        self._max_sessions = int(cfg.get("max_sessions", 8) or 8)
         self._contexts = {}   # session_id -> [{"role","content"}, ...]
         self._summaries = {}  # session_id -> 被挤出去的旧对话浓缩成的摘要
+        self._touched = {}    # session_id -> 最后被碰的单调时刻，LRU 淘汰用
+        self._lock = threading.Lock()
+
+    def _evict_locked(self) -> None:
+        """会话数超上限时淘汰最久未碰的那个，三张字典一起清。要求已持锁。"""
+        while len(self._contexts) > self._max_sessions:
+            victim = min(self._contexts, key=lambda k: self._touched.get(k, 0.0))
+            self._contexts.pop(victim, None)
+            self._summaries.pop(victim, None)
+            self._touched.pop(victim, None)
 
     def append(self, session_id: str, role: str, text: str) -> None:
         if not text:
             return
-        context = self._contexts.setdefault(session_id, [])
-        context.append({"role": role, "content": text})
-        if len(context) > self._max_turns:
-            self._roll_over(session_id, context)
+        old_part = None
+        with self._lock:
+            context = self._contexts.setdefault(session_id, [])
+            context.append({"role": role, "content": text})
+            self._touched[session_id] = time.monotonic()
+            # 超长就把最老的一半摘出来；锁内只做截断，LLM 摘要放到锁外
+            if len(context) > self._max_turns:
+                cut = len(context) // 2
+                old_part = context[:cut]
+                self._contexts[session_id] = context[cut:]
+            self._evict_locked()
+        if old_part:
+            self._summarize(session_id, old_part)
 
-    def _roll_over(self, session_id: str, context: list) -> None:
-        """太长了就把最老的一半交给模型压成摘要，上下文才不会越滚越大。"""
-        cut = len(context) // 2
-        old_part = context[:cut]
-        self._contexts[session_id] = context[cut:]
+    def _summarize(self, session_id: str, old_part: list) -> None:
+        """把被挤出去的旧对话压成摘要。慢调用在锁外做，做完再持锁写回。
+
+        持锁做模型调用会把所有会话串行化，比不加锁还糟，所以这里先放开锁。
+        """
         old_text = "\n".join(f"{m['role']}: {m['content']}" for m in old_part)
         try:
             got = services.get("llm").chat(
@@ -51,37 +79,57 @@ class SessionMemoryKeeper:
                 temperature=0.3,
                 max_tokens=200,
             )
+        except Exception:
+            return  # 摘要失败就丢掉最老的一半，聊天不能停
+        with self._lock:
+            # 写回时以锁内最新值为准（期间别的线程可能已写入新摘要），避免丢更新
             summary = self._summaries.get(session_id, "")
             self._summaries[session_id] = f"{summary}\n{got}".strip() if summary else got
-        except Exception:
-            pass  # 摘要失败就丢掉最老的一半，聊天不能停
 
     def get_context(self, session_id: str) -> list:
-        """喂给模型的上下文：摘要放最前面（如果有），后面跟最近几轮原文。"""
+        """喂给模型的上下文：摘要放最前面（如果有），后面跟最近几轮原文。
+
+        返回副本（连内部字典元素也各复制一份），调用方在外面切片/遍历/改写都不影响内部。
+        """
+        with self._lock:
+            self._touched[session_id] = time.monotonic()
+            summary = self._summaries.get(session_id, "")
+            session_msgs = [dict(m) for m in self._contexts.get(session_id, [])]
         messages = []
-        summary = self._summaries.get(session_id, "")
         if summary:
             messages.append({"role": "system", "content": f"【之前聊过的内容，摘要】\n{summary}"})
-        messages.extend(self._contexts.get(session_id, []))
+        messages.extend(session_msgs)
         return messages
 
     def restore(self, session_id: str) -> None:
-        """进程重启后把上次的聊天记录捞回来，不然每次重启都失忆。"""
-        if self._contexts.get(session_id):
-            return  # 内存里已经有了就不用折腾
+        """进程重启后把上次的聊天记录捞回来，不然每次重启都失忆。
+
+        读库是磁盘动作，放到锁外；只在读写字典时持锁（与 append 同一原则）。
+        """
+        with self._lock:
+            if self._contexts.get(session_id):
+                return  # 内存里已经有了就不用折腾
         try:
             records = services.get("kv_store").read("session", session_id) or []
-            self._contexts[session_id] = [
-                {"role": r.get("role", "user"), "content": r.get("text", "")}
-                for r in records[-self._max_turns:]
-                if r.get("text")
-            ]
         except Exception:
-            pass
+            return
+        restored = [
+            {"role": r.get("role", "user"), "content": r.get("text", "")}
+            for r in records[-self._max_turns:]
+            if r.get("text")
+        ]
+        with self._lock:
+            if self._contexts.get(session_id):
+                return  # 期间别的线程已经恢复了，别覆盖
+            self._contexts[session_id] = restored
+            self._touched[session_id] = time.monotonic()
+            self._evict_locked()
 
     def reset(self, session_id: str) -> None:
-        self._contexts.pop(session_id, None)
-        self._summaries.pop(session_id, None)
+        with self._lock:
+            self._contexts.pop(session_id, None)
+            self._summaries.pop(session_id, None)
+            self._touched.pop(session_id, None)
 
 
 class MemoryRecaller:

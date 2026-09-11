@@ -5,6 +5,7 @@
 """
 
 import json
+import time
 
 from openai import OpenAI
 
@@ -13,9 +14,6 @@ from config.settings import get_settings, load_app_config
 
 class LLMClient:
     """对话补全、带工具的补全，都从这走。主模型挂了备用顶上。"""
-
-    # 粘住备用后，每这么多次请求放行一次主模型，试探它恢复了没有
-    _PROBE_INTERVAL = 20
 
     def __init__(self):
         cfg = get_settings()
@@ -41,10 +39,13 @@ class LLMClient:
             self._fallback = None
             self._fallback_model = ""
 
-        # 降级状态：主模型连挂 max_errors 次就粘住备用，省得每次白等 60 秒超时
-        self._max_errors = load_app_config()["llm"].get("fallback", {}).get("max_errors", 2)
+        # 降级状态：主模型连续失败达到 max_errors 次就打开熔断（记下打开时刻），
+        # 冷却期内彻底不碰主模型，省得每次白等 60 秒超时；冷却到期半开放行一次
+        fb_cfg = load_app_config()["llm"].get("fallback", {})
+        self._max_errors = fb_cfg.get("max_errors", 2)
+        self._cooldown = float(fb_cfg.get("cooldown_seconds", 30) or 30)
         self._error_count = 0
-        self._request_count = 0
+        self._opened_at: float | None = None  # 熔断打开时刻（单调时钟），None=未打开
 
     # ---------- 内部：统一的主备切换，切换逻辑只写这一遍 ----------
     def _complete(self, **kwargs) -> object:
@@ -52,28 +53,34 @@ class LLMClient:
 
         返回原始响应对象，取 content 还是 tool_calls 由调用方自己决定。
         """
-        self._request_count += 1
         last_error = None
 
-        # 主模型健康、或粘住备用后撞上探测周期，就试主模型。
-        # Qwen3 系非流式调用必须关思考模式，不然官方直接拒绝请求
-        should_try_primary = (
-            self._error_count < self._max_errors
-            or self._request_count % self._PROBE_INTERVAL == 0
+        # 熔断是否仍处于打开状态：打开且未到冷却 → 直接走备用，连主模型都不碰
+        # （这是修掉“冷却期里还白等主模型 60 秒超时”的关键）
+        circuit_open = (
+            self._opened_at is not None
+            and (time.monotonic() - self._opened_at) < self._cooldown
         )
-        if should_try_primary:
-            # 思考深度从 config.json 读，前端「设置」里随时可切，不用重启
+
+        if not circuit_open:
+            # 正常态每次都试主模型；半开态（冷却到期）也只放行这一次探测。
+            # Qwen3 系非流式调用必须关思考模式，不然官方直接拒绝请求
             thinking = load_app_config()["llm"].get("enable_thinking", False)
             kwargs.setdefault("extra_body", {"enable_thinking": thinking})
             try:
                 resp = self._client.chat.completions.create(**kwargs)
+                # 成功即闭合：清空错误计数、清掉熔断时刻
                 self._error_count = 0
+                self._opened_at = None
                 return resp
             except Exception as exc:
                 self._error_count += 1
                 last_error = exc
                 # 静默降级会让"主模型 key 失效"这种事藏好几个星期没人发现，至少喊一声
                 print(f"[llm] 主模型调用失败({self._error_count}/{self._max_errors})，走备用：{exc}")
+                if self._error_count >= self._max_errors:
+                    # 连续失败到阈值：打开熔断；半开再次失败时也会走到这，等于刷新打开时刻
+                    self._opened_at = time.monotonic()
 
         # 备用顶上：GLM-5 系是"始终思考"模型，不吃 enable_thinking，摘掉换
         # thinking_effort=low——实测能把每条回复的推理开销砍半（500→250 上下），

@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import hmac
 import json
 from pathlib import Path
 
@@ -325,7 +326,9 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     raw = file.filename or "file"
     safe_ext = Path(raw).suffix.lower()
     # 只放行常见图片和文档后缀，避免传上来奇怪的脚本
-    allowed = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+    # 特别注意不放行 .svg：SVG 能内嵌 <script>，存成静态文件后被浏览器同源执行会读走
+    # localStorage 里的口令（存储型 XSS），所以直接从白名单里掐掉
+    allowed = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
                ".pdf", ".txt", ".md", ".doc", ".docx", ".xls", ".xlsx", ".csv"}
     if safe_ext not in allowed:
         return {"ok": False, "error": f"不支持的文件类型：{safe_ext or '（无后缀）'}"}
@@ -769,7 +772,9 @@ class _TokenGuard:
     # 静态资源路径免鉴权（头像/PWA图标/CA证书等，浏览器加载时不可能带自定义 header）。
     # 根路径 "/" 也放行：要返回前端壳 HTML，PWA standalone 启动才能加载出 JS，
     # 之后 JS 再弹口令框登录；数据/语音/记忆等接口仍强制鉴权。
-    _PUBLIC_PATHS = ("/static/", "/uploads/", "/ca.crt", "/manifest.json", "/sw.js")
+    # 注意 /uploads/ 不在免鉴权之列：上传文件可能含私人内容，必须凭口令访问
+    # （前端给 <img>/<a> 拼 ?token=，见 index.html 的 _withToken）。
+    _PUBLIC_PATHS = ("/static/", "/ca.crt", "/manifest.json", "/sw.js")
 
     async def __call__(self, scope, receive, send):
         path = scope.get("path", "")
@@ -789,14 +794,19 @@ class _TokenGuard:
             if k == b"x-access-token":
                 got = v.decode("utf-8", "ignore")
                 break
-        if not got:
+        # 查询串 token 只放行两类：WebSocket 握手（沿用既有约定，前端 WS 走查询串传 token），
+        # 以及 /uploads/（<img>/<a> 加载时无法带自定义请求头，只能靠查参）。
+        # 其它路径（含所有 /api/*）只认 X-Access-Token 头，免得口令进访问日志和 Referer。
+        if not got and (scope["type"] == "websocket" or path.startswith("/uploads/")):
             qs = scope.get("query_string", b"").decode("utf-8", "ignore")
             for part in qs.split("&"):
                 if part.startswith("token="):
                     got = part[6:]
                     break
 
-        if got == token:
+        # 常量时间比较，别用 == 逐字符比（会泄露口令长度/前缀）；两边先 encode，
+        # 非 ASCII 口令也不会因为 str/bytes 混比抛异常
+        if hmac.compare_digest(got.encode("utf-8"), token.encode("utf-8")):
             await self.app(scope, receive, send)
             return
 
@@ -808,6 +818,19 @@ class _TokenGuard:
 
             resp = JSONResponse({"detail": "需要访问口令"}, status_code=401)
             await resp(scope, receive, send)
+
+
+class _NosniffStaticFiles(StaticFiles):
+    """给静态文件的每个响应补 X-Content-Type-Options: nosniff。
+
+    即便上传目录里混入了可被当作脚本解析的文件，浏览器也不会凭内容嗅探去执行它。
+    StaticFiles 不方便按目录统一加头，覆盖 file_response 是最小的改法。
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
 
 
 def build_app() -> FastAPI:
@@ -832,7 +855,7 @@ def build_app() -> FastAPI:
         # 上传文件目录，前端/回传通过 /uploads/xxx 访问
         _up_dir = get_settings().data_dir / "uploads"
         _up_dir.mkdir(parents=True, exist_ok=True)
-        app.mount("/uploads", StaticFiles(directory=str(_up_dir)), name="uploads")
+        app.mount("/uploads", _NosniffStaticFiles(directory=str(_up_dir)), name="uploads")
         # 根路径 → 新前端。no-store：前端改版后手机浏览器不许再拿缓存的旧页面，
         # 旧版采集的音频格式后端已经不认了，页面落后一个版本语音就是"没反应"
         @app.get("/", include_in_schema=False)

@@ -474,6 +474,15 @@ window.fetch = function (input, init) {
   });
 };
 
+// 给 /uploads/ 资源拼上口令查询串：<img>/<a> 加载时没法带 X-Access-Token 头，只能走查参。
+// 没配口令（localStorage 里没有 token）时不拼，避免拼出空的 ?token=。
+function _withToken(url) {
+  const t = localStorage.getItem("ariaToken") || "";
+  return (t && typeof url === "string" && url.indexOf("/uploads/") === 0)
+    ? url + "?token=" + encodeURIComponent(t)
+    : url;
+}
+
 // ========== Config ==========
 // 默认头像用本地文件：之前走 trae-api 在线文生图，每次打开都现场"画"一张，
 // PWA 冷启动慢的元凶就是它。用户设置过头像后仍会被远端配置覆盖
@@ -482,7 +491,7 @@ const IMG = {
   gem: "/static/gem-default.png"
 };
 function applyAvatar(url) {
-  document.querySelectorAll("[data-av=aria]").forEach(el => { el.src = url || IMG.aria; });
+  document.querySelectorAll("[data-av=aria]").forEach(el => { el.src = url ? _withToken(url) : IMG.aria; });
 }
 document.querySelectorAll("[data-av=gem]").forEach(el => el.src = IMG.gem);
 // 先显示默认，再读取已保存的头像覆盖
@@ -733,9 +742,10 @@ function clearUp() {
 function attachHtml(url, name) {
   const lower = (url || "").toLowerCase();
   const imgExt = [".png",".jpg",".jpeg",".gif",".webp",".bmp",".svg"];
+  const u = _withToken(url);
   return imgExt.some(x => lower.endsWith(x))
-    ? `<img class="attach" src="${esc(url)}" alt="${esc(name||"图片")}">`
-    : `<a class="filedoc" href="${esc(url)}" target="_blank">📎 ${esc(name||"文件")}</a>`;
+    ? `<img class="attach" src="${esc(u)}" alt="${esc(name||"图片")}">`
+    : `<a class="filedoc" href="${esc(u)}" target="_blank">📎 ${esc(name||"文件")}</a>`;
 }
 
 // ========== 历史加载 ==========

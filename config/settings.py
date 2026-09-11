@@ -62,6 +62,9 @@ class Settings:
     # ---- 访问口令（公网部署时必配：空=不鉴权，仅限本机/内网使用）----
     access_token: str
 
+    # ---- 监听地址（默认 0.0.0.0 对外可访问；填 127.0.0.1 只听本机）----
+    bind_host: str
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -94,6 +97,7 @@ def get_settings() -> Settings:
         embedding_dimension=int(getenv("EMBEDDING_DIMENSION", "2560")),
         data_dir=Path(getenv("DATA_DIR", str(PROJECT_ROOT / "storage"))),
         access_token=getenv("ACCESS_TOKEN", ""),
+        bind_host=getenv("BIND_HOST", "0.0.0.0"),
     )
 
 

@@ -3,7 +3,8 @@
     "temperature": 0.8,
     "max_tokens": 1024,
     "fallback": {
-      "max_errors": 2
+      "max_errors": 2,
+      "cooldown_seconds": 30
     },
     "enable_thinking": false
   },
@@ -14,7 +15,8 @@
     "profile_confidence_threshold": 0.6,
     "persona_decay_days": 14,
     "diary_max_entries": 30,
-    "session_update_interval": 5
+    "session_update_interval": 5,
+    "max_sessions": 8
   },
   "proactive": {
     "idle_minutes": 30
