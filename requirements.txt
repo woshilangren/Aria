@@ -11,6 +11,10 @@ chromadb
 pydantic
 python-dotenv
 
+# ===== 文件上传（/api/chat/upload 的 UploadFile 需要它）=====
+# 之前一直没显式声明，靠 gradio 传递依赖带上；不装 gradio 的环境会直接报错
+python-multipart
+
 # ===== 语音 / 向量 / 画图（dashscope SDK，百炼原生接口那一族全靠它）=====
 dashscope
 

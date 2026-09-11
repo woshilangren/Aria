@@ -22,10 +22,17 @@ Aria 是一个跑在自己电脑上的 AI 伴侣程序：能聊天、能打电�
 - 内置天气、联网搜索、图片生成、写日记四个工具
 - 三级降级：模型原生 tool call → 模型文本规划 → 规则表，模型不支持 function calling 也能跑
 
-**稳定性设计**
-- 主备 LLM 自动切换：主模型连续失败 2 次粘住备用，之后定期探测主模型恢复
-- 后置审核：回复出口前查违规内容和敷衍回复（单字崩），不过就重写，最多 2 次
+**对话体验**
+- 逐句流式：模型生成到哪一句就发哪一句，不用等整条说完。文字聊天走 SSE，一句一个气泡
+- 随时打断：正生成时能插话，上一句不会被丢掉——新输入会和它合并成一条，一起回复
 - 时间感知：每轮注入实时时间 + 时段分寸提示，凌晨三点不会问"吃晚饭了吗"
+
+**稳定性设计**
+- 主备 LLM 熔断切换：主模型连续失败到阈值就打开熔断，冷却期（默认 120 秒）内完全不碰它；冷却到期放行一次探测，探测用 5 秒短超时，成功即闭合。这样设计是因为交互式聊天是低频场景——按请求计数或复用 60 秒超时，都会让"几乎每条消息白等一分钟"
+- 句级内容审核：每生成一句就过一次违规检查，过了才推给你
+- 审核没过的裁决是一条统一规则：**还没推出任何内容就允许重写，一旦推出过就只能整轮替换成兜底话**
+- `<voice>` 里的语音内容同样过审，且先审后合成：不会被念出来，也不会落库
+- 轮次可取消：被打断的那一轮什么都不写，不会污染记忆和关系数值
 
 ## 快速开始
 
@@ -54,6 +61,10 @@ copy .env.example .env
 | http://127.0.0.1:8000/api/system/health | 健康检查 |
 
 首次启动会自动生成自签名证书（`storage/certs/`，十年期，含全部网卡 IP）。手机浏览器访问 `https://IP:8443` 时点"高级 → 继续访问"即可；也可以下载根证书安装（`/ca.crt`）实现无警告访问。
+
+首次启动时如果 `.env` 里没配 `ACCESS_TOKEN`、而监听地址又是 `0.0.0.0`（默认），程序会**自动生成一个随机访问口令写进 `.env` 并在控制台打印**。浏览器第一次访问会弹框，把控制台那串粘进去就行，之后存在本地不用再输。只想本机使用的话把 `BIND_HOST` 改成 `127.0.0.1`，那时不配口令也不会自动生成。
+
+要 HTTPS 就必须用 `python main.py`——`uvicorn main:app` 只有单端口 HTTP，应用对象管不了第二个端口。
 
 ## 配置
 
@@ -86,26 +97,39 @@ copy .env.example .env
 ## 项目结构
 
 ```
-main.py                  程序入口：装配服务、建 Web 应用、起双端口服务器
+main.py                  程序入口：建应用 + lifespan 装配 + 双端口启动
+run_local.py             等价于 python main.py（兼容旧的启动习惯）
+bootstrap.py             组合根：全项目唯一允许跨层向上 import 的地方
 config.json              业务参数（可在线修改并写回）
 config/settings.py       环境变量与业务配置的读取、默认值
-interaction/             Web 层：REST/WS 路由、消息网关、Gradio 兜底页、前端
-orchestration/           调度层：对话主流程管道（普通 async）、语音路由决策、异常降级
+interaction/             Web 层：REST/WS/SSE 路由、消息网关、Gradio 兜底页
+orchestration/           调度层：pipeline.py（对话主流程）、cancellation.py（轮次取消）、managers.py（路由与降级）
 capability/              能力层：感知、记忆、人设组装、回复生成、日记、工具编排
 tools/                   工具层：LLM 客户端、语音 SDK、外部 API、日志、证书
 data/                    数据层：SQLite、Chroma、人设正主文件
-shared/                  层间契约（types.py）与全局单例（singletons.py）
+shared/                  层间契约（types.py）与服务注册表（singletons.py）
 frontend/                自定义主界面（单文件 HTML）+ PWA 资产
+docs/                    两份深度解读：项目全景、代码逐层导读
 storage/                 运行时数据（.gitignore 已排除，备份这一个目录即可）
 ```
 
-分层规则：`interaction → orchestration → capability → tools → data`，只许向下调用。一轮对话的完整链路、兜底逻辑、语音三条通道的取舍，见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+分层规则：`interaction → orchestration → capability → tools → data`，只许向下调用。服务的装配不在 import 期做，而是放在应用 startup 的 lifespan 里——所以 `import main` 没有副作用。
+
+一轮对话的完整链路、兜底逻辑、语音三条通道的取舍，见 [ARCHITECTURE.md](ARCHITECTURE.md)。这一轮改了什么、为什么改，见 [修改日志.md](修改日志.md)。
 
 ## 数据与隐私
 
 - 所有数据（聊天记录、记忆库、日记、档案、证书、上传文件）都在 `storage/` 一个目录里，不上云、不上报
-- `.env` 里的 API Key 不会进 git；部署到公网时务必配置 `ACCESS_TOKEN` 访问口令
+- `.env` 里的 API Key 不会进 git。对外监听时务必配 `ACCESS_TOKEN`——没配的话程序会自己生成一个（见上面"快速开始"）
+- 上传的文件（`storage/uploads/`）默认需要口令才能访问，不再对局域网里任何人开放
 - 想清空重来，删掉 `storage/` 目录重启即可，程序会自动重建
+
+## 已知未验证的地方
+
+不假装都测过（详见 [修改日志.md](修改日志.md) 第十节）：
+
+- SSE 流式**没有经过内网穿透实测**。如果你用 cpolar 之类把服务穿到手机上，要自己确认句子是不是真的逐句到达——部分穿透服务会缓冲 SSE，症状是攒到最后一起冒出来，本机测不出来
+- `requirements.lock` 是本机 `pip freeze` 出来的参考，没在全新机器上验证过安装
 
 ## License
 
