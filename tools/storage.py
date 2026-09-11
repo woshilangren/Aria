@@ -200,6 +200,73 @@ class VectorStoreTool:
             print(f"[diary] 日记删除失败: {exc}")
             return False
 
+    def list_diaries_enriched(self) -> list:
+        """列出日记并逐条补上正文与元数据，按日期倒序；读不到的条目留空、不抛。
+
+        api.py 展示日记要正文，list_diaries 只给元数据，这里把两步合成一个口子，
+        免得外层去摸私有的 _col_of。
+        """
+        enriched = []
+        for d in self.list_diaries():
+            try:
+                col = self._col_of(_DIARY_COLLECTION)
+                res = col.get(ids=[d["id"]], include=["documents", "metadatas"])
+                doc = (res.get("documents") or [None])[0] or ""
+                meta = (res.get("metadatas") or [{}])[0] or {}
+            except Exception:
+                doc = ""
+                meta = {}
+            enriched.append({**d, "content": doc, **meta})
+        enriched.sort(key=lambda e: e.get("date", ""), reverse=True)
+        return enriched
+
+    # ---- 长期记忆集合的展示/删除口子：列、取、删。语义检索另有 search_memory ----
+
+    def list_memories(self, limit: int = 20) -> list:
+        """列出长期记忆 [{id, content, ...meta}]，按 timestamp 倒序取前 limit 条；挂了返回空。"""
+        col = self._col_of(_DISTILLED_COLLECTION)
+        if col is None:
+            return []
+        try:
+            res = col.get(include=["documents", "metadatas"])
+        except Exception:
+            return []
+        ids = res.get("ids") or []
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        items = [
+            {"id": iid, "content": doc, **(meta or {})}
+            for iid, doc, meta in zip(ids, docs, metas)
+        ]
+        items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return items[:limit]
+
+    def get_memory(self, memory_id: str):
+        """按 id 取一条记忆 [{id, content, ...meta}]，取不到返回 None。"""
+        col = self._col_of(_DISTILLED_COLLECTION)
+        if col is None:
+            return None
+        try:
+            res = col.get(ids=[memory_id], include=["documents", "metadatas"])
+        except Exception:
+            return None
+        ids = res.get("ids") or []
+        if not ids:
+            return None
+        doc = (res.get("documents") or [None])[0]
+        meta = (res.get("metadatas") or [{}])[0] or {}
+        return {"id": ids[0], "content": doc, **meta}
+
+    def delete_memory(self, memory_id: str) -> bool:
+        col = self._col_of(_DISTILLED_COLLECTION)
+        if col is None:
+            return False
+        try:
+            col.delete(ids=[memory_id])
+            return True
+        except Exception:
+            return False
+
 
 class KVStoreTool:
     """各类 JSON 存储的统一入口，按 store 名字路由到对应的 Store。"""
@@ -260,3 +327,11 @@ class KVStoreTool:
     def last_chat_per_session(self) -> list:
         """每个会话最后一次聊天的时间，闲置检测器点名用。"""
         return self._session.last_chat_per_session()
+
+    def recent_chat(self, session_id: str, n: int = 100) -> list:
+        """取某会话最近 n 条聊天记录。
+
+        read("session", key) 内部写死 get_recent(key, 20)、传不进 n，
+        api.py 拉历史要自定义条数，走这个专门的口子。
+        """
+        return self._session.get_recent(session_id, n)

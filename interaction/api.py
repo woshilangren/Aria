@@ -269,9 +269,9 @@ async def chat_history(session_id: str = "default", n: int = 100) -> dict:
     免得标签原文露在对话里。
     """
     from interaction.gateway import extract_voice
-    from data.stores import SessionStore
+    from shared.singletons import services
 
-    recs = SessionStore().get_recent(session_id, n)
+    recs = services.get("kv_store").recent_chat(session_id, n)
     items = []
     for r in recs:
         role = r.get("role")
@@ -695,67 +695,33 @@ async def _get_relationship(session_id: str = "default"):
 
 @memory_router.get("/diaries")
 async def _get_diaries():
-    from tools.storage import VectorStoreTool
-    vs = VectorStoreTool()
-    diaries = vs.list_diaries()
-    enriched = []
-    for d in diaries:
-        try:
-            col = vs._col_of("diary")
-            res = col.get(ids=[d["id"]], include=["documents", "metadatas"])
-            doc = (res.get("documents") or [None])[0] or ""
-            meta = (res.get("metadatas") or [{}])[0] or {}
-        except Exception:
-            doc = ""
-            meta = {}
-        enriched.append({**d, "content": doc, **meta})
-    enriched.sort(key=lambda e: e.get("date", ""), reverse=True)
-    return enriched
+    from shared.singletons import services
+
+    return services.get("vector_store").list_diaries_enriched()
 
 
 @memory_router.delete("/diaries/{diary_id}")
 async def _delete_diary(diary_id: str):
-    from tools.storage import VectorStoreTool
-    vs = VectorStoreTool()
-    return {"ok": vs.delete_diary(diary_id)}
+    from shared.singletons import services
+
+    return {"ok": services.get("vector_store").delete_diary(diary_id)}
 
 
 @memory_router.get("/memories")
 async def _get_memories(q: str = "", session_id: str = "default"):
-    from tools.storage import VectorStoreTool
-    vs = VectorStoreTool()
+    from shared.singletons import services
+
+    vs = services.get("vector_store")
     if q:
         return vs.search_memory(q, top_k=10)
-    col = vs._col_of("distilled_memory")
-    if col is None:
-        return []
-    try:
-        res = col.get(include=["documents", "metadatas"])
-    except Exception:
-        return []
-    ids = res.get("ids") or []
-    docs = res.get("documents") or []
-    metas = res.get("metadatas") or []
-    items = [
-        {"id": iid, "content": doc, **(meta or {})}
-        for iid, doc, meta in zip(ids, docs, metas)
-    ]
-    items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-    return items[:20]
+    return vs.list_memories(limit=20)
 
 
 @memory_router.delete("/memories/{memory_id}")
 async def _delete_memory(memory_id: str):
-    from tools.storage import VectorStoreTool
-    vs = VectorStoreTool()
-    col = vs._col_of("distilled_memory")
-    if col is None:
-        return {"ok": False}
-    try:
-        col.delete(ids=[memory_id])
-        return {"ok": True}
-    except Exception:
-        return {"ok": False}
+    from shared.singletons import services
+
+    return {"ok": services.get("vector_store").delete_memory(memory_id)}
 
 
 # ---------- 应用工厂 ----------

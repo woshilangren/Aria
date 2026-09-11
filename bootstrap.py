@@ -1,0 +1,80 @@
+"""组合根（Composition Root）。
+
+这是全项目**唯一**允许"跨层向上 import"的地方——装配的职责本来就是
+"知道所有层的存在"：它要 import tools / capability 里的具体实现，把实例
+建好、注册进全局注册表。除此之外的任何模块都不许这么干。
+
+把装配单独拎到这里之后：
+- shared/singletons.py 退化成纯注册表，不再反向依赖 tools / capability，
+  那个"懒加载环 + 分层倒置"就消掉了；
+- 装配有了显式入口（`bootstrap()`），什么时候装配一目了然，顺手解决了
+  "import 就产生副作用"——现在装配只发生在应用 startup（见 main.py 的 lifespan）。
+"""
+
+from shared.singletons import services
+
+
+def bootstrap() -> None:
+    """按依赖顺序装配所有服务，逐个注册进全局注册表。
+
+    单个服务初始化失败只记账、不抛出：某个服务没起来不影响别的服务，
+    真正用到它的时候再报错（保持既有容错语义）。
+    """
+    # 工具层基础件
+    try:
+        from tools.misc import Logger
+
+        services.register("logger", Logger())
+    except Exception as exc:
+        services.mark_error("logger", str(exc))
+
+    try:
+        from tools.storage import KVStoreTool, VectorStoreTool
+
+        services.register("kv_store", KVStoreTool())
+        services.register("vector_store", VectorStoreTool())
+    except Exception as exc:
+        services.mark_error("kv_store", str(exc))
+
+    try:
+        from tools.registry import ToolExecutor, ToolRegistry
+
+        services.register("tool_registry", ToolRegistry())
+        services.register("tool_executor", ToolExecutor())
+    except Exception as exc:
+        services.mark_error("tool_registry", str(exc))
+
+    # 日记作者：真身在 capability 层，工具名片已在 registry 登记，
+    # 这里把实例注册好、把工具入口注入进去（延迟 import 避开循环依赖）
+    try:
+        from capability.diary import DiaryWriter
+
+        services.register("diary_writer", DiaryWriter())
+        services.get("tool_registry").register_handler(
+            "diary_write", services.get("diary_writer").run_as_tool
+        )
+    except Exception as exc:
+        services.mark_error("diary_writer", str(exc))
+
+    # LLM：聊天功能的核心，失败要留清楚原因
+    try:
+        from tools.llm_client import LLMClient
+
+        services.register("llm", LLMClient())
+    except Exception as exc:
+        services.mark_error("llm", str(exc))
+
+    # 语音两件套，没配 key 也正常，用到再报错
+    try:
+        from tools.speech import ASRTool
+
+        services.register("asr", ASRTool())
+    except Exception as exc:
+        services.mark_error("asr", str(exc))
+
+    try:
+        from tools.speech import TTSTool
+
+        services.register("tts", TTSTool())
+    except Exception as exc:
+        services.mark_error("tts", str(exc))

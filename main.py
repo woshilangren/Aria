@@ -1,36 +1,62 @@
 """程序入口：装配服务、建 Web 应用、起服务器。
 
-启动：python main.py
-起来之后：
-    http://127.0.0.1:8000/                     主界面（本机桌面 / Via 类 WebView 浏览器的手机端）
-    https://<本机局域网IP>:8443/                主界面（Chrome 等严格浏览器的手机端）
-    http://127.0.0.1:8000/ui                  旧聊天页（Gradio 兜底）
-    http://127.0.0.1:8000/api/system/health   健康检查
+启动方式：
+    python main.py        推荐。证书 + 双端口：HTTP 8000 + HTTPS 8443（手机走 HTTPS）
+    uvicorn main:app      只有单端口 HTTP（8000）
+注意：`uvicorn main:app` **出不了 8443**——应用对象管不了第二个端口。手机等严格浏览器
+      要 HTTPS 才能用麦克风，所以那种场景请用 `python main.py`。
+
+装配时机：import 本模块**不产生副作用**——不建任何服务、不起后台线程。真正的装配
+发生在应用 startup 的 lifespan 里。`app` 对象仍在模块顶层建好，所以 `uvicorn main:app`
+依然可用（代价是既不生成证书、也不开 8443）。
 """
 
 import os
 import secrets
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
+from fastapi import FastAPI
 
+from bootstrap import bootstrap
 from interaction.api import build_app
-from shared.singletons import services
-
-# 服务先建好（LLM、语音、存储这些），单个失败不拦启动，用到再报错
-services.init_all()
-
-# 闲置太久自动写日记的后台巡检，跟着服务一起起
-from capability.proactive import IdleDiaryWatcher
-
-_watcher = IdleDiaryWatcher()
-_watcher.start()
-
-app = build_app()
 
 # 视为“仅本机”的监听地址：绑这些地址不会被局域网/公网直接访问，不配口令也安全
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def create_app() -> FastAPI:
+    """建应用对象（挂中间件 / 路由 / 静态目录）并接上 lifespan。
+
+    便宜、无副作用：不初始化任何服务，服务的装配交给 lifespan（startup 时执行）。
+    """
+    app = build_app()
+    # build_app 里若装了 gradio，它会把自己的 lifespan 包在 app.router.lifespan_context 上；
+    # 这里同样“包一层”，绝不能直接覆盖，否则会把 gradio 的 startup 事件丢掉（/ui 就废了）
+    old_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # startup：装配所有服务 + 起闲置巡检线程
+        bootstrap()
+        from capability.proactive import IdleDiaryWatcher
+
+        watcher = IdleDiaryWatcher()
+        watcher.start()
+        try:
+            async with old_lifespan(app) as state:
+                yield state
+        finally:
+            watcher.stop()  # shutdown：叫停巡检线程
+
+    app.router.lifespan_context = lifespan
+    return app
+
+
+# app 在模块顶层建好：`uvicorn main:app` 仍然能用（只是没有证书和 8443）
+app = create_app()
 
 
 def _serve(config: uvicorn.Config) -> None:
@@ -97,7 +123,8 @@ def _ensure_access_token(settings) -> None:
     print("=" * 64)
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """标准启动路径（`python main.py` 与 run_local.py 都走这里）：口令兜底 → 证书 → 双端口。"""
     from config.settings import get_settings
     from tools.certgen import ensure_cert
 
@@ -114,10 +141,16 @@ if __name__ == "__main__":
             app, host=settings.bind_host, port=8443,
             ssl_certfile=cert, ssl_keyfile=key, log_level="warning",
         )
-        t = threading.Thread(target=_serve, args=(https_cfg,), daemon=True, name="https-8443")
-        t.start()
+        threading.Thread(
+            target=_serve, args=(https_cfg,), daemon=True, name="https-8443"
+        ).start()
         print("HTTPS 已就绪: https://<本机IP>:8443/  （Chrome 等严格浏览器的手机端用这个）")
         print("HTTP  已就绪: http://<本机IP>:8000/   （Via 等 WebView 浏览器的手机端 + 桌面）")
-        uvicorn.run(app, host=settings.bind_host, port=8000)
+        print("（双端口/手机 HTTPS 只有 `python main.py` 有；`uvicorn main:app` 只有单端口 HTTP）")
     else:
-        uvicorn.run(app, host=settings.bind_host, port=8000)
+        print("HTTP  已就绪: http://<本机IP>:8000/（未生成证书，仅单端口 HTTP）")
+    uvicorn.run(app, host=settings.bind_host, port=8000)
+
+
+if __name__ == "__main__":
+    run()
