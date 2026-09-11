@@ -6,8 +6,9 @@
 
 import json
 import time
+from typing import AsyncIterator
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from config.settings import get_settings, load_app_config
 
@@ -38,6 +39,22 @@ class LLMClient:
         else:
             self._fallback = None
             self._fallback_model = ""
+
+        # 异步客户端：只给流式用（C1a 先加接口，尚未接进管道）。同步客户端一律保留——
+        # 记忆摘要 / 画像 / 感知 / 日记那几处还在用同步的 chat()。
+        self._aclient = AsyncOpenAI(
+            api_key=cfg.llm_api_key,
+            base_url=cfg.llm_base_url,
+            timeout=60,
+        )
+        if cfg.llm_fallback_api_key:
+            self._afallback = AsyncOpenAI(
+                api_key=cfg.llm_fallback_api_key,
+                base_url=cfg.llm_fallback_base_url,
+                timeout=90,
+            )
+        else:
+            self._afallback = None
 
         # 降级状态：主模型连续失败达到 max_errors 次就打开熔断（记下打开时刻），
         # 冷却期内彻底不碰主模型，省得每次白等 60 秒超时；冷却到期半开放行一次
@@ -152,3 +169,98 @@ class LLMClient:
                 "call_id": call.id,
             }
         return {"type": "final", "content": msg.content or ""}
+
+    # ---------- 异步流式（C1a 只提供能力，尚未接入管道）----------
+    async def astream_chat(
+        self, messages: list, temperature: float = None, max_tokens: int = None
+    ) -> AsyncIterator[str]:
+        """异步流式补全：逐块 yield 文本增量。
+
+        与同步 chat() 共用同一套熔断/降级状态（_opened_at / _error_count / _cooldown /
+        _probe_timeout），不另起炉灶。
+
+        流式降级的硬约束：**只能在还没吐出任何 token 之前换备用**——一旦已经 yield 过
+        内容，再换备用也是接不上的半截话，所以那种情况直接抛，由上层收尾。
+        """
+        cfg = load_app_config()["llm"]
+        if temperature is None:
+            temperature = cfg["temperature"]
+        if max_tokens is None:
+            max_tokens = cfg["max_tokens"]
+
+        kwargs = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        last_error = None
+
+        # 熔断打开且未到冷却 → 直接走备用（与同步 _complete 同一判断）
+        circuit_open = (
+            self._opened_at is not None
+            and (time.monotonic() - self._opened_at) < self._cooldown
+        )
+        if not circuit_open:
+            is_probe = self._opened_at is not None  # 半开探测：只在这时传短超时
+            thinking = load_app_config()["llm"].get("enable_thinking", False)
+            kwargs.setdefault("extra_body", {"enable_thinking": thinking})
+            if is_probe:
+                kwargs["timeout"] = self._probe_timeout
+            stream = None
+            try:
+                stream = await self._aclient.chat.completions.create(**kwargs)
+            except Exception as exc:
+                self._error_count += 1
+                last_error = exc
+                print(f"[llm] 主模型流式建流失败({self._error_count}/{self._max_errors})，走备用：{exc}")
+                if self._error_count >= self._max_errors:
+                    self._opened_at = time.monotonic()
+            if stream is not None:
+                # 建流成功：正常逐块产出。中途出错：吐过内容就直接抛；没吐过则回落去试备用
+                emitted = False
+                try:
+                    async for chunk in stream:
+                        delta = self._delta_of(chunk)
+                        if delta:
+                            emitted = True
+                            yield delta
+                    self._error_count = 0
+                    self._opened_at = None
+                    return
+                except Exception as exc:
+                    self._error_count += 1
+                    last_error = exc
+                    if self._error_count >= self._max_errors:
+                        self._opened_at = time.monotonic()
+                    if emitted:
+                        raise  # 已经吐过 token，换备用也接不上，交给上层收尾
+                    # 一个 token 都没吐：落到下面走备用
+
+        # 备用顶上：GLM 系始终思考，换成 thinking_effort=low（同同步路径）
+        if self._afallback is not None:
+            kwargs.pop("extra_body", None)
+            kwargs.pop("timeout", None)  # 短超时只给半开探测用，备用走它自己的默认超时
+            kwargs["extra_body"] = {"thinking_effort": "low"}
+            kwargs["model"] = self._fallback_model
+            try:
+                stream = await self._afallback.chat.completions.create(**kwargs)
+            except Exception as exc:
+                raise RuntimeError(f"主模型和备用模型都挂了（流式）：主={last_error}，备={exc}") from exc
+            async for chunk in stream:
+                delta = self._delta_of(chunk)
+                if delta:
+                    yield delta
+            return
+
+        raise RuntimeError(f"LLM 流式调用失败，也没配备用模型：{last_error}")
+
+    @staticmethod
+    def _delta_of(chunk) -> str:
+        """从流式分块里取文本增量；取不到（无 choices / 非文本增量）返回空串。"""
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            return ""
+        delta = getattr(choices[0], "delta", None)
+        return getattr(delta, "content", None) or ""

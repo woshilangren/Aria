@@ -11,7 +11,7 @@ import uuid
 import gradio as gr
 
 from interaction.gateway import MessageReceiver, OutputRenderer
-from orchestration.dialogue_orchestrator import DialogueOrchestrator
+from orchestration.pipeline import DialoguePipeline
 
 # 语音通话的三条线路，名字对齐 wiki：cascade=两段接力，e2e=直达专线，realtime=实时专线
 ROUTE_LABELS = {
@@ -24,12 +24,12 @@ LABEL_TO_ROUTE = {v: k for k, v in ROUTE_LABELS.items()}
 
 def build_gradio_app() -> gr.Blocks:
     """搭一个聊天页面：对话窗口 + 输入框 + 语音线路切换。"""
-    orchestrator = DialogueOrchestrator()
+    orchestrator = DialoguePipeline()
     receiver = MessageReceiver()
     renderer = OutputRenderer()
 
     async def respond(message: str, history: list, session_id: str):
-        """点发送之后的事：收消息 -> 过主对话图 -> 渲染回复 -> 刷回页面。"""
+        """点发送之后的事：收消息 -> 过对话管道 -> 渲染回复 -> 刷回页面。"""
         msg = receiver.receive(message, session_id)
         reply = await orchestrator.handle(msg)
         # render 内部有秒级同步网络调用，扔线程池，别堵事件循环

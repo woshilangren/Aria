@@ -90,7 +90,7 @@ main.py                  程序入口：装配服务、建 Web 应用、起双�
 config.json              业务参数（可在线修改并写回）
 config/settings.py       环境变量与业务配置的读取、默认值
 interaction/             Web 层：REST/WS 路由、消息网关、Gradio 兜底页、前端
-orchestration/           调度层：LangGraph 主流程、语音路由决策、异常降级
+orchestration/           调度层：对话主流程管道（普通 async）、语音路由决策、异常降级
 capability/              能力层：感知、记忆、人设组装、回复生成、日记、工具编排
 tools/                   工具层：LLM 客户端、语音 SDK、外部 API、日志、证书
 data/                    数据层：SQLite、Chroma、人设正主文件

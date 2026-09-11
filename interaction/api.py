@@ -30,7 +30,7 @@ def _build_realtime_instructions(session_id: str) -> str:
     记忆和文字聊天共用同一套仓库：档案、画像、关系、长期记忆、日记、最近几轮。
     """
     from capability.memory import MemoryRecaller
-    from orchestration.graph import KEEPER
+    from orchestration.pipeline import KEEPER
     from shared.singletons import services
 
     parts = []
@@ -99,13 +99,13 @@ def _build_realtime_instructions(session_id: str) -> str:
 
 
 def _realtime_writeback(session_id: str, user_text: str, reply_text: str, emotion: str) -> None:
-    """实时专线聊完一轮，按主对话图的写回规矩落账。
+    """实时专线聊完一轮，按主对话管道的写回规矩落账。
 
     短期记忆、聊天记录、硬事实沉淀、亲密度一样别落，
     和文字聊天共用同一份短期记忆，两条线才连得起来。
     """
     from capability.memory import ConversationDistiller, RelationshipTracker
-    from orchestration.graph import KEEPER
+    from orchestration.pipeline import KEEPER
     from shared.singletons import services
     from tools.speech import strip_emotion_marks
 
@@ -162,9 +162,9 @@ def _get_orchestrator():
     """对话编排器全局就一份，第一次用到才建。"""
     global _orchestrator
     if _orchestrator is None:
-        from orchestration.dialogue_orchestrator import DialogueOrchestrator
+        from orchestration.pipeline import DialoguePipeline
 
-        _orchestrator = DialogueOrchestrator()
+        _orchestrator = DialoguePipeline()
     return _orchestrator
 
 
@@ -372,7 +372,7 @@ async def voice_stream(websocket: WebSocket) -> None:
 
     客户端把整段录音当二进制帧发上来，发一条文本 "END" 表示说完。
     服务端按当前路由处理：e2e 直接进语音对话引擎，cascade 转文字走
-    主对话图再合成音频，realtime 直连实时专线（连接时注入记忆、每轮写回）。
+    主对话管道再合成音频，realtime 直连实时专线（连接时注入记忆、每轮写回）。
     文本帧除了 END 还可以发 {"voice": "音色名"}，给实时专线当场换音色。
     回复文字和音频分帧推回去。
     """
@@ -424,7 +424,7 @@ async def voice_stream(websocket: WebSocket) -> None:
                     if route == ROUTE_E2E:
                         from capability.perception import PerceptionPipeline
                         from capability.skills import SpeechDialogEngine
-                        from orchestration.graph import KEEPER
+                        from orchestration.pipeline import KEEPER
 
                         # ASR+LLM+TTS 是几十秒的同步网络调用，必须扔线程池，
                         # 不然语音通话期间整个事件循环（所有请求）一起卡死

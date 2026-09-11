@@ -24,7 +24,7 @@ AI 伴侣类产品的"机器感"——秒回、全知、永不疲倦、上句不
 | 层 | 选型 | 用途 |
 |---|---|---|
 | Web 服务 | FastAPI + Uvicorn | REST + WebSocket，HTTP 8000 / HTTPS 8443 双端口 |
-| 流程编排 | LangGraph | 对话主流程的状态图（节点 + 条件边） |
+| 流程编排 | 普通 async 管道 | 对话主流程（顺序调用 + 分支 + 有界重写循环，无外部编排框架） |
 | 聊天界面 | 单文件原生 HTML/JS（`frontend/index.html`） | 无构建链，改完刷新即生效；PWA 可安装 |
 | 兜底界面 | Gradio | 自定义前端不存在时的最小可用聊天页 |
 | 结构化存储 | SQLite（WAL 模式） | 档案、画像、关系、聊天记录、KV 配置 |
@@ -41,7 +41,7 @@ AI 伴侣类产品的"机器感"——秒回、全知、永不疲倦、上句不
 ```
 interaction/    Web 入口：REST/WS 路由、消息网关、语音流收发、Gradio 兜底
     ↓
-orchestration/  调度：LangGraph 主流程、语音路由决策、缺信息追问、异常降级决策
+orchestration/  调度：对话主流程管道（普通 async）、语音路由决策、缺信息追问、异常降级决策
     ↓
 capability/     智能：感知、记忆、人设组装、回复生成、日记、工具管线、随机小动作
     ↓
@@ -57,12 +57,12 @@ config/         环境变量与业务配置的读取
 
 两个关键单例：
 
-- `KEEPER`（短期记忆管家，`orchestration/graph.py` 顶部）——全项目一份。Web 层的 realtime 写回也用它，文字聊天和语音通话才共用同一段上下文。
+- `KEEPER`（短期记忆管家，`orchestration/pipeline.py` 顶部）——全项目一份。Web 层的 realtime 写回也用它，文字聊天和语音通话才共用同一段上下文。
 - `services`（`shared/singletons.py`）——LLM、语音、存储、工具表的服务注册表。单个服务初始化失败不拦启动，用到时才报错：语音 key 没配，文字聊天照常能跑。
 
 ## 四、一轮对话的运行逻辑
 
-主流程是一张 LangGraph 状态图（`orchestration/graph.py`），节点之间靠 `DialogueState` 传数据：
+主流程是一条普通 async 管道（`orchestration/pipeline.py` 的 `DialoguePipeline`），单轮状态用 `TurnState` 在管道各步之间传递：
 
 ```
 用户消息
@@ -94,7 +94,7 @@ perceive ──────── 意图+情绪（一次 LLM 调用）∥ 记忆
             返回给前端（语音轮额外合成音频）
 ```
 
-几个节点的内部细节：
+几个步骤的内部细节（名称对应 `DialoguePipeline` 里同名的方法）：
 
 **perceive（并行感知）**。意图/情绪判断是一次 LLM 调用，记忆召回是两次向量检索（长期记忆 + 日记），两者互不依赖，扔线程池同时跑。串行等于把两段网络延迟相加；代价是工具轮也会多付两次向量检索，但工具轮本来就要跑好几秒外部接口，这点开销不心疼。意图带上下文判断（最近 4 轮），"还要"这种指代才判得准。
 
@@ -118,7 +118,7 @@ perceive ──────── 意图+情绪（一次 LLM 调用）∥ 记忆
 - L3：连规划都失败时，规则表硬编码 + 正则抠参数，模型再怎么抽风都有底
 - 三级全失败：按 `FallbackController` 的决策重试或放弃，给一句人设化的兜底话
 
-**流程层（orchestration/graph.py + managers.py）**
+**流程层（orchestration/pipeline.py + managers.py）**
 - 后置审核不过 → 换说法重写，最多 2 次（工具链路走重新转述，不走 generate）→ 超限婉拒
 - 单字崩拦截：回复去掉标点只剩一个字判为敷衍（小模型被夸时爱回"哼/哦"），强制重写
 - 安全预检不过 → 固定话术拒绝，不进模型
@@ -179,7 +179,7 @@ perceive ──────── 意图+情绪（一次 LLM 调用）∥ 记忆
 
 | 路由 | 链路 | 特点 |
 |---|---|---|
-| cascade 级联 | ASR → 文字走主对话图 → TTS | 最稳，回复质量最高（走完整人设/记忆/审核），延迟最長 |
+| cascade 级联 | ASR → 文字走对话主流程 → TTS | 最稳，回复质量最高（走完整人设/记忆/审核），延迟最長 |
 | e2e 端到端 | 录音直进语音对话引擎 | 延迟低，记忆接入复用 realtime 写回通道 |
 | realtime 实时专线 | WebSocket 直连多模态 Omni 模型 | 即时对话，识别+生成+合成一体，时间感知靠 session.update 刷新 |
 

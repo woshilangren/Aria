@@ -241,22 +241,6 @@ class VectorStoreTool:
         items.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
         return items[:limit]
 
-    def get_memory(self, memory_id: str):
-        """按 id 取一条记忆 [{id, content, ...meta}]，取不到返回 None。"""
-        col = self._col_of(_DISTILLED_COLLECTION)
-        if col is None:
-            return None
-        try:
-            res = col.get(ids=[memory_id], include=["documents", "metadatas"])
-        except Exception:
-            return None
-        ids = res.get("ids") or []
-        if not ids:
-            return None
-        doc = (res.get("documents") or [None])[0]
-        meta = (res.get("metadatas") or [{}])[0] or {}
-        return {"id": ids[0], "content": doc, **meta}
-
     def delete_memory(self, memory_id: str) -> bool:
         col = self._col_of(_DISTILLED_COLLECTION)
         if col is None:

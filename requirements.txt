@@ -4,9 +4,6 @@ uvicorn[standard]
 gradio
 websockets
 
-# ===== 编排（调度层）=====
-langgraph
-
 # ===== 向量记忆（工具层 / 数据层）=====
 chromadb
 
