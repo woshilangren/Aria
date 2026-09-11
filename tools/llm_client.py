@@ -43,7 +43,9 @@ class LLMClient:
         # 冷却期内彻底不碰主模型，省得每次白等 60 秒超时；冷却到期半开放行一次
         fb_cfg = load_app_config()["llm"].get("fallback", {})
         self._max_errors = fb_cfg.get("max_errors", 2)
-        self._cooldown = float(fb_cfg.get("cooldown_seconds", 30) or 30)
+        self._cooldown = float(fb_cfg.get("cooldown_seconds", 120) or 120)
+        # 半开探测专用短超时：探测不再复用客户端默认的 60 秒，避免聊天节奏下每条都白等
+        self._probe_timeout = float(fb_cfg.get("probe_timeout_seconds", 5) or 5)
         self._error_count = 0
         self._opened_at: float | None = None  # 熔断打开时刻（单调时钟），None=未打开
 
@@ -63,10 +65,15 @@ class LLMClient:
         )
 
         if not circuit_open:
-            # 正常态每次都试主模型；半开态（冷却到期）也只放行这一次探测。
+            # 这次是不是"半开探测"：熔断原本开着（_opened_at 非空）且已过冷却，才会走到这里。
+            # 探测复用主客户端，但默认 60 秒超时对人聊天的节奏太长（几乎每条都白等），
+            # 所以只给探测传短超时；正常调用绝不传，保持客户端默认 60 秒。
+            is_probe = self._opened_at is not None
             # Qwen3 系非流式调用必须关思考模式，不然官方直接拒绝请求
             thinking = load_app_config()["llm"].get("enable_thinking", False)
             kwargs.setdefault("extra_body", {"enable_thinking": thinking})
+            if is_probe:
+                kwargs["timeout"] = self._probe_timeout
             try:
                 resp = self._client.chat.completions.create(**kwargs)
                 # 成功即闭合：清空错误计数、清掉熔断时刻
@@ -87,6 +94,7 @@ class LLMClient:
         # 不然聊天每条都要先默默想十几秒才开口，用户只会觉得"怎么这么慢"
         if self._fallback is not None:
             kwargs.pop("extra_body", None)
+            kwargs.pop("timeout", None)  # 短超时只给半开探测用，备用走它自己的默认超时
             kwargs["extra_body"] = {"thinking_effort": "low"}
             kwargs["model"] = self._fallback_model
             try:

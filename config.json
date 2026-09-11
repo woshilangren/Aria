@@ -4,7 +4,8 @@
     "max_tokens": 1024,
     "fallback": {
       "max_errors": 2,
-      "cooldown_seconds": 30
+      "cooldown_seconds": 120,
+      "probe_timeout_seconds": 5
     },
     "enable_thinking": false
   },
