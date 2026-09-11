@@ -27,13 +27,12 @@ def _persona_fallback(kind: str, default: str) -> str:
     return default
 
 
-def generate(prompt: PromptPackage, user_text: str, extra: str = "", user_image: str = "") -> str:
-    """纯聊天回复：人设提示词 + 短期记忆 + 用户这句话，喂给模型拿回复。
+def build_chat_messages(prompt: PromptPackage, user_text: str, extra: str = "",
+                        user_image: str = "") -> list:
+    """拼"纯聊天"要发给模型的 messages：系统提示词 + 短期记忆 + 用户这句（可带图）。
 
-    extra 是追加在系统提示词末尾的附加规矩（比如语音轮的情绪标注要求）。
-    user_image 是用户随消息上传的图片绝对地址；带图时把用户消息转成
-    OpenAI 多模态数组格式，让多模态模型连图一起看。
-    模型挂了就返回兜底话，别把异常漏到上层把整个对话弄崩。
+    单独抽出来，是为了让**流式路径**和 generate() 用同一套消息构造，
+    不写两条并行逻辑（否则改了非流式忘了流式，两边就会漂移）。
     """
     system = prompt.system_prompt + (f"\n\n{extra}" if extra else "")
     if user_image:
@@ -44,11 +43,22 @@ def generate(prompt: PromptPackage, user_text: str, extra: str = "", user_image:
         ]
     else:
         user_content = user_text
-    messages = (
+    return (
         [{"role": "system", "content": system}]
         + list(prompt.context_messages or [])
         + [{"role": "user", "content": user_content}]
     )
+
+
+def generate(prompt: PromptPackage, user_text: str, extra: str = "", user_image: str = "") -> str:
+    """纯聊天回复：人设提示词 + 短期记忆 + 用户这句话，喂给模型拿回复。
+
+    extra 是追加在系统提示词末尾的附加规矩（比如语音轮的情绪标注要求）。
+    user_image 是用户随消息上传的图片绝对地址；带图时把用户消息转成
+    OpenAI 多模态数组格式，让多模态模型连图一起看。
+    模型挂了就返回兜底话，别把异常漏到上层把整个对话弄崩。
+    """
+    messages = build_chat_messages(prompt, user_text, extra=extra, user_image=user_image)
     try:
         return get_llm().chat(messages) or _persona_fallback("llm", _FALLBACK_REPLY)
     except Exception:

@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 
+from config.settings import get_settings
 from tools.misc import ClockTool
 from shared.singletons import services
 from shared.types import FinalReply, InputMessage
@@ -33,7 +34,14 @@ def _voice_cache_dir() -> Path:
 
 
 def _voice_key(text: str) -> str:
-    return hashlib.md5((text or "").encode("utf-8")).hexdigest()
+    """缓存 key：文本 + 当前音色 + 当前模型。
+
+    只按文本 md5 的话，换了音色（TTS_VOICE）还会命中旧音频，听起来"换了设置没生效"。
+    把音色和模型一起算进 key，换配置即失效重合成（缓存本来就可丢弃）。
+    """
+    cfg = get_settings()
+    raw = f"{text or ''}\x00{cfg.tts_voice}\x00{cfg.tts_model}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def get_cached_voice(text: str):

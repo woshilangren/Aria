@@ -113,16 +113,26 @@ class ToolPlanner:
 class ToolCallOrchestrator:
     """工具调用的总指挥，L1 挂了找 L2，L2 挂了找 L3，一层层往下兜。"""
 
-    def run(self, user_text: str, intent: str, fallback_city: str = "", session_id: str = "") -> dict:
+    def run(
+        self,
+        user_text: str,
+        intent: str,
+        fallback_city: str = "",
+        session_id: str = "",
+        should_cancel=None,
+    ) -> dict:
         """跑完三级降级，返回 {"results": [ToolCallResult...], "final_text": str}。
 
         final_text 只有 L1 通道才有：模型自己把答案说完了。
         session_id 是运行时上下文，注入式工具（比如写日记）靠它知道在给谁干活。
+        should_cancel 是调用方注入的"该不该停"回调（返回 True 就尽早收工）。
+        它只是个普通可调用对象，能力层不 import 调度层，避免越层依赖；
+        真被取消时返回带 "cancelled": True 的结果，由上层决定怎么处理。
         """
         # L1：模型原生工具调用，模型自己决定调什么、调完自己组织答案
         if get_settings().llm_supports_tool_call:
             try:
-                return self._run_native_loop(user_text, session_id)
+                return self._run_native_loop(user_text, session_id, should_cancel)
             except Exception:
                 pass
 
@@ -146,7 +156,7 @@ class ToolCallOrchestrator:
             results.append(ToolCallResult(rule_name, out["status"], out["data"]))
         return {"results": results, "final_text": ""}
 
-    def _run_native_loop(self, user_text: str, session_id: str = "") -> dict:
+    def _run_native_loop(self, user_text: str, session_id: str = "", should_cancel=None) -> dict:
         """L1 循环：模型带工具列表补全，要调工具就执行后把结果喂回去，
         直到它给出最终回答或轮数用完。"""
         registry = services.get("tool_registry")
@@ -170,6 +180,9 @@ class ToolCallOrchestrator:
         guard = ToolGuard()
 
         for _ in range(rounds):
+            # 取消检查点：每一轮开跑前先看看这轮还该不该继续，别白烧模型调用
+            if should_cancel is not None and should_cancel():
+                return {"results": results, "final_text": "", "cancelled": True}
             resp = get_llm().chat_with_tools(messages, catalog)
 
             # 模型说完了，把它的答案带回去

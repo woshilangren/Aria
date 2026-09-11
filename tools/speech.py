@@ -25,10 +25,15 @@ from dashscope.audio.tts_v2 import SpeechSynthesizer
 
 from config.settings import get_settings
 
-# [情绪] 短标签：方括号里 1~6 个字符，比如 [开心]、[得意]
-_EMOTION_TAG_RE = re.compile(r"\[([^\[\]]{1,6})\]")
-# （语气描述）短句：全角/半角圆括号里 1~12 个字符，比如（压低声音）
-_ACTION_DESC_RE = re.compile(r"[（(]([^（）()]{1,12})[）)]")
+# 情绪标签白名单：prompt 里给过示例（开心/得意/生气/难过），再补几个常见的语气词。
+# 收紧成白名单的好处：正文里的 [1]（如"第[1]点"）和普通括号（如"他（我朋友）"）
+# 不会再被误当情绪标记剥掉——这是之前那个过宽正则的 bug。
+EMOTION_WORDS = ("开心", "得意", "生气", "难过", "温柔", "惊喜", "无奈", "委屈", "兴奋", "害羞")
+
+# [情绪] 标签：只认回复**开头**第一个，且必须是白名单里的词，比如 [开心]、[得意]
+_EMOTION_TAG_RE = re.compile(r"^\s*\[(" + "|".join(EMOTION_WORDS) + r")\]")
+# （语气描述）短句：只在情绪标签**紧邻之后**才认，全角/半角圆括号里 1~12 个字符
+_ACTION_DESC_RE = re.compile(r"^\s*[（(]([^（）()]{1,12})[）)]")
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = 16000, channels: int = 1, bits: int = 16) -> bytes:
@@ -60,18 +65,29 @@ def sniff_audio_format(audio: bytes) -> str:
     return ""
 
 
-def _split_emotion(text: str) -> tuple:
-    """把情绪标记从文本里拆出来：返回（干净正文，情绪词列表，描述列表）。"""
+def split_emotion(text: str) -> tuple:
+    """把**开头**的情绪标记从文本里拆出来：返回（干净正文，情绪词列表，描述列表）。
+
+    只认开头的第一个 [情绪]（且在白名单里）以及紧随其后的（语气描述）——
+    与 prompt 契约"标记整条只出现一次、且在开头"一致，正文里的方括号/圆括号不再误伤。
+    """
     text = text or ""
-    tags = _EMOTION_TAG_RE.findall(text)
-    descs = _ACTION_DESC_RE.findall(text)
-    clean = _ACTION_DESC_RE.sub("", _EMOTION_TAG_RE.sub("", text))
-    return clean.strip(), tags, descs
+    tags, descs = [], []
+    rest = text
+    m = _EMOTION_TAG_RE.match(rest)
+    if m:
+        tags.append(m.group(1))
+        rest = rest[m.end():]
+        d = _ACTION_DESC_RE.match(rest)
+        if d:
+            descs.append(d.group(1))
+            rest = rest[d.end():]
+    return rest.strip(), tags, descs
 
 
 def strip_emotion_marks(text: str) -> str:
-    """剥掉情绪标签和语气描述，得到能直接展示、能落库的干净文本。"""
-    clean, _tags, _descs = _split_emotion(text)
+    """剥掉开头的情绪标签和语气描述，得到能直接展示、能落库的干净文本。"""
+    clean, _tags, _descs = split_emotion(text)
     return clean
 
 
@@ -157,7 +173,7 @@ class TTSTool:
             raise RuntimeError("语音合成服务没配置（TTS_API_KEY）")
         # 文本里带的 [情绪] 和（语气描述）是给合成器的：拆出来转成指令，
         # 剥干净的正文才拿去念，标记绝不能被念出来
-        clean, tags, descs = _split_emotion(text)
+        clean, tags, descs = split_emotion(text)
         if not clean:
             clean = (text or "").strip()
         # 文本里带了标记就以它为准，没带才用调用方显式传的指令

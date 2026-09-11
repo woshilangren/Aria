@@ -9,8 +9,8 @@ import hmac
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import APIRouter, FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -258,6 +258,76 @@ async def send_message(payload: dict) -> dict:
         except Exception:
             pass
     return data
+
+
+def _sse_frame(obj: dict) -> str:
+    """把一个事件序列化成一帧 SSE（`data: {...}\n\n`）。"""
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+@chat_router.post("/stream")
+async def stream_message(payload: dict, request: Request):
+    """流式对话：句级 SSE，逐帧推 start/emotion/sentence/voice/image/refuse/done/error。
+
+    与 /send 共用同一份管道实现（astream），差别只在把事件逐帧推给前端、
+    并在管道内部完成语音合成（synthesize_voice=True）。
+    客户端断开会取消该轮，别让后端继续烧 token。
+    """
+    text = (payload.get("text") or "").strip()
+    session_id = payload.get("session_id", "default")
+
+    async def _gen():
+        from orchestration.cancellation import TURN_REGISTRY
+
+        # 空消息不跑管道，直接回一句提示（与 /send 一致的兜底话术）
+        if not text:
+            tip = "一句话都不说吗？想聊什么直接说吧。"
+            yield _sse_frame({"type": "start", "turn_id": 0, "session_id": session_id, "text": ""})
+            yield _sse_frame({"type": "sentence", "seq": 1, "text": tip})
+            yield _sse_frame({"type": "done", "full_text": tip, "output_mode": "text", "image_path": ""})
+            return
+
+        gateway = _get_gateway()
+        image_url = payload.get("attachment") or payload.get("image_url") or ""
+        # 与 /send 同一套图片处理：只认 /uploads/ 相对路径，转 base64 内嵌
+        if image_url and image_url.startswith("/uploads/") and image_url.lower().split("?")[0].endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+        ):
+            image_url = _upload_to_data_url(image_url)
+        else:
+            image_url = ""
+        message = gateway["receiver"].receive(text, session_id, image_url=image_url)
+
+        turn_id = None
+        try:
+            async for ev in _get_orchestrator().astream(
+                message, synthesize_voice=True, want_voice=_wants_voice(text)
+            ):
+                if ev.get("type") == "start":
+                    turn_id = ev.get("turn_id")
+                if await request.is_disconnected():
+                    # 前端走了：取消该轮，后端尽快收工
+                    TURN_REGISTRY.cancel(session_id, turn_id)
+                    break
+                yield _sse_frame(ev)
+        except asyncio.CancelledError:
+            # 服务端把这个响应生成器取消了，同样把该轮标掉
+            TURN_REGISTRY.cancel(session_id, turn_id)
+            raise
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers=headers)
+
+
+@chat_router.post("/cancel")
+async def cancel_message(payload: dict) -> dict:
+    """取消某会话当前活跃的那一轮对话（后端据此停止生成、且不写记忆）。"""
+    from orchestration.cancellation import TURN_REGISTRY
+
+    session_id = payload.get("session_id", "default")
+    turn_id = payload.get("turn_id")
+    TURN_REGISTRY.cancel(session_id, turn_id)
+    return {"ok": True}
 
 
 @chat_router.get("/history")
