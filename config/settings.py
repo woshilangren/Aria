@@ -122,6 +122,23 @@ def load_app_config() -> dict:
         "personality": {
             "quirk_rate": 0.12,
         },
+        # 什么时候让模型"认真想"。不是全局开关——按输入复杂度逐轮判断
+        "thinking": {
+            "enabled": True,
+            "char_threshold": 60,          # 输入达到这个字数就触发
+            "never_on_comfort": True,      # 安抚轮永远不想：这时候要温度不是分析
+            "never_on_emotions": ["sad", "angry", "委屈"],
+            "force_if_last_poor": True,    # 上一轮被判敷衍/出戏，这轮强制想
+        },
+        # 表达尺度：极简反应的放行规则 + 长输入放开字数
+        "expression": {
+            "minimal_input_chars": 40,     # 输入超过这个数，极简回复才算敷衍
+            "minimal_allowlist": [],
+            "reaction_tag": "@r",
+            "long_input_chars": 60,        # 输入达到这个数就放开字数限制
+            "long_input_require_split": True,
+            "force_cut_chars": 40,
+        },
         "log": {"level": "INFO"},
     }
     path = PROJECT_ROOT / "config.json"

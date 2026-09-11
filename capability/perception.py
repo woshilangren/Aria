@@ -8,7 +8,7 @@
 import json
 import re
 
-from shared.singletons import get_llm
+from shared.singletons import get_llm, services
 from shared.types import EmotionResult, IntentResult
 
 # 意图只有这几种，模型答出别的就当它胡说，转头走规则兜底
@@ -74,14 +74,40 @@ def _parse_json(raw: str) -> dict:
     return json.loads(raw[start : end + 1])
 
 
+def _load_subtext_hints(text: str) -> str:
+    """从人设文件里捞命中本条消息的潜台词提示，拼成一段塞进感知提示词。
+
+    词典是作者自己维护的（persona_config.json 的 subtext_hints）——他最清楚
+    自己什么时候在说反话，这层模型补不了。没配或没命中就返回空串。
+    """
+    try:
+        persona = services.get("kv_store").read("persona_config", "")
+        hints = getattr(persona, "subtext_hints", None) or {}
+    except Exception:
+        return ""
+    hits = []
+    for surface, meaning in hints.items():
+        if surface and surface in text:
+            hits.append(f"「{surface}」可能不是字面意思：{meaning}")
+    return "\n".join(hits)
+
+
 class PerceptionPipeline:
-    """意图 + 情绪一次感知：危机词最优先，模型判一遍，词表兜底。"""
+    """意图 + 情绪 + 潜台词一次感知：危机词最优先，模型判一遍，词表兜底。
+
+    潜台词（弦外之音）与意图/情绪合在同一次调用里——不加调用次数，但覆盖
+    所有轮次。这很关键：潜台词最密集的恰恰是短消息（"我没事"、"随便"、
+    "呵呵"），这些轮根本不会触发思考阈值，塞进「想」那一步反而会漏。
+    """
 
     def run(self, text: str, recent_context: list = None) -> tuple:
-        """返回 (IntentResult, EmotionResult)。模型掉线或答非所问就退词表兜底。"""
+        """返回 (IntentResult, EmotionResult, subtext: str)。
+
+        模型掉线或答非所问就退词表兜底，subtext 兜底为空串。
+        """
         text = (text or "").strip()
         if not text:
-            return IntentResult(intent="chat", confidence=0.5), EmotionResult()
+            return IntentResult(intent="chat", confidence=0.5), EmotionResult(), ""
 
         # 危机信号最优先，直接匹配，宁可错杀不可放过；危机关头别的都靠边
         for word in _CRISIS_PATTERNS:
@@ -89,30 +115,40 @@ class PerceptionPipeline:
                 return (
                     IntentResult(intent="comfort", confidence=0.9),
                     EmotionResult(emotion="crisis", intensity=1.0, is_crisis=True),
+                    "",
                 )
+
+        hint_block = _load_subtext_hints(text)
+        hint_part = f"\n已知的潜台词提示（优先参考）：\n{hint_block}\n" if hint_block else ""
 
         try:
             prompt = (
-                "判断这条用户消息的意图和情绪。\n"
+                "判断这条用户消息的意图、情绪，以及有没有潜台词。\n"
                 "intent 从这些里选：\n"
                 "chat=普通闲聊\ncomfort=情绪低落需要安慰\nweather=问天气\n"
                 "search=要查资料或新闻\nimage=要生成图片\n"
                 "info_supply=主动报个人信息（比如报名字、说住在哪）\n"
                 "diary=想让AI写日记、把今天聊天记下来\n"
                 "emotion 从这些里选：neutral / happy / sad / angry / tired / anxious / crisis\n"
+                "subtext：字面之外可能想表达什么（反话、赌气、试探、没说出口的请求）。\n"
+                "没有就写\"无\"，不要硬凑。\n"
+                f"{hint_part}"
                 f"最近对话：{_recent_tail(recent_context or [])}\n"
                 f"用户消息：{text}\n"
                 '只输出 JSON：{"intent": "类别", "confidence": 0到1的小数, '
-                '"emotion": "类别", "intensity": 0到1的小数}'
+                '"emotion": "类别", "intensity": 0到1的小数, "subtext": "潜台词或无"}'
             )
             raw = get_llm().chat(
-                [{"role": "user", "content": prompt}], temperature=0.1, max_tokens=96
+                [{"role": "user", "content": prompt}], temperature=0.1, max_tokens=160
             )
             data = _parse_json(raw)
             intent = str(data.get("intent", ""))
             if intent not in _VALID_INTENTS:
                 raise ValueError(f"意图不在白名单里：{intent}")
             intensity = float(data.get("intensity", 0.3))
+            subtext = str(data.get("subtext", "") or "").strip()
+            if subtext in ("无", "无。", "none", "None"):
+                subtext = ""
             return (
                 IntentResult(intent=intent, confidence=float(data.get("confidence", 0.8))),
                 EmotionResult(
@@ -120,6 +156,7 @@ class PerceptionPipeline:
                     intensity=max(0.0, min(1.0, intensity)),
                     is_crisis=False,
                 ),
+                subtext,
             )
         except Exception:
             pass  # 模型掉线或答非所问都别慌，下面有词表兜底
@@ -137,7 +174,7 @@ class PerceptionPipeline:
                 break
         return IntentResult(intent=intent, confidence=confidence), EmotionResult(
             emotion=emotion, intensity=0.6 if emotion != "neutral" else 0.3
-        )
+        ), ""
 
 
 class SafetyReviewer:

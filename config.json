@@ -29,6 +29,22 @@
   "personality": {
     "quirk_rate": 0.12
   },
+  "thinking": {
+    "enabled": true,
+    "char_threshold": 60,
+    "never_on_comfort": true,
+    "never_on_emotions": ["sad", "angry", "委屈"],
+    "force_if_last_poor": true
+  },
+  "expression": {
+    "minimal_input_chars": 40,
+    "minimal_allowlist": ["...", "。。。", "？", "？？", "！", "!!", "6", "666",
+                          "神了", "不是哥们", "wdf", "哈", "哇", "切", "嗯", "哦", "哼"],
+    "reaction_tag": "@r",
+    "long_input_chars": 60,
+    "long_input_require_split": true,
+    "force_cut_chars": 40
+  },
   "log": {
     "level": "INFO"
   }

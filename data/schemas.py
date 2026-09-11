@@ -25,6 +25,7 @@ class PersonaConfig:
     # 目的是把"角色怎么说"全部收进 persona_config.json，改口吻不用改代码。
     fallback_replies: dict = field(default_factory=dict)  # 异常兜底话术，键见 FallbackController
     ask_templates: dict = field(default_factory=dict)  # 缺信息追问话术，键：city/birthday/nickname/occupation
+    subtext_hints: dict = field(default_factory=dict)  # 潜台词词典：他自己的反话/弦外之音，模型猜不出的那部分
     diary_notes: str = ""  # 写日记时的口吻补充要求
 
 

@@ -30,6 +30,8 @@ class PersonaEngine:
         session_id: str,
         emotion_label: str = "",
         quirk: str = "",
+        user_text: str = "",
+        subtext: str = "",
     ) -> PromptPackage:
         kv = services.get("kv_store")
         persona = kv.read("persona_config", "")
@@ -124,6 +126,41 @@ class PersonaEngine:
             "语气可以凶、可以软、可以闹性子，但话永远是好几句说完整的——绝不蹦单字、绝不只回一个词把人晾着。\n"
             "7. 带语音时，<voice> 里要念出完整的一段（1~3 句），别只放一个字；正文备注一短句即可。"
         )
+
+        # ---- 对抗 AI 腔：真人说话是增量式，只说对方还不知道的部分 ----
+        sections.append(
+            "【说话的规矩】\n"
+            "1. 他刚说过的事，绝对不要复述。要反应，不要总结。\n"
+            "2. 不要解释他显然已经知道的背景。\n"
+            "3. 可以只说半句，可以省略，可以跳着说。\n"
+            "4. 不知道就直说：\"我也说不上来\"\"就是怪\"\"反正就是\"。\n"
+            "5. 不要用\"首先/其次/最后\"\"综上所述\"\"值得注意的是\"这类词。\n"
+            "6. 有起伏——有的话重，有的话随便，不要每句都一样力度。\n"
+            "7. 允许跑题、联想、突然想起别的。\n"
+            "8. 可以有口癖：\"嗯\"\"就是\"\"怎么说呢\"\"不是\"。"
+        )
+
+        # ---- 潜台词：他这句话字面之外可能想表达什么 ----
+        if subtext:
+            sections.append(f"【潜台词提醒】他这句话可能不是字面意思：{subtext}。接的时候照顾到。")
+
+        # ---- 长输入放开字数：每个问题都答到，分句不松 ----
+        if user_text:
+            try:
+                from config.settings import load_app_config as _lac
+                cfg = _lac()["expression"]
+            except Exception:
+                cfg = {}
+            is_long = (
+                len(user_text) >= int(cfg.get("long_input_chars", 60))
+                or user_text.count("?") + user_text.count("？") >= 2
+            )
+            if is_long and cfg.get("long_input_require_split", True):
+                sections.append(
+                    "【这一轮别压字数】\n"
+                    "他这次说了很多，里面不止一个要点。每个问题、每个要点都要答到，"
+                    "不要压字数。可以分几段，每个要点另起一句，不要挤成一段。"
+                )
 
         return PromptPackage(
             system_prompt="\n\n".join(sections),

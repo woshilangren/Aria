@@ -172,12 +172,16 @@ class LLMClient:
 
     # ---------- 异步流式（C1a 只提供能力，尚未接入管道）----------
     async def astream_chat(
-        self, messages: list, temperature: float = None, max_tokens: int = None
+        self, messages: list, temperature: float = None,
+        max_tokens: int = None, enable_thinking: bool = None,
     ) -> AsyncIterator[str]:
         """异步流式补全：逐块 yield 文本增量。
 
         与同步 chat() 共用同一套熔断/降级状态（_opened_at / _error_count / _cooldown /
         _probe_timeout），不另起炉灶。
+
+        enable_thinking：本轮是否让模型认真想。None = 读 config 的全局开关；
+        True/False = 按本轮输入复杂度逐轮覆盖（管道判定）。
 
         流式降级的硬约束：**只能在还没吐出任何 token 之前换备用**——一旦已经 yield 过
         内容，再换备用也是接不上的半截话，所以那种情况直接抛，由上层收尾。
@@ -204,7 +208,10 @@ class LLMClient:
         )
         if not circuit_open:
             is_probe = self._opened_at is not None  # 半开探测：只在这时传短超时
-            thinking = load_app_config()["llm"].get("enable_thinking", False)
+            if enable_thinking is None:
+                thinking = load_app_config()["llm"].get("enable_thinking", False)
+            else:
+                thinking = enable_thinking
             kwargs.setdefault("extra_body", {"enable_thinking": thinking})
             if is_probe:
                 kwargs["timeout"] = self._probe_timeout

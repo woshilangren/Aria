@@ -511,7 +511,7 @@ async def voice_stream(websocket: WebSocket) -> None:
                         emotion = ""
                         try:
                             pipeline = PerceptionPipeline()
-                            _intent, emo = await asyncio.to_thread(
+                            _intent, emo, _st = await asyncio.to_thread(
                                 pipeline.run, user_text, KEEPER.get_context(session_id)[-4:]
                             )
                             emotion = emo.emotion

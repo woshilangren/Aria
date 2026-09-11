@@ -52,6 +52,7 @@ class PersonaConfigStore:
             memory_config=raw["memory_config"],
             fallback_replies=raw.get("fallback_replies", {}),
             ask_templates=raw.get("ask_templates", {}),
+            subtext_hints=raw.get("subtext_hints", {}),
             diary_notes=raw.get("diary_notes", ""),
         )
 

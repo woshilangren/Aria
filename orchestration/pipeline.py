@@ -57,6 +57,8 @@ from capability.quirks import MoodEngine, QuirkDirector
 from capability.response_generator import build_chat_messages, generate, persona_wrap
 from capability.toolcall import ToolCallOrchestrator
 
+from config.settings import load_app_config
+
 from orchestration.cancellation import TURN_REGISTRY, TurnCancelled
 from orchestration.managers import FallbackController, InfoGapCoordinator
 from shared.singletons import services
@@ -96,6 +98,8 @@ _FIRST_HOLD_MAX = 4
 # <voice> / </voice> 标签
 _VOICE_OPEN = "<voice>"
 _VOICE_CLOSE = "</voice>"
+# 模型自标的"本能反应"前缀：看到就放行极简判定，推送前剥掉
+_REACTION_TAG = "@r"
 
 
 class _ReviewReject(Exception):
@@ -128,7 +132,10 @@ class TurnState:
     safety_passed: bool = True
     intent: Optional[IntentResult] = None
     emotion: Optional[EmotionResult] = None
+    subtext: str = ""                # 感知步骤读出的潜台词/弦外之音
     comfort_mode: bool = False
+    think: bool = False              # 本轮是否触发"认真想"（按输入复杂度逐轮判定）
+    reaction_tagged: bool = False    # 模型自标了 @r（这一句是本能反应）
     memory: Optional[MemoryBundle] = None
     prompt: Optional[PromptPackage] = None
     draft_reply: str = ""
@@ -173,6 +180,43 @@ def _is_onechar_reply(reply: str) -> bool:
     """单字崩检测：整句去掉空格标点后只剩 1 个汉字/字母/数字，判为敷衍。
     被夸/被闹时小模型爱用"哼/啧/哈/你/哦"单字打发，这里硬拦。"""
     return _subst_count(reply) <= 1
+
+
+# 「想」的触发正则：出现这些模式说明这条消息需要动脑（连问/追问原因/取舍/要观点）
+_THINK_RE = re.compile(
+    r"[?？]\s*.{0,40}[?？]"           # 多个问号 / 连问
+    r"|为什么|怎么会|凭什么|咋就"        # 追问原因
+    r"|怎么办|该怎么|要不要|还是|选哪个"  # 取舍 / 决策
+    r"|帮我(想|分析|看看|比较|总结|梳理)"  # 明确要动脑
+    r"|你觉得|你认为|你的看法|怎么看"     # 要观点
+    r"|第一|第二|首先|其次|另外"         # 多要点
+)
+
+
+def _needs_thinking(state: TurnState) -> bool:
+    """这一轮要不要让模型"认真想"。按输入复杂度逐轮判定，不是全局开关。
+
+    反向规则比正向更重要：安抚和情绪回应绝对不想——这时候要温度，一分析就
+    变成心理咨询师了（用户说的"开思考智商高情商低"就是这个）。
+    """
+    cfg = load_app_config()["thinking"]
+    if not cfg.get("enabled", True):
+        return False
+    # 安抚轮 + 情绪轮：绝对不想
+    if state.comfort_mode and cfg.get("never_on_comfort", True):
+        return False
+    emo = state.emotion.emotion if state.emotion else "neutral"
+    if emo in (cfg.get("never_on_emotions") or []):
+        return False
+    # 短情绪消息：也不要想（比如"我今天好难过"——要的是陪伴）
+    if emo in ("sad", "tired") and _subst_count(state.user_text) < 20:
+        return False
+    # 该想的：字数达到阈值，或命中复杂度正则
+    if len(state.user_text) >= int(cfg.get("char_threshold", 60)):
+        return True
+    if _THINK_RE.search(state.user_text):
+        return True
+    return False
 
 
 def _too_short_input(user_text: str) -> str:
@@ -230,6 +274,8 @@ class _ReplyStreamer:
     def __init__(self, voice_mode: bool):
         self.voice_mode = voice_mode
         self.emitted_content = False  # 是否已产出过 sentence/voice
+        self.reaction_tagged = False  # 模型自标了 @r：这一句是本能反应
+        self._tag_checked = False     # 是否已经检查过开头的 @r
         self._emotion_done = not voice_mode
         self._emo_buf = ""
         self._raw = ""  # 待处理原始文本（可能含被截断的标签）
@@ -237,6 +283,17 @@ class _ReplyStreamer:
         self._voice_buf = ""
         self._text_buf = ""
         self._held = None  # 首句短缓冲
+
+    # ---- 反应标记 @r：只看每个片段的开头，剥掉并登记 ----
+    def _maybe_strip_tag(self, s: str) -> str:
+        if self._tag_checked or self.reaction_tagged:
+            return s
+        self._tag_checked = True
+        t = s.lstrip()
+        if t.startswith(_REACTION_TAG):
+            self.reaction_tagged = True
+            return t[len(_REACTION_TAG):].lstrip()
+        return s
 
     # ---- 情绪前缀 ----
     def _emit_emotion(self, emo, desc, rest, out):
@@ -289,6 +346,7 @@ class _ReplyStreamer:
 
     # ---- 片段产出（含首句短缓冲）----
     def _push_sentence(self, s, out):
+        s = self._maybe_strip_tag(s)
         if self._held is not None:
             out.append(("sentence", self._held))
             self._held = None
@@ -300,6 +358,7 @@ class _ReplyStreamer:
         self.emitted_content = True
 
     def _push_voice(self, v, out):
+        v = self._maybe_strip_tag(v)
         if self._held is not None:
             out.append(("sentence", self._held))
             self._held = None
@@ -494,8 +553,10 @@ class DialoguePipeline:
                 yield {"type": "done", "full_text": text, "output_mode": "text", "image_path": ""}
                 return
 
-            # ② 感知（意图 + 情绪 + 记忆召回）
+            # ② 感知（意图 + 情绪 + 潜台词 + 记忆召回）
             await asyncio.to_thread(self._perceive, state)
+            # 逐轮判定要不要"认真想"（不是全局开关）
+            state.think = _needs_thinking(state)
             self._check_cancel(handle)
 
             # ③ 分流：工具链 / 人设链
@@ -569,7 +630,9 @@ class DialoguePipeline:
         # 而审核重写的判据必须是"真推过"，否则首句被拦时会被误判成"已推过"直接降级。
         pushed = False
         try:
-            async for chunk in services.get("llm").astream_chat(messages):
+            async for chunk in services.get("llm").astream_chat(
+                messages, enable_thinking=state.think
+            ):
                 self._check_cancel(handle)  # ① 每个 token 之后
                 raw_parts.append(chunk)
                 for frag in streamer.feed(chunk):
@@ -579,13 +642,33 @@ class DialoguePipeline:
                         yield ev
 
             # 正常收尾：处理首句短缓冲（可能触发安全重写）
+            state.reaction_tagged = streamer.reaction_tagged
             for frag in streamer.finish():
                 if frag[0] == "held":
                     # 整轮只剩一句短话——此时一个 token 都还没推，重写是安全的。
-                    # 判据用 _is_onechar_reply（≤1 实质字符），与改造前一致；
-                    # 只有它命中才重写，所以 "好的。" 这种正常短句不会被误重写。
-                    if not _is_onechar_reply(frag[1]):
-                        async for ev in self._emit_frags([("sentence", frag[1])], state, handle, synthesize_voice, seq):
+                    #
+                    # 判定分两层（见方案第六节）：
+                    # ① 反应之后有没有下文——剥掉反应前缀后还有实质内容就放行，
+                    #    不管多短（"？你说的是真的？"、"6，这也行？"都是正常形态）
+                    # ② 只剩反应、没下文时，再看这一轮需不需要实质回应：
+                    #    长输入 / 含明确提问 / 情绪求助 → 算敷衍，重写
+                    #    短闲聊 / 小脾气 → 放行（"哼"是小脾气不是敷衍）
+                    held_text = frag[1]
+                    has_followup = _subst_count(held_text) > 1
+                    if has_followup or state.reaction_tagged:
+                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
+                            if ev.get("type") in ("sentence", "voice"):
+                                pushed = True
+                            yield ev
+                        continue
+                    needs_substance = (
+                        len(state.user_text) >= int(load_app_config()["expression"].get("minimal_input_chars", 40))
+                        or "?" in state.user_text or "？" in state.user_text
+                        or state.comfort_mode
+                    )
+                    if not needs_substance:
+                        # 闲聊/短陈述：极简放行，不算敷衍
+                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
                             if ev.get("type") in ("sentence", "voice"):
                                 pushed = True
                             yield ev
@@ -741,10 +824,11 @@ class DialoguePipeline:
         with ThreadPoolExecutor(max_workers=2) as pool:
             ft = pool.submit(pipeline.run, state.user_text, recent)
             fr = pool.submit(MemoryRecaller().recall, state.user_text, state.session_id)
-            intent, emotion = ft.result()
+            intent, emotion, subtext = ft.result()
             state.memory = fr.result()
         state.intent = intent
         state.emotion = emotion
+        state.subtext = subtext
         # 危机信号或用户明说要安慰，都切安抚模式
         state.comfort_mode = bool(emotion.is_crisis) or intent.intent == "comfort"
 
@@ -766,6 +850,8 @@ class DialoguePipeline:
             state.session_id,
             emotion_label=emotion.emotion if emotion else "",
             quirk=quirk,
+            user_text=state.user_text,
+            subtext=state.subtext,
         )
 
     def _toolcall(self, state: TurnState, handle) -> None:
