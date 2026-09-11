@@ -15,6 +15,12 @@ from pydantic import BaseModel
 
 from shared.types import InputMessage
 
+# 上传文件大小上限（20MB）；一次从上传流里读多少字节做累加校验。
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+# 语音缓冲上限：10MB 裸 PCM16 ≈ 16kHz 单声道约 5 分钟音频，够用又能防无界增长。
+_MAX_VOICE_BUFFER_BYTES = 10 * 1024 * 1024
+
 
 def _build_realtime_instructions(session_id: str) -> str:
     """组装实时专线的开场白：人设 + 语音通话规矩 + 关于用户的记忆。
@@ -238,12 +244,15 @@ async def send_message(payload: dict) -> dict:
         image_url = ""
     message = gateway["receiver"].receive(text, payload.get("session_id", "default"), image_url=image_url)
     reply = await _get_orchestrator().handle(message)
-    data = gateway["renderer"].render(reply, message.session_id)
+    # render 内部有秒级同步网络调用，扔线程池，别堵住事件循环（否则并发语音通话一起僵死）
+    data = await asyncio.to_thread(gateway["renderer"].render, reply, message.session_id)
     # 兜底：AI 这轮没给自己标语音、但用户明确点名要语音时，把简短正文也合一条语音；
     # 已主动带语音就不重复。TTS 失败只是少声音，文字照常回。
     if _wants_voice(text) and not data.get("voice_audio"):
         try:
-            audio = gateway["renderer"].render_voice(data.get("text") or "", message.session_id)
+            audio = await asyncio.to_thread(
+                gateway["renderer"].render_voice, data.get("text") or "", message.session_id
+            )
             data["voice_audio"] = base64.b64encode(audio).decode()
         except Exception:
             pass
@@ -295,8 +304,11 @@ async def chat_voice_replay(payload: dict) -> dict:
     try:
         audio = get_cached_voice(text)
         if audio is None:
-            audio = _get_gateway()["renderer"].render_voice(
-                text, payload.get("session_id", "default")
+            # 合成是同步网络调用，扔线程池，别堵事件循环
+            audio = await asyncio.to_thread(
+                _get_gateway()["renderer"].render_voice,
+                text,
+                payload.get("session_id", "default"),
             )
             save_cached_voice(text, audio)
         return {"ok": True, "voice_audio": base64.b64encode(audio).decode()}
@@ -327,11 +339,23 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
     stamp = time.strftime("%Y%m%d%H%M%S")
     fname = f"{stamp}_{Path(raw).name}"
     dest = up_dir / fname
-    data = await file.read()
-    if len(data) > 20 * 1024 * 1024:  # 20MB 上限
+    # 分块读边写边累加：超限立刻停、删掉半成品文件，别把整个大文件先读进内存再判断（会 OOM）
+    total = 0
+    oversize = False
+    try:
+        with open(dest, "wb") as f:
+            while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    oversize = True
+                    break
+                f.write(chunk)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+    if oversize:
+        dest.unlink(missing_ok=True)
         return {"ok": False, "error": "文件超过 20MB 上限"}
-    with open(dest, "wb") as f:
-        f.write(data)
     return {"ok": True, "url": f"/uploads/{fname}", "name": Path(raw).name}
 
 
@@ -494,6 +518,14 @@ async def voice_stream(websocket: WebSocket) -> None:
                 buffer = b""
             else:
                 buffer += chunk
+                # 客户端一直发二进制帧却从不发 END，buffer 会无界增长到 OOM：
+                # 到上限就清空并提醒用户，异常咽掉别炸连接
+                if len(buffer) > _MAX_VOICE_BUFFER_BYTES:
+                    buffer = b""
+                    try:
+                        await stream.send_text("语音太长了，我先截断了，你分几次说吧")
+                    except Exception:
+                        pass
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -502,9 +534,17 @@ async def voice_stream(websocket: WebSocket) -> None:
         print(f"[voice] 连接断开：{exc}（连接持续 {_time.time() - _conn_start:.0f}s）")
     finally:
         print(f"[voice] 连接关闭（持续 {_time.time() - _conn_start:.0f}s）")
+        # close() 可能抛异常，各自独立包裹：绝不能让它把后面的连接簿清理一起跳过，
+        # 否则 ConnectionKeeper 里会残留死会话
         if realtime_client is not None:
-            await realtime_client.close()
-        _get_gateway()["connections"].on_disconnect(session_id)
+            try:
+                await realtime_client.close()
+            except Exception:
+                pass
+        try:
+            _get_gateway()["connections"].on_disconnect(session_id)
+        except Exception:
+            pass
 
 
 # ---------- 系统路由 ----------

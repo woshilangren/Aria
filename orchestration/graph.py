@@ -56,7 +56,7 @@ class DialogueState(TypedDict, total=False):
     user_text: str                        # 用户消息文本
     session_id: str                       # 会话 ID
     voice_mode: bool                      # 是否语音轮（语音轮回复要带情绪标注）
-    user_image: str = ""                  # 用户随消息上传的图片地址（多模态模型看）
+    user_image: str                       # 用户随消息上传的图片地址（多模态模型看）
 
     # 各节点产出
     safety_passed: bool                   # 安全预检是否通过
@@ -69,6 +69,7 @@ class DialogueState(TypedDict, total=False):
     tool_results: list                    # 工具管线跑出来的结果列表
     rewrite_count: int                    # 后置审核后已重写的次数
     review_passed: bool                   # 后置审核是否通过
+    review_block_reason: str              # 审核未通过的原因（如 too_short，重写时据此换提示）
     final_reply: str                      # 最终回复
     output_mode: str                      # text / image
     image_path: str                       # 回复带图时的图片路径

@@ -5,6 +5,7 @@
 挂在 /ui 路径下，装载的事归 api.py 管。
 """
 
+import asyncio
 import uuid
 
 import gradio as gr
@@ -31,7 +32,8 @@ def build_gradio_app() -> gr.Blocks:
         """点发送之后的事：收消息 -> 过主对话图 -> 渲染回复 -> 刷回页面。"""
         msg = receiver.receive(message, session_id)
         reply = await orchestrator.handle(msg)
-        data = renderer.render(reply, session_id)
+        # render 内部有秒级同步网络调用，扔线程池，别堵事件循环
+        data = await asyncio.to_thread(renderer.render, reply, session_id)
         text = data["text"]
         if data["output_mode"] == "image" and data["image_path"]:
             text += f"\n\n（图：{data['image_path']}）"
