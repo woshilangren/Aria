@@ -232,6 +232,10 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);overflow:hid
 .msg.me .bubble{background:linear-gradient(135deg,#4f6ef7,#6366f1);color:#fff;border-bottom-right-radius:6px;box-shadow:0 6px 24px -8px rgba(79,110,247,.4)}
 .msg.ai .bubble{background:var(--glass-heavy);backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2);border:1px solid var(--glass-border);color:var(--text);border-bottom-left-radius:6px;box-shadow:var(--glass-shadow)}
 .msg .tag{font-size:10px;color:var(--text-faint)}
+/* 被打断的一轮：气泡留痕（用户已经看到了，删掉反而困惑），但置灰不再抢眼 */
+.msg.ai.cut{opacity:.5}
+.msg.ai.cut .bubble{background:rgba(0,0,0,.04);box-shadow:none;border-color:var(--line)}
+.msg .cut-tag{font-size:10px;color:var(--text-faint);border:1px solid var(--line-2);border-radius:4px;padding:0 4px;margin-left:2px}
 .typing{display:inline-flex;gap:5px;align-items:center;padding:12px 14px}
 .typing i{width:6px;height:6px;border-radius:50%;background:var(--text-faint);animation:blink 1.4s infinite}
 .typing i:nth-child(2){animation-delay:.2s}
@@ -611,108 +615,199 @@ function appendMsg(kind, inner, timeStr) {
 function userText(t) { return appendMsg("me", `<div class="bubble">${esc(t)}</div>`); }
 function aiTyping() { return appendMsg("ai", `<div class="bubble typing"><i></i><i></i><i></i></div>`); }
 
-// ---------- 分段渲染：整条回复拆成 ≤50 字的 3-4 段，一段一个气泡，中间打字动画 ----------
-let animSeq = 0; // 新一轮打断旧动画用的序号
-function splitSentences(t) {
-  // 不用正则 lookbehind（老 Safari 解析整个脚本都会炸），手动按句读切
-  const out = []; let buf = "";
-  for (const ch of t) {
-    buf += ch;
-    if ("。！？；!?;\n".includes(ch)) { out.push(buf); buf = ""; }
+// ---------- SSE 解析：把字节流切成一帧帧 JSON ----------
+// 后端每帧形如 `data: {...}\n\n`。TCP/read() 不保证一次给一整帧，
+// 一帧被切成两次 read 是流式前端最经典的坑，所以这里只按 \n\n 切，
+// 没凑齐的半帧原样留在缓冲区里等下次。返回 [完整帧数组, 剩余缓冲]。
+function parseSSEFrames(buffer) {
+  const frames = [];
+  let rest = buffer;
+  let idx = rest.indexOf("\n\n");
+  while (idx !== -1) {
+    const raw = rest.slice(0, idx);
+    rest = rest.slice(idx + 2);
+    // 一帧里可能有多行 data:（标准 SSE 允许），这里只取 data: 开头的行拼起来
+    const payload = raw.split("\n")
+      .filter(l => l.startsWith("data:"))
+      .map(l => l.slice(5).trim())
+      .join("");
+    if (payload) {
+      try { frames.push(JSON.parse(payload)); } catch (e) { /* 单帧坏了不拖垮整条流 */ }
+    }
+    idx = rest.indexOf("\n\n");
   }
-  if (buf.trim()) out.push(buf);
-  return out.map(s => s.trim()).filter(Boolean);
+  return [frames, rest];
 }
-function splitReply(text) {
-  const t = (text || "").trim();
-  if (!t) return [];
-  const sents = splitSentences(t);
-  if (t.length <= 55) return [t];
-  if (sents.length <= 1) {
-    // 整段没有句读的长文本：按 50 字硬切，别让硬切逻辑被提前返回绕过去
-    const out = [];
-    for (let i = 0; i < t.length; i += 50) out.push(t.slice(i, i + 50));
-    return out;
-  }
-  const segs = []; let cur = "";
-  for (const s of sents) {
-    // 收段阈值 40：一般回复正好 3-4 段，单段不超 50；单句超长的硬切
-    if (cur && (cur + s).length > 40) { segs.push(cur); cur = s; }
-    else { cur = cur ? cur + s : s; }
-    while (cur.length > 80) { segs.push(cur.slice(0, 50)); cur = cur.slice(50); }
-  }
-  if (cur) segs.push(cur);
-  while (segs.length > 4) { const last = segs.pop(); segs[segs.length - 1] += last; } // 最多 4 段
-  return segs;
+
+// 一个 sentence 事件追加一个气泡（真正的分句来自后端，前端不再自己切）
+function appendAiBubble(text) {
+  return appendMsg("ai", `<div class="bubble">${esc(text)}</div>`);
 }
-function renderAiSegments(text, extraHtml) {
-  const seq = ++animSeq;
-  const segs = splitReply(text);
-  if (!segs.length) { if (extraHtml) appendMsg("ai", extraHtml); return; }
-  let chain = Promise.resolve();
-  segs.forEach((seg, i) => {
-    chain = chain.then(() => new Promise(res => {
-      if (seq !== animSeq) { res(); return; }  // 用户打断：旧消息别再往外蹦了
-      const typing = aiTyping();
-      setTimeout(() => {
-        if (seq !== animSeq) { typing.remove(); res(); return; }
-        typing.querySelector(".typing").outerHTML = `<div class="bubble">${esc(seg)}</div>`;
-        scrollDown();
-        setTimeout(res, 380); // 段间隔，像一条条发出来的
-      }, i === 0 ? 0 : 420);
-    }));
+// 第一条内容到达：把打字指示器收掉
+function firstContent(turn) {
+  if (turn && turn.typing) { try { turn.typing.remove(); } catch (e) {} turn.typing = null; }
+}
+// refuse(replace:true) / 本地出错：整轮替换成一句话
+function replaceTurn(turn, text) {
+  firstContent(turn);
+  (turn.bubbles || []).forEach(b => { try { b.remove(); } catch (e) {} });
+  turn.bubbles = [appendAiBubble(text)];
+}
+// 被打断：已推出的气泡保留、置灰 +「已打断」留痕，新回复在下方另起
+function markCut(turn) {
+  if (!turn) return;
+  firstContent(turn);
+  (turn.bubbles || []).forEach(b => {
+    if (!b) return;
+    b.classList.add("cut");
+    const w = b.querySelector(".who");
+    if (w && !w.querySelector(".cut-tag")) {
+      const s = document.createElement("span");
+      s.className = "cut-tag"; s.textContent = "已打断";
+      w.appendChild(s);
+    }
   });
-  chain.then(() => { if (seq === animSeq && extraHtml) appendMsg("ai", extraHtml); });
+}
+
+// ---------- 逐事件渲染 ----------
+function handleStreamEvent(ev, turn) {
+  switch (ev.type) {
+    case "start":
+      turn.turnId = ev.turn_id; // 打断时要带着它去 /api/chat/cancel
+      return;
+    case "emotion":
+      // 语音轮的语气提示：只是给合成器看的标记，不显示成文字
+      return;
+    case "sentence":
+      firstContent(turn);
+      turn.bubbles.push(appendAiBubble(ev.text || ""));
+      return;
+    case "voice": {
+      firstContent(turn);
+      // 有音频就存进 voiceStore 出可点的语音条；没有就只留一条可回放的占位
+      const html = ev.audio_b64
+        ? renderVoiceNote(ev.audio_b64)
+        : replayVoiceBarHtml(ev.voice_text || "语音");
+      turn.bubbles.push(appendMsg("ai", html));
+      return;
+    }
+    case "image":
+      firstContent(turn);
+      turn.bubbles.push(appendMsg("ai", attachHtml(ev.path, "图片回复")));
+      return;
+    case "refuse":
+      // replace:true —— 整轮替换，已推出去的句子撤不回
+      replaceTurn(turn, ev.text || "");
+      return;
+    case "cancelled":
+      markCut(turn);
+      return;
+    case "error":
+      replaceTurn(turn, "……刚才出了点问题：" + (ev.message || ev.code || "未知错误"));
+      return;
+    case "done":
+      return;
+  }
 }
 
 // ---------- 发送：打断 + 合并 + 断线重试 ----------
-let inFlight = null;  // {ctrl, typing, texts}：还在生成中的一轮
-let retrySend = null; // 断线时没发出去的话，回前台自动重发
+let inFlight = null;    // {ctrl, typing, texts, bubbles, turnId}：还在生成中的一轮
+let retrySend = null;   // 断线时没发出去的话，回前台自动重发
+let pendingTexts = [];  // 合并窗口里攒下的话（打断旧轮之后新打的）
+let pendingAtt = "";    // 合并窗口里攒下的附件
+let mergeTimer = null;
+// 合并窗口 500ms：现有段落间隔是 380/420ms，500ms 约等于"一拍"，用户无感。
+// 连打三句从"3 次 abort + 3 次请求"变成"1 次白烧 + 1 次真请求"。
+const MERGE_MS = 500;
+
 async function doSend(texts, attachment) {
   const typing = aiTyping(); setLive("busy"); $("send").disabled = true;
   const ctrl = new AbortController();
-  inFlight = { ctrl, typing, texts };
+  const turn = { ctrl, typing, texts, bubbles: [], turnId: null };
+  inFlight = turn;
   try {
-    const resp = await fetch("/api/chat/send", {
+    const resp = await fetch("/api/chat/stream", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: ctrl.signal,
       body: JSON.stringify({ text: texts.join("\n"), session_id: "default", attachment: attachment || "" })
     });
-    const data = await resp.json();
-    if (inFlight && inFlight.typing === typing) typing.remove();
-    // Aria自己带了语音：说话为主，同一条里放简短文字 + 语音条（不套白框），时间是此刻
-    if (data.voice_audio) {
-      const body = ((data.text || "").trim() ? `<div class="bubble">${esc(data.text)}</div>` : "") + renderVoiceNote(data.voice_audio);
-      appendMsg("ai", body, nowT());
-    } else {
-      renderAiSegments(data.text || "", data.image_path ? attachHtml(data.image_path, "图片回复") : "");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    if (!resp.body) throw new Error("no stream body");
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder("utf-8");
+    let buf = "";
+    while (true) {
+      const rd = await reader.read();
+      if (rd.done) break;
+      // stream:true 让被 read 边界切断的多字节汉字在下次拼接时正确还原
+      buf += dec.decode(rd.value, { stream: true });
+      const out = parseSSEFrames(buf);   // 没凑齐 \n\n 的半帧会留在 out[1] 里
+      buf = out[1];
+      out[0].forEach(ev => handleStreamEvent(ev, turn));
+    }
+    // 兜底：后端 done 一定以 \n\n 收尾，这里是防御（比如连接被中途掐断留下半帧）
+    if (buf.trim()) {
+      const out = parseSSEFrames(buf + "\n\n");
+      out[0].forEach(ev => handleStreamEvent(ev, turn));
     }
     setLive("ok"); retrySend = null;
   } catch (e) {
-    if (ctrl.signal.aborted) return; // 被新发送打断：UI 已由新一轮接管
-    if (inFlight && inFlight.typing === typing) {
-      typing.querySelector(".typing").outerHTML = `<div class="bubble">……刚才信号断了，这条没收到，再说一遍？</div>`;
-    }
+    if (e && (e.name === "AbortError" || ctrl.signal.aborted)) return; // 被新输入顶掉：UI 已由新一轮接管
+    firstContent(turn);
+    appendAiBubble("……刚才信号断了，这条没收到，再说一遍？");
     setLive("off"); retrySend = texts;
   } finally {
+    firstContent(turn); // 无论如何把打字指示器收掉
     if (!inFlight || inFlight.ctrl === ctrl) { $("send").disabled = false; inFlight = null; }
   }
 }
+
+// 打断当前轮：先通知后端取消，再掐本地连接，最后给已推出的气泡留痕
+function cancelInFlight() {
+  const t = inFlight;
+  if (!t) return;
+  // start 事件还没到就打断时 turnId 是 null，后端按"该会话当前活跃轮"来取消，一样命中
+  const body = { session_id: "default" };
+  if (t.turnId != null) body.turn_id = t.turnId;
+  fetch("/api/chat/cancel", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).catch(() => {});
+  try { t.ctrl.abort(); } catch (e) {}
+  markCut(t);
+}
+
 async function send() {
   const inp = $("input"); const v = inp.value.trim();
   if (!v) return;
-  let texts = [v];
-  if (inFlight) {
-    // 打断机制：上一条还在生成，掐掉请求，两句话合并成一条一起问
-    try { inFlight.ctrl.abort(); } catch (e) {}
-    if (inFlight.typing) inFlight.typing.remove();
-    animSeq++; // 旧回复的分段动画也一并停掉
-    texts = [...(inFlight.texts || []), v];
-  }
+  const up = pendingUp; if (up) clearUp();
   inp.value = ""; resize(); block();
-  const up = pendingUp; if (up) { clearUp(); userText(up.name ? "📎 " + up.name : ""); }
-  texts.forEach(t => userText(t));
-  doSend(texts, up ? up.url : "");
+  if (up) userText(up.name ? "📎 " + up.name : "");
+  userText(v);
+  const att = up ? up.url : "";
+
+  if (!inFlight && !mergeTimer) {
+    doSend([v], att);   // 空闲：立即发送
+    return;
+  }
+  // 有在飞的轮次（或合并窗口还开着）：取消旧的、把话攒起来、重置计时器
+  // 打断只让那次"生成"白费，用户打的字不能丢——被打断那句也要接过来一起合并，
+  // 否则用户得把上一句重打一遍（他要的是"整合用户发的消息一起回复"）。
+  const carried = (inFlight && inFlight.texts) ? inFlight.texts.slice() : [];
+  cancelInFlight();
+  // 守卫：第二次打断时 inFlight 可能还没被 finally 清掉（abort 是异步的），
+  // 不判空就会把同一批话塞两遍
+  if (carried.length && pendingTexts.length === 0) pendingTexts.push(...carried);
+  pendingTexts.push(v);
+  if (att) pendingAtt = att;
+  clearTimeout(mergeTimer);
+  mergeTimer = setTimeout(() => {
+    mergeTimer = null;
+    const texts = pendingTexts.slice();
+    const a = pendingAtt;
+    pendingTexts = []; pendingAtt = "";
+    doSend(texts, a);
+  }, MERGE_MS);
 }
 
 function quick(t) { $("input").value = t; send(); }
