@@ -131,6 +131,32 @@ storage/                 运行时数据（.gitignore 已排除，备份这一�
 - SSE 流式**没有经过内网穿透实测**。如果你用 cpolar 之类把服务穿到手机上，要自己确认句子是不是真的逐句到达——部分穿透服务会缓冲 SSE，症状是攒到最后一起冒出来，本机测不出来
 - `requirements.lock` 是本机 `pip freeze` 出来的参考，没在全新机器上验证过安装
 
+## 本地跑测试
+
+测试资产都在 `tests/` 下，用项目自己的虚拟环境跑：
+
+```bash
+.venv\Scripts\pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest
+```
+
+- `tests/unit/` —— 纯逻辑单测（对话管道的判定函数、感知的词表兜底、工具调用的规则与安检），
+  **不启应用、不联网、不需要任何密钥**。
+- `tests/integration/` —— 真起 FastAPI 应用的冒烟测试（健康检查 / 口令门卫 / 路由注册），
+  标记为 `integration`。环境不满足（导不进应用、起不动应用）时会**优雅 skip，不会 fail**。
+
+只跑单元测试、跳过集成测试：
+
+```bash
+.venv\Scripts\python -m pytest -m "not integration"
+```
+
+测试进程由 `tests/conftest.py` 注入**假环境变量**，`DATA_DIR` 一律指向临时目录——
+**不会读写 `.env` 里的真实密钥，也不会写进仓库的 `storage/`**。
+
+CI 见 `.github/workflows/ci.yml`：`push` / `pull_request` 到 `master` 时用 Python 3.14
+装依赖并跑 `pytest`（不配置任何 secrets，离线可跑）。
+
 ## License
 
 [MIT](LICENSE)
