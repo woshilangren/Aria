@@ -307,16 +307,12 @@ def _on_bg_done(task) -> None:
             print(f"[bg] 后台写回异常: {type(exc).__name__}: {exc}")
 
 
-def _schedule_bg_writeback(fn, *args) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # 无事件循环（测试直调 _writeback）：退化为同步执行，行为与挪后台前一致
-        fn(*args)
-        return
-    task = asyncio.create_task(asyncio.to_thread(fn, *args))
-    _BG_TASKS.add(task)
-    task.add_done_callback(_on_bg_done)
+def _schedule_bg_writeback(deferred) -> None:
+    """把 writeback 返回的后台待办逐个调度（必须在持有 running loop 的一侧调用）。"""
+    for fn in deferred or []:
+        task = asyncio.create_task(asyncio.to_thread(fn))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_on_bg_done)
 
 
 def _clean_review_input(user_text: str) -> str:
@@ -648,7 +644,7 @@ class DialoguePipeline:
             await asyncio.to_thread(self._safety_precheck, state)
             self._check_cancel(handle)
             if not state.safety_passed:
-                text = fallback_line("blocked", session_id, default=FallbackController().fallback_reply("blocked"))
+                text = fallback_line("blocked", state.session_id, default=FallbackController().fallback_reply("blocked"))
                 state.final_reply = text
                 state.review_block_reason = "输入未过安全预检"
                 yield {"type": "refuse", "text": text, "replace": True, "reason": state.review_block_reason}
@@ -679,10 +675,12 @@ class DialoguePipeline:
                         voice_emitted = True
                     yield ev
 
-            # ④ 记忆写回（含取消检查点，保证迟到的取消不会写出半截账）
+            # ④ 记忆写回（含取消检查点，保证迟到的取消不会写出半截账）。
+            # 写回跑在工作线程（无事件循环），它**不自己调度**后台待办，
+            # 而是把闭包列表带回来由这里（持有 loop 的一方）调度——I11
+            deferred = await asyncio.to_thread(self._writeback, state, handle)
             self._check_cancel(handle)
-            await asyncio.to_thread(self._writeback, state, handle)
-            self._check_cancel(handle)
+            _schedule_bg_writeback(deferred)
 
             # ⑤ _wants_voice 兜底：用户点名要语音但整轮没出 <voice>，用简短正文补一条
             if want_voice and not voice_emitted:
@@ -810,7 +808,7 @@ class DialoguePipeline:
                             yield ev
                         return
                     state.was_poor = True
-                    raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
+                    raise _RefuseTurn(fallback_line("review", state.session_id, default=FallbackController().fallback_reply("review")))
                 async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
                     if ev.get("type") in ("sentence", "voice"):
                         pushed = True
@@ -827,7 +825,7 @@ class DialoguePipeline:
             if pushed:
                 # 已经推过内容 → 撤不回，整轮降级成兜底话（与改造前行为一致）
                 state.was_poor = True
-                raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
+                raise _RefuseTurn(fallback_line("review", state.session_id, default=FallbackController().fallback_reply("review")))
             if attempt < _MAX_REWRITE:
                 # 一个 token 都还没推 → 换个干净说法重跑一次。
                 # 与单字崩那条重写是同一条机制：共用 attempt 计数与 _MAX_REWRITE 上限。
@@ -840,7 +838,7 @@ class DialoguePipeline:
                 return
             # 一个 token 都没推、重写额度也用尽 → 整轮降级
             state.was_poor = True
-            raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
+            raise _RefuseTurn(fallback_line("review", state.session_id, default=FallbackController().fallback_reply("review")))
         except Exception:
             # 主/备模型都挂了，或中途断流
             if streamer.emitted_content:
@@ -1054,13 +1052,13 @@ class DialoguePipeline:
             _enrich_telegraph(state.user_text),
             initial_text=state.draft_reply,
             extra=extra,
-            session_id=session_id,
+            session_id=state.session_id,
         )
         state.final_reply = reply.text
         state.output_mode = reply.output_mode
         state.image_path = reply.image_path
 
-    def _writeback(self, state: TurnState, handle) -> None:
+    def _writeback(self, state: TurnState, handle) -> list:
         """记忆写回。短期记忆、长期沉淀、亲密度、画像，一样别落。
 
         取消检查点插在每个子步骤之前：迟到的取消（被新轮顶掉）不会写出半截账。
@@ -1144,7 +1142,7 @@ class DialoguePipeline:
 
         # 危机或婉拒的轮次不沉淀、不涨亲密度，这些轮次不算正常互动
         if emotion and emotion.is_crisis:
-            return
+            return []  # 无后台待办
 
         self._check_cancel(handle)
         distiller = ConversationDistiller()
@@ -1178,9 +1176,10 @@ class DialoguePipeline:
 
         # 聊够几轮才重新画像，别一句话就给人家贴标签。
         # 画像与身份冻结都是 LLM 秒级调用——阻塞在 done 之前会让"她说完了"
-        # 你还要等她做完笔记。挪到后台（真机反馈"回复很久"），任务里先查取消：
-        # 迟到的取消仍然不让这些写
-        self._check_cancel(handle)
+        # 你还要等她做完笔记。这里**只把待办闭包打包返回**，由 astream（持有
+        # running loop 的一方）create_task 调度——写回自己跑在工作线程里，
+        # 线程内没有事件循环，在这里调度会退化成同步执行（I11，实测踩中）。
+        deferred = []
         interval = _portrait_interval()
         if rel.get("interaction_count", 0) % interval == 0:
             context_snapshot = KEEPER.get_context(session_id)[-6:]
@@ -1190,7 +1189,7 @@ class DialoguePipeline:
                     return  # 迟到的取消：什么都不写
                 PortraitBuilder().refresh(sid, ctx)
 
-            _schedule_bg_writeback(_bg_portrait)
+            deferred.append(_bg_portrait)
 
         # 她自己的身份冻结（批次0"种子+涌现"）：从她刚说的话里定下名字/年龄/
         # 城市/职业/住处（只收她亲口说的、只填空不改口），第 3 轮后提炼一次
@@ -1209,4 +1208,5 @@ class DialoguePipeline:
             self_identity.maybe_freeze(sid, text, recent_her_lines=lines,
                                        interaction_count=count)
 
-        _schedule_bg_writeback(_bg_freeze)
+        deferred.append(_bg_freeze)
+        return deferred

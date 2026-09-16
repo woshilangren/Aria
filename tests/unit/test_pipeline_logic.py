@@ -154,7 +154,7 @@ def test_has_city(text, expected):
 
 
 # --------------- F：_writeback 语音轮标记剥离（端到端） ---------------
-from orchestration.pipeline import DialoguePipeline, TurnState  # noqa: E402
+from orchestration.pipeline import DialoguePipeline  # noqa: E402
 from tools.storage import KVStoreTool  # noqa: E402
 
 

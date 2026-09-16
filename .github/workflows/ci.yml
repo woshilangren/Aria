@@ -32,5 +32,10 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      - name: Lint (undefined names / redefinitions / syntax)
+        # F821=用了未定义的名字（A2/A3 那类事故静态即报）；compileall 抓不到
+        run: |
+          ruff check --select F821,F822,F811,E9 .
+
       - name: Run tests
         run: python -m pytest

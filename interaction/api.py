@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import base64
 import hmac
 import json
 from pathlib import Path
@@ -592,19 +593,25 @@ async def voice_stream(websocket: WebSocket) -> None:
                         print(f"[voice] cascade 识别OK: {message.text[:40]}")
                         await stream.send_text(f"我听到的是：{message.text}")
                         # cascade 轮也登记进轮次表（F10）：生成期间轮询连接状态，
-                        # 挂断/切后台即取消——不再"对着空气说完整段话"并写记忆
+                        # 挂断/切后台即取消——不再"对着空气说完整段话"并写记忆。
+                        # 注意：这里**不要**自己 start——handle() 内部会 start 内层轮，
+                        # 外层 start 会立刻把内层顶掉、且挂断时按外层 id 取消必然
+                        # id 不匹配被拒（I9，实测踩中）。用 get() 拿当前活跃轮来取消。
                         from orchestration.cancellation import TURN_REGISTRY
 
-                        turn = TURN_REGISTRY.start(session_id)
                         task = asyncio.create_task(_get_orchestrator().handle(message))
                         try:
                             while not task.done():
                                 done, _pending = await asyncio.wait({task}, timeout=1.0)
                                 if not stream.alive:
-                                    TURN_REGISTRY.cancel(session_id, turn.turn_id)
+                                    active = TURN_REGISTRY.get(session_id)
+                                    if active is not None:
+                                        TURN_REGISTRY.cancel(session_id, active.turn_id)
                             reply = await task
                         finally:
-                            TURN_REGISTRY.finish(session_id, turn.turn_id)
+                            active = TURN_REGISTRY.get(session_id)
+                            if active is not None and not task.cancelled():
+                                pass  # 内层轮由 handle 自己的 finally finish，这里不动
                         print(f"[voice] cascade 回复OK: {reply.text[:40]}")
                         audio = b""
                         try:

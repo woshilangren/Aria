@@ -239,6 +239,133 @@ class VectorStoreTool:
         return picked
 
 
+# KV 路由表：store 名 -> (读函数, 写函数)。read/write 都走这张表，加新存储只改这里。
+#
+# 注意：read 和 write 的 key 集合**故意不对称**，别顺手"对齐"成一样：
+#   - read 有 persona_config、write 没有 —— 因为 persona_config 的正主是
+#     data/persona_config.json，人设配置本来就不该经 KV 写入，只许读。
+#   - read 里的 image 是"列出全部图片"（无 key 概念），write 是"存一张"，
+#     两边语义本就不是一对，所以写函数签名上留了 value。
+# 真要新加可写的存储，请同时确认它是不是也有"正主在别处"的问题。
+_KV_DISPATCH = {
+    "profile": ("_profile", True),
+    "portrait": ("_portrait", True),
+    "relationship": ("_relationship", True),
+    "self": ("_self", True),
+    "session": ("_session", True),
+    "image": ("_image", True),
+    "route_config": ("_route", True),
+    "persona_config": ("_persona_config", False),  # 只读：正主在 data/persona_config.json
+}
+
+# 支持"读-改-写原子闭包"的 store 白名单：整包语义的 KV 表。
+# 不能只看 _KV_DISPATCH 的 writable 标记：session 是"按条追加"、image 是
+# "存一张"、route_config 是配置——它们的 Store 上压根没有 update 方法，
+# 放它们进来会抛 AttributeError；而 writable=False 的 persona_config 抛 ValueError，
+# 错误类型不统一，将来若给某个 Store 补了同名 update 方法，会变成"能调但语义错"。
+# 这里显式收紧，语义不符的一律 ValueError，与错用只读表保持同一种失败方式。
+# self（她自己的身份）也是整包语义，批次0 收进来。
+_KV_UPDATE_TABLES = ("profile", "portrait", "relationship", "self")
+
+
+class KVStoreTool:
+    """各类 JSON 存储的统一入口，按 store 名字路由到对应的 Store。"""
+
+    def __init__(self):
+        self._profile = ProfileStore()
+        self._portrait = PortraitStore()
+        self._relationship = RelationshipStore()
+        self._self = SelfStore()
+        self._session = SessionStore()
+        self._image = ImageAssetStore()
+        self._route = RouteConfigStore()
+        self._log = LogStore()
+        self._persona_config = PersonaConfigStore()
+
+    def read(self, store: str, key: str, default=None):
+        entry = _KV_DISPATCH.get(store)
+        if entry is None:
+            return default
+        attr, _writable = entry
+        target = getattr(self, attr)
+        # session 是聊天记录：按条存。条数以前写死 20、与 memory.max_turns_short_term
+        # 脱钩——重启后恢复的短期记忆比运行时长一截（"她醒来记得的比聊着的多"）。
+        # 现在读同一份配置，两边一致。
+        if store == "session":
+            n = int(load_app_config()["memory"].get("max_turns_short_term", 12) or 12)
+            return target.get_recent(key, n)
+        # image 是列表式资源：读即列出全部，没有 key 的概念
+        if store == "image":
+            return target.list_images()
+        # persona_config 整包一份，没有 key
+        if store == "persona_config":
+            return target.load()
+        return target.load(key)
+
+    def write(self, store: str, key: str, value) -> bool:
+        entry = _KV_DISPATCH.get(store)
+        # 未知 store、或表里标明只读的（persona_config），一律拒绝
+        if entry is None or not entry[1]:
+            return False
+        target = getattr(self, entry[0])
+        if store == "session":
+            # value 是一条记录的 dict，进来就追加
+            target.append(key, DialogueRecord(**value))
+        elif store == "image":
+            target.save(value)
+        else:
+            target.save(key, value)
+        return True
+
+    def update(self, store: str, key: str, fn):
+        """读-改-写原子闭包（F3）：只对 profile/portrait/relationship 三张整包 KV 表开放。
+
+        上层凡是"读整包 -> 内存改 -> 整包覆盖写"的更新（亲密度、画像、档案）
+        都必须走这里，否则两个并发写方会互相覆盖增量（静默漏账）。
+        fn 在 SQLite 锁内执行，必须是纯计算——锁内禁网络、禁 LLM。
+
+        白名单见 _KV_UPDATE_TABLES：本次显式收紧，不再依赖 _KV_DISPATCH 的
+        writable 标记（那会让 session/image/route_config 抛 AttributeError、
+        persona_config 抛 ValueError，错误类型不统一）。
+        """
+        if store not in _KV_UPDATE_TABLES:
+            raise ValueError(f"store {store} 不是整包 KV 表，不支持原子更新")
+        # 白名单已保证表名在 dispatch 里且可写，直接取 attr
+        return getattr(self, _KV_DISPATCH[store][0]).update(key, fn)
+
+    def log(self, entry: dict) -> None:
+        self._log.append(entry)
+
+    def log_relationship_change(self, session_id: str, old: float, new: float,
+                                reason: str = "", source_quote: str = "") -> None:
+        """关系数值账本（S3）：每次亲密度/信任变动留痕，"你为什么生气"有据可答。"""
+        self._relationship.append_ledger(session_id, old, new, reason, source_quote)
+
+    def recent_ledger(self, session_id: str, n: int = 8) -> list:
+        """最近 n 条关系账本（旧 -> 新），氛围线聚合趋势用。"""
+        return self._relationship.recent_ledger(session_id, n)
+
+    def chats_between(self, session_id: str, start_iso: str, end_iso: str) -> list:
+        """按时间段捞聊天记录（含头不含尾），写日记要用某一天的完整对话就靠它。"""
+        return self._session.get_chats_between(session_id, start_iso, end_iso)
+
+    def last_chat_per_session(self) -> list:
+        """每个会话最后一次聊天的时间，闲置检测器点名用。"""
+        return self._session.last_chat_per_session()
+
+    def proactive_after(self, session_id: str, after_iso: str, n: int = 5) -> list:
+        """某时刻之后她主动发的话（N3 轮询），旧 -> 新。"""
+        return self._session.proactive_after(session_id, after_iso, n)
+
+    def recent_chat(self, session_id: str, n: int = 100) -> list:
+        """取某会话最近 n 条聊天记录。
+
+        read("session", key) 内部写死 get_recent(key, 20)、传不进 n，
+        api.py 拉历史要自定义条数，走这个专门的口子。
+        """
+        return self._session.get_recent(session_id, n)
+
+
 def _log1p_safe(count) -> float:
     """log1p 的安全包装：热度字段坏了退 0（不加成，不炸排序）。"""
     try:
@@ -370,128 +497,3 @@ def _log1p_safe(count) -> float:
             return False
 
 
-# KV 路由表：store 名 -> (读函数, 写函数)。read/write 都走这张表，加新存储只改这里。
-#
-# 注意：read 和 write 的 key 集合**故意不对称**，别顺手"对齐"成一样：
-#   - read 有 persona_config、write 没有 —— 因为 persona_config 的正主是
-#     data/persona_config.json，人设配置本来就不该经 KV 写入，只许读。
-#   - read 里的 image 是"列出全部图片"（无 key 概念），write 是"存一张"，
-#     两边语义本就不是一对，所以写函数签名上留了 value。
-# 真要新加可写的存储，请同时确认它是不是也有"正主在别处"的问题。
-_KV_DISPATCH = {
-    "profile": ("_profile", True),
-    "portrait": ("_portrait", True),
-    "relationship": ("_relationship", True),
-    "self": ("_self", True),
-    "session": ("_session", True),
-    "image": ("_image", True),
-    "route_config": ("_route", True),
-    "persona_config": ("_persona_config", False),  # 只读：正主在 data/persona_config.json
-}
-
-# 支持"读-改-写原子闭包"的 store 白名单：整包语义的 KV 表。
-# 不能只看 _KV_DISPATCH 的 writable 标记：session 是"按条追加"、image 是
-# "存一张"、route_config 是配置——它们的 Store 上压根没有 update 方法，
-# 放它们进来会抛 AttributeError；而 writable=False 的 persona_config 抛 ValueError，
-# 错误类型不统一，将来若给某个 Store 补了同名 update 方法，会变成"能调但语义错"。
-# 这里显式收紧，语义不符的一律 ValueError，与错用只读表保持同一种失败方式。
-# self（她自己的身份）也是整包语义，批次0 收进来。
-_KV_UPDATE_TABLES = ("profile", "portrait", "relationship", "self")
-
-
-class KVStoreTool:
-    """各类 JSON 存储的统一入口，按 store 名字路由到对应的 Store。"""
-
-    def __init__(self):
-        self._profile = ProfileStore()
-        self._portrait = PortraitStore()
-        self._relationship = RelationshipStore()
-        self._self = SelfStore()
-        self._session = SessionStore()
-        self._image = ImageAssetStore()
-        self._route = RouteConfigStore()
-        self._log = LogStore()
-        self._persona_config = PersonaConfigStore()
-
-    def read(self, store: str, key: str, default=None):
-        entry = _KV_DISPATCH.get(store)
-        if entry is None:
-            return default
-        attr, _writable = entry
-        target = getattr(self, attr)
-        # session 是聊天记录：按条存。条数以前写死 20、与 memory.max_turns_short_term
-        # 脱钩——重启后恢复的短期记忆比运行时长一截（"她醒来记得的比聊着的多"）。
-        # 现在读同一份配置，两边一致。
-        if store == "session":
-            n = int(load_app_config()["memory"].get("max_turns_short_term", 12) or 12)
-            return target.get_recent(key, n)
-        # image 是列表式资源：读即列出全部，没有 key 的概念
-        if store == "image":
-            return target.list_images()
-        # persona_config 整包一份，没有 key
-        if store == "persona_config":
-            return target.load()
-        return target.load(key)
-
-    def write(self, store: str, key: str, value) -> bool:
-        entry = _KV_DISPATCH.get(store)
-        # 未知 store、或表里标明只读的（persona_config），一律拒绝
-        if entry is None or not entry[1]:
-            return False
-        target = getattr(self, entry[0])
-        if store == "session":
-            # value 是一条记录的 dict，进来就追加
-            target.append(key, DialogueRecord(**value))
-        elif store == "image":
-            target.save(value)
-        else:
-            target.save(key, value)
-        return True
-
-    def update(self, store: str, key: str, fn):
-        """读-改-写原子闭包（F3）：只对 profile/portrait/relationship 三张整包 KV 表开放。
-
-        上层凡是"读整包 -> 内存改 -> 整包覆盖写"的更新（亲密度、画像、档案）
-        都必须走这里，否则两个并发写方会互相覆盖增量（静默漏账）。
-        fn 在 SQLite 锁内执行，必须是纯计算——锁内禁网络、禁 LLM。
-
-        白名单见 _KV_UPDATE_TABLES：本次显式收紧，不再依赖 _KV_DISPATCH 的
-        writable 标记（那会让 session/image/route_config 抛 AttributeError、
-        persona_config 抛 ValueError，错误类型不统一）。
-        """
-        if store not in _KV_UPDATE_TABLES:
-            raise ValueError(f"store {store} 不是整包 KV 表，不支持原子更新")
-        # 白名单已保证表名在 dispatch 里且可写，直接取 attr
-        return getattr(self, _KV_DISPATCH[store][0]).update(key, fn)
-
-    def log(self, entry: dict) -> None:
-        self._log.append(entry)
-
-    def log_relationship_change(self, session_id: str, old: float, new: float,
-                                reason: str = "", source_quote: str = "") -> None:
-        """关系数值账本（S3）：每次亲密度/信任变动留痕，"你为什么生气"有据可答。"""
-        self._relationship.append_ledger(session_id, old, new, reason, source_quote)
-
-    def recent_ledger(self, session_id: str, n: int = 8) -> list:
-        """最近 n 条关系账本（旧 -> 新），氛围线聚合趋势用。"""
-        return self._relationship.recent_ledger(session_id, n)
-
-    def chats_between(self, session_id: str, start_iso: str, end_iso: str) -> list:
-        """按时间段捞聊天记录（含头不含尾），写日记要用某一天的完整对话就靠它。"""
-        return self._session.get_chats_between(session_id, start_iso, end_iso)
-
-    def last_chat_per_session(self) -> list:
-        """每个会话最后一次聊天的时间，闲置检测器点名用。"""
-        return self._session.last_chat_per_session()
-
-    def proactive_after(self, session_id: str, after_iso: str, n: int = 5) -> list:
-        """某时刻之后她主动发的话（N3 轮询），旧 -> 新。"""
-        return self._session.proactive_after(session_id, after_iso, n)
-
-    def recent_chat(self, session_id: str, n: int = 100) -> list:
-        """取某会话最近 n 条聊天记录。
-
-        read("session", key) 内部写死 get_recent(key, 20)、传不进 n，
-        api.py 拉历史要自定义条数，走这个专门的口子。
-        """
-        return self._session.get_recent(session_id, n)
