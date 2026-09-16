@@ -3,6 +3,9 @@
 VoiceStreamIO 把 WebSocket 包成音频流的收发通道，只管流的进出。
 """
 
+from starlette.websockets import WebSocketState
+
+
 class VoiceStreamIO:
     """WebSocket 上的音频流收发通道，一个会话一条。"""
 
@@ -11,6 +14,14 @@ class VoiceStreamIO:
         self._session_id = ""
         # 最近一条文本帧的内容：控制指令（比如换音色）从这里取
         self.last_text = ""
+
+    @property
+    def alive(self) -> bool:
+        """连接是否还活着（F10）：cascade 生成期间轮询它，挂断即取消该轮。"""
+        try:
+            return self._ws.client_state == WebSocketState.CONNECTED
+        except Exception:
+            return False
 
     async def open_stream(self, session_id: str) -> None:
         """接受 WebSocket 连接，标记这条流属于哪个会话。"""

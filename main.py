@@ -39,7 +39,13 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # startup：装配所有服务 + 起闲置巡检线程
+        # startup：口令兜底（F5）→ 装配所有服务 → 起闲置巡检线程。
+        # 口令兜底原来只在 run() 里做——`uvicorn main:app` 绕过它，BIND_HOST=0.0.0.0
+        # 且没配口令时全站（记忆/档案/聊天）不鉴权对外。挪进 lifespan 后任何
+        # 启动方式都先过这道防线。
+        from config.settings import get_settings
+
+        _ensure_access_token(get_settings())
         bootstrap()
         from capability.proactive import IdleDiaryWatcher
 

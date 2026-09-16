@@ -151,3 +151,108 @@ def test_clean_review_input_mentions_reanswer():
 )
 def test_has_city(text, expected):
     assert _has_city(text) is expected
+
+
+# --------------- F：_writeback 语音轮标记剥离（端到端） ---------------
+from orchestration.pipeline import DialoguePipeline, TurnState  # noqa: E402
+from tools.storage import KVStoreTool  # noqa: E402
+
+
+class _NoopHandle:
+    def is_cancelled(self) -> bool:
+        return False
+
+
+def _run_writeback(monkeypatch, state):
+    """把 _writeback 的外部依赖打桩，只验证标记剥离与落库文本。"""
+    import orchestration.pipeline as pl
+
+    kv = KVStoreTool()
+    monkeypatch.setattr(pl, "RelationshipTracker", lambda: type(
+        "T", (), {"update": lambda *a, **k: {"interaction_count": 1, "intimacy": 0}}
+    )())
+    monkeypatch.setattr(pl, "ConversationDistiller", lambda: type(
+        "D", (), {"distill_turn": lambda *a, **k: None}
+    )())
+    monkeypatch.setattr(pl, "PortraitBuilder", lambda: type(
+        "P", (), {"refresh": lambda *a, **k: None}
+    )())
+    monkeypatch.setattr(pl.services, "get", lambda name: kv)
+    written = []
+    orig_write = kv.write
+
+    def spy_write(store, key, value):
+        written.append(value)
+        return orig_write(store, key, value)
+
+    monkeypatch.setattr(kv, "write", spy_write)
+    pl.DialoguePipeline()._writeback(state, _NoopHandle())
+    return written
+
+
+def test_writeback_voice_strips_reaction_keeps_emotion(monkeypatch):
+    """语音轮 [开心]@r 你好：落库正文无 @r，final_reply 仍留情绪标签给合成。"""
+    st = TurnState(user_text="hi", session_id="f-writeback", voice_mode=True)
+    st.final_reply = "[开心]@r 你好"
+    st.emotion = None
+    stored = _run_writeback(monkeypatch, st)
+
+    assistant_records = [r for r in stored if r.get("role") == "assistant"]
+    assert assistant_records, "assistant 记录没落库"
+    assert "@r" not in assistant_records[0]["text"]
+    assert assistant_records[0]["text"] == "你好"
+    # final_reply 必须保留情绪标签（合成路径 split_emotion 要拆得出来）
+    from tools.speech import split_emotion
+    body, tags, _d = split_emotion(st.final_reply)
+    assert tags == ["开心"]
+    assert body == "你好"
+
+
+def test_writeback_text_mode_strips_reaction(monkeypatch):
+    """纯文本轮 @r 你好：落库正文为 你好，final_reply 无标记。"""
+    st = TurnState(user_text="hi", session_id="f-writeback-text", voice_mode=False)
+    st.final_reply = "@r 你好"
+    stored = _run_writeback(monkeypatch, st)
+    assistant_records = [r for r in stored if r.get("role") == "assistant"]
+    assert assistant_records[0]["text"] == "你好"
+    assert st.final_reply == "你好"
+
+
+# --------- F 补丁：<voice> 内 @r 逃过 _tag_checked 一次性开关 ---------
+from orchestration.pipeline import _ReplyStreamer  # noqa: E402
+
+
+def _frags(text, voice_mode=False):
+    s = _ReplyStreamer(voice_mode)
+    return s.feed(text) + s.finish(), s
+
+
+def test_voice_inner_reaction_tag_stripped_after_body_sentence():
+    """正文先跑掉 _tag_checked 后，<voice> 内的 @r 仍要被剥掉。
+
+    形态 "你好。<voice>@r 你好呀</voice>"：_push_sentence 先消耗唯一一次
+    _tag_checked，旧实现会让 <voice> 里的 @r 直接进 voice_text 被朗读。
+    """
+    frags, streamer = _frags("你好。<voice>@r 你好呀</voice>", voice_mode=True)
+    voices = [f for f in frags if f[0] == "voice"]
+    assert voices, "没有产出 voice 片段"
+    assert "@r" not in voices[0][1]
+    assert voices[0][1] == "你好呀"
+    # 剥到 @r 要登记：这是"模型自标了本能反应"的信号，上层要用
+    assert streamer.reaction_tagged is True
+
+
+def test_voice_inner_no_reaction_tag_unaffected():
+    """对照：正文/ <voice> 都不含 @r 时，voice_text 原样保留、reaction_tagged 为 False。"""
+    frags, streamer = _frags("你好。<voice>你好呀</voice>", voice_mode=True)
+    voices = [f for f in frags if f[0] == "voice"]
+    assert voices, "没有产出 voice 片段"
+    assert voices[0][1] == "你好呀"
+    assert streamer.reaction_tagged is False
+
+
+def test_voice_inner_email_not_touched():
+    """<voice> 内中/尾部的 @r（邮箱之类）不能被误伤。"""
+    frags, _s = _frags("好的。<voice>发到 a@r.com</voice>", voice_mode=True)
+    voices = [f for f in frags if f[0] == "voice"]
+    assert voices[0][1] == "发到 a@r.com"

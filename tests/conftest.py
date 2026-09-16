@@ -82,10 +82,19 @@ def _clear_settings_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """每个用例：独立 DATA_DIR（tmp_path）+ 干净的全局服务注册表。"""
+    """每个用例：独立 DATA_DIR（tmp_path）+ 干净的全局服务注册表 + 重置 DB 单例。
+
+    get_db() 是模块级懒加载单例：只换 DATA_DIR 不重置它，第二个用例起拿到的
+    还是第一个用例临时目录里的库——跨用例数据串味（身份冻结测试实测踩中）。
+    """
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ACCESS_TOKEN", "test-token")
     _clear_settings_cache()
+
+    import data.sqlite_store as _sqlite_mod
+
+    saved_db = _sqlite_mod._db
+    _sqlite_mod._db = None
 
     from shared.singletons import services
 
@@ -96,6 +105,12 @@ def _isolate(tmp_path, monkeypatch):
     try:
         yield
     finally:
+        try:
+            if _sqlite_mod._db is not None and _sqlite_mod._db is not saved_db:
+                _sqlite_mod._db.close()
+        except Exception:
+            pass
+        _sqlite_mod._db = saved_db
         services._services = saved_services
         services._errors = saved_errors
         _clear_settings_cache()
@@ -153,19 +168,20 @@ class FakeLLM:
 
 
 class FakePerception:
-    """感知结果替身：run() 固定返回预设的 (IntentResult, EmotionResult, subtext)。"""
+    """感知结果替身：run() 固定返回预设的 (IntentResult, EmotionResult, subtext, extras)。"""
 
-    def __init__(self, intent=None, emotion=None, subtext=""):
-        from shared.types import EmotionResult, IntentResult
+    def __init__(self, intent=None, emotion=None, subtext="", extras=None):
+        from shared.types import EmotionResult, IntentResult, PerceptionExtras
 
         self.intent = intent or IntentResult(intent="chat")
         self.emotion = emotion or EmotionResult()
         self.subtext = subtext
+        self.extras = extras or PerceptionExtras()
         self.calls = []
 
     def run(self, text, recent_context=None):
         self.calls.append((text, recent_context))
-        return self.intent, self.emotion, self.subtext
+        return self.intent, self.emotion, self.subtext, self.extras
 
 
 @pytest.fixture

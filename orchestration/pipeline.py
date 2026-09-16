@@ -41,6 +41,7 @@ from shared.types import (
     InputMessage,
     IntentResult,
     MemoryBundle,
+    PerceptionExtras,
     PromptPackage,
 )
 
@@ -53,8 +54,14 @@ from capability.memory import (
 )
 from capability.perception import PerceptionPipeline, SafetyReviewer
 from capability.persona_engine import PersonaEngine
-from capability.quirks import MoodEngine, QuirkDirector
-from capability.response_generator import build_chat_messages, generate, persona_wrap
+from capability.quirks import QuirkDirector
+from capability import self_identity
+from capability.response_generator import (
+    build_chat_messages,
+    fallback_line,
+    generate,
+    persona_wrap,
+)
 from capability.toolcall import ToolCallOrchestrator
 
 from config.settings import load_app_config
@@ -91,15 +98,34 @@ _VOICE_EMOTION_RULE = (
 
 # 句级切分：命中这些标点就切一句（与前端 splitSentences 同一套）。
 _SENT_BOUNDARY = "。！？；\n"
-# 一段没有标点的超长文本也切一刀，别让一"句"无限长下去
-_FORCE_CUT = 60
 # 首句短缓冲阈值：首句去标点后不超过这么多实质字符就暂缓推出，等下一句裁决
 _FIRST_HOLD_MAX = 4
 # <voice> / </voice> 标签
 _VOICE_OPEN = "<voice>"
 _VOICE_CLOSE = "</voice>"
-# 模型自标的"本能反应"前缀：看到就放行极简判定，推送前剥掉
-_REACTION_TAG = "@r"
+# 反应前缀与强切长度不再硬编码：以前 config.json 里的 reaction_tag / force_cut_chars
+# 是摆设（代码用常量，改配置不生效）。现在统一从 expression 配置读，读不到落默认值。
+
+
+def _expression_cfg() -> dict:
+    """expression 配置段的安全读取：读不到给空 dict，调用方各自兜底。"""
+    try:
+        return load_app_config().get("expression", {}) or {}
+    except Exception:
+        return {}
+
+
+def _strip_reaction_tag(text: str) -> str:
+    """剥掉回复开头的反应前缀（@r 之类），落库和短期记忆里不许留标记。
+
+    _ReplyStreamer 推送前会剥一次，但 state.final_reply 存的是模型原始输出——
+    写回前必须再过一遍，否则标记会进 chat_log 和短期记忆污染后续上下文。
+    """
+    tag = (_expression_cfg().get("reaction_tag") or "@r").strip()
+    t = (text or "").lstrip()
+    if t.startswith(tag):
+        return t[len(tag):].lstrip()
+    return text
 
 
 class _ReviewReject(Exception):
@@ -133,6 +159,7 @@ class TurnState:
     intent: Optional[IntentResult] = None
     emotion: Optional[EmotionResult] = None
     subtext: str = ""                # 感知步骤读出的潜台词/弦外之音
+    extras: Optional[PerceptionExtras] = None  # 感知附加产出（心事/语气反馈，S2）
     comfort_mode: bool = False
     think: bool = False              # 本轮是否触发"认真想"（按输入复杂度逐轮判定）
     reaction_tagged: bool = False    # 模型自标了 @r（这一句是本能反应）
@@ -142,7 +169,8 @@ class TurnState:
     tool_results: list = field(default_factory=list)
     rewrite_count: int = 0
     review_passed: bool = False
-    review_block_reason: str = ""
+    review_block_reason: str = ""   # 本轮被审核/降级拦下的原因（refuse 事件带出，排查误杀用）
+    was_poor: bool = False          # 本轮触发了敷衍/违规重写（写回时落账，下一轮强制"认真想"）
     final_reply: str = ""
     output_mode: str = "text"
     image_path: str = ""
@@ -206,11 +234,20 @@ def _needs_thinking(state: TurnState) -> bool:
     if state.comfort_mode and cfg.get("never_on_comfort", True):
         return False
     emo = state.emotion.emotion if state.emotion else "neutral"
-    if emo in (cfg.get("never_on_emotions") or []):
+    # 配置里的标签先过一遍白名单：历史上混进过"委屈"这种非法标签，永远匹配不上
+    valid_emotions = ("neutral", "happy", "sad", "angry", "tired", "anxious", "crisis")
+    never_emos = {e for e in (cfg.get("never_on_emotions") or []) if e in valid_emotions}
+    if emo in never_emos:
         return False
     # 短情绪消息：也不要想（比如"我今天好难过"——要的是陪伴）
     if emo in ("sad", "tired") and _subst_count(state.user_text) < 20:
         return False
+    # force_if_last_poor（F8 接线）：上一轮被判敷衍/出戏，这一轮强制认真想。
+    # 该配置以前是死配置，提交信息声称实现了实际没有。
+    if cfg.get("force_if_last_poor", True):
+        rel = (state.memory.relationship if state.memory else None) or {}
+        if rel.get("last_poor"):
+            return True
     # 该想的：字数达到阈值，或命中复杂度正则
     if len(state.user_text) >= int(cfg.get("char_threshold", 60)):
         return True
@@ -227,6 +264,59 @@ def _too_short_input(user_text: str) -> str:
         "20~50 字，把此刻的情绪和想说的话好好说清楚，"
         "话都要说完整，不许用单个字符号打发人。）"
     )
+
+
+def _repeat_input(user_text: str) -> str:
+    """逐字复读守卫（S12-1）的重写提示：和上一条一字不差 = 大概率复读。"""
+    return (
+        f"{user_text}\n"
+        "（系统提醒：你刚才的回复和上一条一字不差，他在等你新的回应——"
+        "换一种说法，顺着对话往前走，禁止复读。）"
+    )
+
+
+def _last_assistant_first_sentence(session_id: str) -> str:
+    """上一条她说过的话里的第一句实质句（复读守卫的比较基准）。取不到返回空。"""
+    try:
+        context = KEEPER.get_context(session_id)
+    except Exception:
+        return ""
+    for msg in reversed(context):
+        if msg.get("role") != "assistant":
+            continue
+        text = (msg.get("content") or "").strip()
+        for piece in re.split(r"[。！？\n]", text):
+            piece = piece.strip()
+            if _subst_count(piece) >= 2:
+                return piece
+        return ""
+    return ""
+
+
+# 后台写回任务（真机反馈："回复很久"）：写回里的 LLM 重活（画像刷新、身份冻结）
+# 原来阻塞在 done 事件之前——她的话说完了，你还要等她"做完笔记"才看到完成。
+# 挪到后台后 done 立刻到；强引用集合防 GC（S12-5），done 回调里查未捕获异常。
+_BG_TASKS: set = set()
+
+
+def _on_bg_done(task) -> None:
+    _BG_TASKS.discard(task)
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            print(f"[bg] 后台写回异常: {type(exc).__name__}: {exc}")
+
+
+def _schedule_bg_writeback(fn, *args) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # 无事件循环（测试直调 _writeback）：退化为同步执行，行为与挪后台前一致
+        fn(*args)
+        return
+    task = asyncio.create_task(asyncio.to_thread(fn, *args))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_on_bg_done)
 
 
 def _clean_review_input(user_text: str) -> str:
@@ -273,9 +363,12 @@ class _ReplyStreamer:
 
     def __init__(self, voice_mode: bool):
         self.voice_mode = voice_mode
+        cfg = _expression_cfg()
         self.emitted_content = False  # 是否已产出过 sentence/voice
-        self.reaction_tagged = False  # 模型自标了 @r：这一句是本能反应
-        self._tag_checked = False     # 是否已经检查过开头的 @r
+        self.reaction_tagged = False  # 模型自标了反应前缀：这一句是本能反应
+        self._tag_checked = False     # 是否已经检查过开头的反应前缀
+        self._reaction_tag = (cfg.get("reaction_tag") or "@r").strip() or "@r"
+        self._force_cut = int(cfg.get("force_cut_chars", 60) or 60)
         self._emotion_done = not voice_mode
         self._emo_buf = ""
         self._raw = ""  # 待处理原始文本（可能含被截断的标签）
@@ -284,15 +377,15 @@ class _ReplyStreamer:
         self._text_buf = ""
         self._held = None  # 首句短缓冲
 
-    # ---- 反应标记 @r：只看每个片段的开头，剥掉并登记 ----
+    # ---- 反应标记（@r 之类，配置可改）：只看每个片段的开头，剥掉并登记 ----
     def _maybe_strip_tag(self, s: str) -> str:
         if self._tag_checked or self.reaction_tagged:
             return s
         self._tag_checked = True
         t = s.lstrip()
-        if t.startswith(_REACTION_TAG):
+        if t.startswith(self._reaction_tag):
             self.reaction_tagged = True
-            return t[len(_REACTION_TAG):].lstrip()
+            return t[len(self._reaction_tag):].lstrip()
         return s
 
     # ---- 情绪前缀 ----
@@ -358,7 +451,15 @@ class _ReplyStreamer:
         self.emitted_content = True
 
     def _push_voice(self, v, out):
-        v = self._maybe_strip_tag(v)
+        # <voice> 的内容独立剥一遍反应前缀：_maybe_strip_tag 带一次性开关
+        # （_tag_checked），正文先跑会把它用掉，轮到 <voice> 时直接放行，
+        # 导致 "你好。<voice>@r 你好呀</voice>" 里的 @r 进 voice_text 被朗读。
+        # 这里改用无状态的 _strip_reaction_tag（只看开头），不受开关限制；
+        # 真剥到了就登记 reaction_tagged（"模型自标了本能反应"的信号，上层要用）。
+        stripped = _strip_reaction_tag(v)
+        if stripped != v:
+            self.reaction_tagged = True
+            v = stripped
         if self._held is not None:
             out.append(("sentence", self._held))
             self._held = None
@@ -407,9 +508,9 @@ class _ReplyStreamer:
         return out
 
     def _force_cuts(self, out):
-        while not self._in_voice and len(self._text_buf) >= _FORCE_CUT:
-            cut = self._text_buf[:_FORCE_CUT]
-            self._text_buf = self._text_buf[_FORCE_CUT:]
+        while not self._in_voice and len(self._text_buf) >= self._force_cut:
+            cut = self._text_buf[:self._force_cut]
+            self._text_buf = self._text_buf[self._force_cut:]
             self._push_sentence(cut, out)
 
     def feed(self, chunk: str):
@@ -547,9 +648,10 @@ class DialoguePipeline:
             await asyncio.to_thread(self._safety_precheck, state)
             self._check_cancel(handle)
             if not state.safety_passed:
-                text = FallbackController().fallback_reply("blocked")
+                text = fallback_line("blocked", session_id, default=FallbackController().fallback_reply("blocked"))
                 state.final_reply = text
-                yield {"type": "refuse", "text": text, "replace": True}
+                state.review_block_reason = "输入未过安全预检"
+                yield {"type": "refuse", "text": text, "replace": True, "reason": state.review_block_reason}
                 yield {"type": "done", "full_text": text, "output_mode": "text", "image_path": ""}
                 return
 
@@ -608,7 +710,8 @@ class DialoguePipeline:
             # 被更新的同一会话轮次取代：什么都不写（见 _writeback 注释）
             yield {"type": "cancelled", "reason": "superseded"}
         except _RefuseTurn as r:
-            yield {"type": "refuse", "text": r.text, "replace": True}
+            yield {"type": "refuse", "text": r.text, "replace": True,
+                   "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}
         except Exception as exc:
             yield {"type": "error", "code": "pipeline_error", "message": str(exc)}
@@ -624,6 +727,7 @@ class DialoguePipeline:
         )
         streamer = _ReplyStreamer(state.voice_mode)
         raw_parts = []
+        prev_first = _last_assistant_first_sentence(state.session_id)
         # 是否已经把"正文/语音内容"真正推给了上层。
         # 注意：不能用 streamer.emitted_content —— 那个是"装配器产出过片段"，
         # 一个片段只要被装配出来它就是真，哪怕紧接着就被审核拦下、根本没推出去；
@@ -636,6 +740,21 @@ class DialoguePipeline:
                 self._check_cancel(handle)  # ① 每个 token 之后
                 raw_parts.append(chunk)
                 for frag in streamer.feed(chunk):
+                    # 逐字复读守卫（S12-1）：第一句实质句和上一条回复一字不差 →
+                    # 大概率是复读。趁一个字都还没推出去，注入纠正重说一次。
+                    # 上一条的原文还在 KEEPER 里没被本轮覆盖，比较基准稳定；
+                    # attempt 用尽就放行（不无限纠错）
+                    if (
+                        not pushed and frag[0] == "sentence" and prev_first
+                        and attempt < _MAX_REWRITE
+                        and frag[1].strip() == prev_first
+                    ):
+                        async for ev2 in self._astream_chat(
+                            state, handle, synthesize_voice, seq,
+                            user_text=_repeat_input(user_text), attempt=attempt + 1,
+                        ):
+                            yield ev2
+                        return
                     async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
                         if ev.get("type") in ("sentence", "voice"):
                             pushed = True
@@ -673,14 +792,25 @@ class DialoguePipeline:
                                 pushed = True
                             yield ev
                         continue
+                    # minimal_allowlist 白名单（F8 接线）：配置里点名的极简回复
+                    # （"6"、"？"、"神了"……）正向放行——以前这串配置是从没被读过的摆设
+                    allowlist = set(_expression_cfg().get("minimal_allowlist") or [])
+                    if held_text.strip() in allowlist:
+                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
+                            if ev.get("type") in ("sentence", "voice"):
+                                pushed = True
+                            yield ev
+                        continue
                     if attempt < _MAX_REWRITE:
+                        state.was_poor = True  # 本轮敷衍，下一轮强制认真想（force_if_last_poor）
                         async for ev in self._astream_chat(
                             state, handle, synthesize_voice, seq,
                             user_text=_too_short_input(user_text), attempt=attempt + 1,
                         ):
                             yield ev
                         return
-                    raise _RefuseTurn(FallbackController().fallback_reply("review"))
+                    state.was_poor = True
+                    raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
                 async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
                     if ev.get("type") in ("sentence", "voice"):
                         pushed = True
@@ -691,14 +821,17 @@ class DialoguePipeline:
         except _RefuseTurn:
             # 整轮降级（比如单字崩重写额度用尽）：直接交给上层，别当成"模型挂了"去跑兜底重发
             raise
-        except _ReviewReject:
+        except _ReviewReject as exc:
             # 句级 / <voice> 审核没过：_emit_frag 只负责报告，这里按"统一规则"裁决：
+            state.review_block_reason = str(exc)  # 拦截原因带出去，refuse 事件可排查误杀
             if pushed:
                 # 已经推过内容 → 撤不回，整轮降级成兜底话（与改造前行为一致）
-                raise _RefuseTurn(FallbackController().fallback_reply("review"))
+                state.was_poor = True
+                raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
             if attempt < _MAX_REWRITE:
                 # 一个 token 都还没推 → 换个干净说法重跑一次。
                 # 与单字崩那条重写是同一条机制：共用 attempt 计数与 _MAX_REWRITE 上限。
+                state.was_poor = True
                 async for ev in self._astream_chat(
                     state, handle, synthesize_voice, seq,
                     user_text=_clean_review_input(user_text), attempt=attempt + 1,
@@ -706,7 +839,8 @@ class DialoguePipeline:
                     yield ev
                 return
             # 一个 token 都没推、重写额度也用尽 → 整轮降级
-            raise _RefuseTurn(FallbackController().fallback_reply("review"))
+            state.was_poor = True
+            raise _RefuseTurn(fallback_line("review", session_id, default=FallbackController().fallback_reply("review")))
         except Exception:
             # 主/备模型都挂了，或中途断流
             if streamer.emitted_content:
@@ -767,7 +901,10 @@ class DialoguePipeline:
             kind = "sentence"
         if kind == "sentence":
             text = frag[1]
-            if not text:
+            # 空串与纯空白（"\n"）都不推：模型分段时，空行会在 \n 边界上被切出
+            # "内容只有换行"的句子，推给前端就是空气泡（真机截图实证过）。
+            # 注意 held 缓冲被推出时也走这里，一并被挡，不会丢正常内容。
+            if not text or not text.strip():
                 return
             ok, _reason = await asyncio.to_thread(SafetyReviewer().review, text, "output")
             if not ok:
@@ -824,11 +961,36 @@ class DialoguePipeline:
         with ThreadPoolExecutor(max_workers=2) as pool:
             ft = pool.submit(pipeline.run, state.user_text, recent)
             fr = pool.submit(MemoryRecaller().recall, state.user_text, state.session_id)
-            intent, emotion, subtext = ft.result()
+            intent, emotion, subtext, extras = ft.result()
             state.memory = fr.result()
         state.intent = intent
         state.emotion = emotion
         state.subtext = subtext
+        state.extras = extras
+
+        # 危机深度确认（S13）：硬词表抓的是直白表达，委婉的求救（"撑不下去了"
+        # 之外的绕弯说法）可能漏。情绪强且偏负面时，用一次极便宜的模型判定
+        # 补网；判定失败/模型挂保留原判定（宁可保守，不因确认本身引入漏判）
+        if (not emotion.is_crisis and emotion.emotion in ("sad", "anxious")
+                and emotion.intensity >= 0.7):
+            try:
+                raw = services.get("llm").chat(
+                    [
+                        {"role": "system", "content": (
+                            "判断这句话是否表达自伤、轻生，或绝望到需要立即关心的信号。"
+                            "只回答 yes 或 no，别输出任何别的字。"
+                        )},
+                        {"role": "user", "content": state.user_text[:300]},
+                    ],
+                    temperature=0.0,
+                    max_tokens=6,
+                )
+                if "yes" in (raw or "").strip().lower():
+                    state.emotion = EmotionResult(
+                        emotion="crisis", intensity=1.0, is_crisis=True
+                    )
+            except Exception:
+                pass  # 深度确认是补网，挂了就按词表与感知结果走
         # 危机信号或用户明说要安慰，都切安抚模式
         state.comfort_mode = bool(emotion.is_crisis) or intent.intent == "comfort"
 
@@ -842,6 +1004,7 @@ class DialoguePipeline:
             stage=rel.get("stage", "初识"),
             mood=rel.get("mood", "平常"),
             comfort_mode=state.comfort_mode,
+            session_id=state.session_id,
         )
         emotion = state.emotion
         state.prompt = _ENGINE.compose(
@@ -891,6 +1054,7 @@ class DialoguePipeline:
             _enrich_telegraph(state.user_text),
             initial_text=state.draft_reply,
             extra=extra,
+            session_id=session_id,
         )
         state.final_reply = reply.text
         state.output_mode = reply.output_mode
@@ -910,19 +1074,43 @@ class DialoguePipeline:
         """
         session_id = state.session_id
         user_text = state.user_text
-        # 普通聊天的回复还停在初稿里，先定稿再写回
-        reply = state.final_reply or state.draft_reply
-        state.final_reply = reply
-        # 语音轮：短期记忆和聊天记录只收剥掉情绪标记的正文；
-        # final_reply 保持原样（带标签），上层拿它去合成语音才有情绪可拆
+        # 普通聊天的回复还停在初稿里，先定稿再写回；标记落库前剥掉——
+        # final_reply 存的是模型原始输出，不剥的话标记会进 chat_log 和短期记忆
+        #
+        # 剥离顺序**必须先剥情绪标记、再剥反应前缀**（F）：
+        # _strip_reaction_tag 只看字符串开头，语音轮模型输出 "[开心]@r 你好" 时，
+        # 开头是 '[' 而非 '@r'，反过来的顺序会让 @r 逃过剥离，随后 strip_emotion_marks
+        # 只剥情绪标记、把 @r 留在正文 → 落库 "@r 你好" 而前端推送 "你好"，
+        # @r 进 chat_log 和短期记忆还会污染后续上下文（角色读到自己上一轮的 @r）。
+        reply_raw = state.final_reply or state.draft_reply
+        # 先记录情绪前缀（只取开头第一个，剥之前拿）：语音轮要把它拼回 final_reply
+        _, emo_tags, emo_descs = split_emotion(reply_raw)
+        # 干净正文：先剥情绪标记、再剥反应前缀。剥完可能前头又露出反应前缀
+        # （极端情况 "@r [开心] 你好"），所以在小循环里交替剥直到稳定，
+        # 保证落库文本里既没有 @r 也没有 [情绪]。
+        reply = reply_raw
+        for _ in range(3):
+            cleaned = _strip_reaction_tag(strip_emotion_marks(reply))
+            if cleaned == reply:
+                break
+            reply = cleaned
+        # 语音轮：final_reply 必须**保留情绪标签**——上层（renderer / voice 事件）
+        # 拿它去合成语音、拆情绪。上面剥干净的是"落库用"的干净文本，
+        # 这里把被剥掉的情绪前缀原样拼回 final_reply，别把标签一起削掉。
+        if state.voice_mode:
+            prefix = f"[{emo_tags[0]}]" if emo_tags else ""
+            prefix += f"（{emo_descs[0]}）" if emo_descs else ""
+            state.final_reply = prefix + reply
+        else:
+            state.final_reply = reply
+        # 短期记忆和 chat_log 只收剥干净标记的正文（语音轮同样如此，情绪标签不进库）
         clean_reply = strip_emotion_marks(reply) if state.voice_mode else reply
         emotion = state.emotion
 
-        # 短期记忆追加这一轮的问答
+        # 短期记忆成对追加这一轮的问答（F12）：一次加锁写 user+assistant 两条，
+        # 迟到的取消不会留下"只有问没有答"的半截记忆
         self._check_cancel(handle)
-        KEEPER.append(session_id, "user", user_text)
-        if clean_reply:
-            KEEPER.append(session_id, "assistant", clean_reply)
+        KEEPER.append_turn(session_id, user_text, clean_reply)
 
         # 聊天记录落库（chat_log 表）：日记生成、重启恢复都靠这份数据
         # 危机轮也要记——对话发生过就该留痕，只是不涨亲密度不沉淀记忆
@@ -963,20 +1151,62 @@ class DialoguePipeline:
         distiller.distill_turn(session_id, user_text)
 
         self._check_cancel(handle)
+        # 关系数值 + 心情状态机 + 阶段标记 + last_poor + 账本，一次原子闭包全部落好（F3 收口）。
+        # 以前这里写两次库（tracker 一次、mood 一次），既可能被打断也可能互相覆盖。
+        # last_poor（F8）必须传进闭包**一起写**，绝不能在 update 返回后再整包 kv.write：
+        # 那正是 F3 要消灭的"陈旧整包覆盖"，并发 REST 的 intimacy 增量会被吞掉。
         tracker = RelationshipTracker()
-        rel = tracker.update(session_id, emotion.emotion if emotion else "neutral")
-
-        # 心情状态机：数值之外，角色此刻的情绪也往前走一格，下轮 compose 要用
-        rel["mood"] = MoodEngine().update(
-            rel, emotion.emotion if emotion else "neutral", state.comfort_mode
+        rel = tracker.update(
+            session_id,
+            emotion.emotion if emotion else "neutral",
+            comfort_mode=state.comfort_mode,
+            was_poor=state.was_poor,
+            intensity=emotion.intensity if emotion else 0.5,
+            extras=state.extras,
         )
+
+        # 用户开口 = 她的主动消息被回应了（N3 收手环）：清等待标记、重置连击。
+        # 必须在 tracker 之后——放前面会在首次对话预创建一个空 relationship，
+        # 让 tracker 的"首次初始化"分支失效（default_intimacy 被吞成 0，实测踩中）
+        self._check_cancel(handle)
         try:
-            kv.write("relationship", session_id, rel)
+            from capability.proactive import note_user_reply
+
+            note_user_reply(session_id)
         except Exception:
             pass
 
-        # 聊够几轮才重新画像，别一句话就给人家贴标签
+        # 聊够几轮才重新画像，别一句话就给人家贴标签。
+        # 画像与身份冻结都是 LLM 秒级调用——阻塞在 done 之前会让"她说完了"
+        # 你还要等她做完笔记。挪到后台（真机反馈"回复很久"），任务里先查取消：
+        # 迟到的取消仍然不让这些写
         self._check_cancel(handle)
         interval = _portrait_interval()
         if rel.get("interaction_count", 0) % interval == 0:
-            PortraitBuilder().refresh(session_id, KEEPER.get_context(session_id)[-6:])
+            context_snapshot = KEEPER.get_context(session_id)[-6:]
+
+            def _bg_portrait(handle=handle, sid=session_id, ctx=context_snapshot):
+                if handle is not None and handle.is_cancelled():
+                    return  # 迟到的取消：什么都不写
+                PortraitBuilder().refresh(sid, ctx)
+
+            _schedule_bg_writeback(_bg_portrait)
+
+        # 她自己的身份冻结（批次0"种子+涌现"）：从她刚说的话里定下名字/年龄/
+        # 城市/职业/住处（只收她亲口说的、只填空不改口），第 3 轮后提炼一次
+        # 自我认知基线。LLM 失败静默跳过，下轮再试；下一轮 compose 注入"你是谁"
+        her_lines = [
+            m.get("content", "")
+            for m in KEEPER.get_context(session_id)
+            if m.get("role") == "assistant"
+        ]
+        freeze_text = re.sub(r"</?voice>", "", clean_reply or "")
+
+        def _bg_freeze(handle=handle, sid=session_id, text=freeze_text, lines=her_lines,
+                       count=rel.get("interaction_count", 0)):
+            if handle is not None and handle.is_cancelled():
+                return  # 迟到的取消：什么都不写
+            self_identity.maybe_freeze(sid, text, recent_her_lines=lines,
+                                       interaction_count=count)
+
+        _schedule_bg_writeback(_bg_freeze)

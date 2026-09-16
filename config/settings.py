@@ -113,6 +113,11 @@ def load_app_config() -> dict:
         },
         "proactive": {
             "idle_minutes": 30,
+            # 主动开口（N3）：默认关——宁缺毋滥，不招人烦是安全阀不是可选项。
+            # 开了也要过"活跃窗口 + 亲密度门槛 + 每天上限 + 收手环"四道闸
+            "enabled": False,
+            "daily_max": 2,
+            "min_intimacy": 20,
         },
         "tools": {
             "max_retry": 2,
@@ -127,7 +132,7 @@ def load_app_config() -> dict:
             "enabled": True,
             "char_threshold": 60,          # 输入达到这个字数就触发
             "never_on_comfort": True,      # 安抚轮永远不想：这时候要温度不是分析
-            "never_on_emotions": ["sad", "angry", "委屈"],
+            "never_on_emotions": ["sad", "angry"],
             "force_if_last_poor": True,    # 上一轮被判敷衍/出戏，这轮强制想
         },
         # 表达尺度：极简反应的放行规则 + 长输入放开字数

@@ -64,15 +64,19 @@ class TurnRegistry:
             return self._active.get(session_id)
 
     def cancel(self, session_id: str, turn_id: "int | None" = None) -> bool:
-        """取消某会话的活跃轮（可选按 turn_id 精确匹配）。
+        """取消某会话的活跃轮（按 turn_id 精确匹配）。
 
-        给"打了又删、不发新消息"这种兜底场景用；指的是它当前登记的那个轮。
+        turn_id=None 一律拒绝（F4）：竞态下"start 事件还没到、turnId 还是 null"
+        的取消请求会无条件顶掉当前登记的轮——而那时登记的可能已经是**新一轮**
+        （用户连发时新轮 start 先到、旧 cancel 后到），误杀后新轮永远没有回复。
+        前端拿不到 turnId 就不该发 cancel；新轮 start 自带"顶掉旧轮"语义，
+        兜底天然存在，这里的拒绝不会留下没人管的旧轮。
         """
         with self._lock:
-            handle = self._active.get(session_id)
-            if handle is None:
+            if turn_id is None:
                 return False
-            if turn_id is not None and handle.turn_id != turn_id:
+            handle = self._active.get(session_id)
+            if handle is None or handle.turn_id != turn_id:
                 return False
             handle.cancel()
             return True

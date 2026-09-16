@@ -66,6 +66,11 @@ class ProfileStore:
     def save(self, session_id: str, profile: dict) -> None:
         get_db().save_kv("profile", session_id, profile)
 
+    def update(self, session_id: str, fn) -> dict:
+        """读-改-写原子闭包（F3）：并发写方（聊天线程池/语音写回/巡检/REST）
+        同时改档案时，整包覆盖会互相吃掉增量。fn 是锁内纯计算。"""
+        return get_db().update_kv("profile", session_id, fn)
+
 
 class PortraitStore:
     """软画像存储，和档案一样进 SQLite。"""
@@ -76,6 +81,26 @@ class PortraitStore:
     def save(self, session_id: str, portrait: dict) -> None:
         get_db().save_kv("portrait", session_id, portrait)
 
+    def update(self, session_id: str, fn) -> dict:
+        return get_db().update_kv("portrait", session_id, fn)
+
+
+class SelfStore:
+    """她自己定下的身份（批次0"种子+涌现"）：名字、年龄、城市、生活、自我认知。
+
+    写入纪律（性格不变性的配套）：只有"她第一次说出口"的事实能进来，
+    冻结逻辑在 capability/self_identity.py，这里只管存取。
+    """
+
+    def load(self, session_id: str) -> dict:
+        return get_db().load_kv("self", session_id)
+
+    def save(self, session_id: str, value: dict) -> None:
+        get_db().save_kv("self", session_id, value)
+
+    def update(self, session_id: str, fn) -> dict:
+        return get_db().update_kv("self", session_id, fn)
+
 
 class RelationshipStore:
     """关系数值存储，进 SQLite。"""
@@ -85,6 +110,17 @@ class RelationshipStore:
 
     def save(self, session_id: str, relationship: dict) -> None:
         get_db().save_kv("relationship", session_id, relationship)
+
+    def update(self, session_id: str, fn) -> dict:
+        return get_db().update_kv("relationship", session_id, fn)
+
+    def append_ledger(self, session_id: str, old: float, new: float,
+                      reason: str = "", source_quote: str = "") -> None:
+        """关系数值账本（S3）：每次变动留痕。"""
+        get_db().append_ledger(session_id, old, new, reason, source_quote)
+
+    def recent_ledger(self, session_id: str, n: int = 8) -> list:
+        return get_db().recent_ledger(session_id, n)
 
 
 class SessionStore:

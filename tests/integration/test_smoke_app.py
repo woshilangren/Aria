@@ -79,3 +79,28 @@ def test_root_is_public(client):
     # 免鉴权路径：根路径应返回前端壳（200）或兜底重定向，而不该被门卫 401
     resp = client.get("/")
     assert resp.status_code in (200, 307, 308)
+
+
+def test_relationship_endpoint_exposes_mood(client):
+    """GET /api/memory/relationship 返回体必须带 mood（前端「当前情绪」读它）。
+
+    回归守卫：本批曾删掉 mood_baseline、改由 MoodEngine 写 mood，前端一度仍读
+    旧字段 → 永远显示默认「平静」。这里锁死 endpoint 真能给出 mood。
+    """
+    from shared.singletons import services
+
+    kv = services.get("kv_store")
+    kv.update(
+        "relationship",
+        "default",
+        lambda d: {**(d or {}), "mood": "心软", "intimacy": 21, "interaction_count": 3},
+    )
+    resp = client.get(
+        "/api/memory/relationship?session_id=default",
+        headers={"X-Access-Token": TEST_TOKEN},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "mood" in body
+    assert body["mood"] == "心软"
+    assert "mood_baseline" not in body

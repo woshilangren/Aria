@@ -43,6 +43,20 @@ class EmotionResult:
 
 
 @dataclass
+class PerceptionExtras:
+    """感知的附加产出（S2/N2，与意图/情绪/潜台词同一次 LLM 调用带出）。
+
+    concern_*：会压在她心里、影响之后几轮的念头（文本 + 本轮强度增减）；
+    feedback：他在抱怨她的态度/语气时为 "tone_down"，进关系收敛层（calm），
+    绝不改性格内核——"收敛不是改变"是批次的宪法。
+    """
+
+    concern_text: str = ""
+    concern_delta: float = 0.0
+    feedback: str = ""
+
+
+@dataclass
 class ToolCallSpec:
     """一次工具调用计划：调哪个工具、带什么参数。"""
 

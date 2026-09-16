@@ -5,6 +5,7 @@
 """
 
 import json
+import threading
 import time
 from typing import AsyncIterator
 
@@ -65,6 +66,22 @@ class LLMClient:
         self._probe_timeout = float(fb_cfg.get("probe_timeout_seconds", 5) or 5)
         self._error_count = 0
         self._opened_at: float | None = None  # 熔断打开时刻（单调时钟），None=未打开
+        # 半开探测连续失败次数：每失败一次探测超时翻倍（封顶 60 秒）。
+        # 否则主模型首包常态超过探测短超时（开思考/高峰期）时，探测永远失败、
+        # 熔断永不闭合——"主模型其实活着，体验却永远停在小模型"且无人察觉。
+        self._probe_fail_streak = 0
+        # 熔断状态被线程池（chat）、事件循环（astream）、巡检线程（日记 LLM）三方
+        # 无锁共享时，"判断 circuit_open → 更新计数"是复合操作，交错读写会互相误判。
+        # 一把小锁只保护状态字段，不包网络调用。
+        self._cb_lock = threading.Lock()
+
+    def _probe_timeout_now(self) -> float:
+        """本次半开探测用的超时：连续失败就逐次翻倍，封顶 60 秒（客户端默认值）。"""
+        return min(60.0, self._probe_timeout * (2 ** self._probe_fail_streak))
+
+    def _is_qwen(self) -> bool:
+        """主模型是不是 qwen 系——qwen 专有参数只对它发。"""
+        return "qwen" in (self._model or "").lower()
 
     # ---------- 内部：统一的主备切换，切换逻辑只写这一遍 ----------
     def _complete(self, **kwargs) -> object:
@@ -76,35 +93,48 @@ class LLMClient:
 
         # 熔断是否仍处于打开状态：打开且未到冷却 → 直接走备用，连主模型都不碰
         # （这是修掉“冷却期里还白等主模型 60 秒超时”的关键）
-        circuit_open = (
-            self._opened_at is not None
-            and (time.monotonic() - self._opened_at) < self._cooldown
-        )
+        with self._cb_lock:
+            circuit_open = (
+                self._opened_at is not None
+                and (time.monotonic() - self._opened_at) < self._cooldown
+            )
+            is_probe = (not circuit_open) and self._opened_at is not None
 
         if not circuit_open:
             # 这次是不是"半开探测"：熔断原本开着（_opened_at 非空）且已过冷却，才会走到这里。
             # 探测复用主客户端，但默认 60 秒超时对人聊天的节奏太长（几乎每条都白等），
             # 所以只给探测传短超时；正常调用绝不传，保持客户端默认 60 秒。
-            is_probe = self._opened_at is not None
-            # Qwen3 系非流式调用必须关思考模式，不然官方直接拒绝请求
-            thinking = load_app_config()["llm"].get("enable_thinking", False)
-            kwargs.setdefault("extra_body", {"enable_thinking": thinking})
+            # Qwen3 系非流式调用必须关思考模式，不然官方直接拒绝请求；
+            # Claude 系（走 OpenAI 兼容代理）则相反：enable_thinking 是 qwen 专有
+            # 参数，temperature 在 Sonnet 5 上已移除（发原生物理会 400）——
+            # 两个都不带，交给模型默认（Claude 自带 adaptive thinking）
+            if self._is_qwen():
+                thinking = load_app_config()["llm"].get("enable_thinking", False)
+                kwargs.setdefault("extra_body", {"enable_thinking": thinking})
+            else:
+                kwargs.pop("extra_body", None)
+                kwargs.pop("temperature", None)
             if is_probe:
-                kwargs["timeout"] = self._probe_timeout
+                kwargs["timeout"] = self._probe_timeout_now()
             try:
                 resp = self._client.chat.completions.create(**kwargs)
-                # 成功即闭合：清空错误计数、清掉熔断时刻
-                self._error_count = 0
-                self._opened_at = None
+                # 成功即闭合：清空错误计数、清掉熔断时刻、探测超时回到最短档
+                with self._cb_lock:
+                    self._error_count = 0
+                    self._opened_at = None
+                    self._probe_fail_streak = 0
                 return resp
             except Exception as exc:
-                self._error_count += 1
-                last_error = exc
-                # 静默降级会让"主模型 key 失效"这种事藏好几个星期没人发现，至少喊一声
-                print(f"[llm] 主模型调用失败({self._error_count}/{self._max_errors})，走备用：{exc}")
-                if self._error_count >= self._max_errors:
-                    # 连续失败到阈值：打开熔断；半开再次失败时也会走到这，等于刷新打开时刻
-                    self._opened_at = time.monotonic()
+                with self._cb_lock:
+                    self._error_count += 1
+                    last_error = exc
+                    if is_probe:
+                        self._probe_fail_streak += 1
+                    # 静默降级会让"主模型 key 失效"这种事藏好几个星期没人发现，至少喊一声
+                    print(f"[llm] 主模型调用失败({self._error_count}/{self._max_errors})，走备用：{exc}")
+                    if self._error_count >= self._max_errors:
+                        # 连续失败到阈值：打开熔断；半开再次失败时也会走到这，等于刷新打开时刻
+                        self._opened_at = time.monotonic()
 
         # 备用顶上：GLM-5 系是"始终思考"模型，不吃 enable_thinking，摘掉换
         # thinking_effort=low——实测能把每条回复的推理开销砍半（500→250 上下），
@@ -115,7 +145,13 @@ class LLMClient:
             kwargs["extra_body"] = {"thinking_effort": "low"}
             kwargs["model"] = self._fallback_model
             try:
-                return self._fallback.chat.completions.create(**kwargs)
+                resp = self._fallback.chat.completions.create(**kwargs)
+                # 备用每成功一次就把主模型错误计数衰减一格，而不是只等主模型自己成功清零——
+                # 否则相隔几小时的两次网络抖动各自被兜住、计数却累到阈值，白开一轮 120 秒熔断，
+                # 期间感知/画像/日记全换小模型，用户感知为"她突然变了个人"
+                with self._cb_lock:
+                    self._error_count = max(0, self._error_count - 1)
+                return resp
             except Exception as exc:
                 raise RuntimeError(f"主模型和备用模型都挂了：主={last_error}，备={exc}") from exc
 
@@ -201,29 +237,39 @@ class LLMClient:
         }
         last_error = None
 
-        # 熔断打开且未到冷却 → 直接走备用（与同步 _complete 同一判断）
-        circuit_open = (
-            self._opened_at is not None
-            and (time.monotonic() - self._opened_at) < self._cooldown
-        )
+        # 熔断打开且未到冷却 → 直接走备用（与同步 _complete 同一判断、同一把锁）
+        with self._cb_lock:
+            circuit_open = (
+                self._opened_at is not None
+                and (time.monotonic() - self._opened_at) < self._cooldown
+            )
+            is_probe = (not circuit_open) and self._opened_at is not None
         if not circuit_open:
-            is_probe = self._opened_at is not None  # 半开探测：只在这时传短超时
-            if enable_thinking is None:
-                thinking = load_app_config()["llm"].get("enable_thinking", False)
+            # 半开探测：只在这时传短超时（连续失败逐次翻倍，见 _probe_timeout_now）
+            # qwen 专有参数只对 qwen 发（见 _complete 里的同款处理）
+            if self._is_qwen():
+                if enable_thinking is None:
+                    thinking = load_app_config()["llm"].get("enable_thinking", False)
+                else:
+                    thinking = enable_thinking
+                kwargs.setdefault("extra_body", {"enable_thinking": thinking})
             else:
-                thinking = enable_thinking
-            kwargs.setdefault("extra_body", {"enable_thinking": thinking})
+                kwargs.pop("extra_body", None)
+                kwargs.pop("temperature", None)
             if is_probe:
-                kwargs["timeout"] = self._probe_timeout
+                kwargs["timeout"] = self._probe_timeout_now()
             stream = None
             try:
                 stream = await self._aclient.chat.completions.create(**kwargs)
             except Exception as exc:
-                self._error_count += 1
-                last_error = exc
-                print(f"[llm] 主模型流式建流失败({self._error_count}/{self._max_errors})，走备用：{exc}")
-                if self._error_count >= self._max_errors:
-                    self._opened_at = time.monotonic()
+                with self._cb_lock:
+                    self._error_count += 1
+                    last_error = exc
+                    if is_probe:
+                        self._probe_fail_streak += 1
+                    print(f"[llm] 主模型流式建流失败({self._error_count}/{self._max_errors})，走备用：{exc}")
+                    if self._error_count >= self._max_errors:
+                        self._opened_at = time.monotonic()
             if stream is not None:
                 # 建流成功：正常逐块产出。中途出错：吐过内容就直接抛；没吐过则回落去试备用
                 emitted = False
@@ -233,14 +279,17 @@ class LLMClient:
                         if delta:
                             emitted = True
                             yield delta
-                    self._error_count = 0
-                    self._opened_at = None
+                    with self._cb_lock:
+                        self._error_count = 0
+                        self._opened_at = None
+                        self._probe_fail_streak = 0
                     return
                 except Exception as exc:
-                    self._error_count += 1
-                    last_error = exc
-                    if self._error_count >= self._max_errors:
-                        self._opened_at = time.monotonic()
+                    with self._cb_lock:
+                        self._error_count += 1
+                        last_error = exc
+                        if self._error_count >= self._max_errors:
+                            self._opened_at = time.monotonic()
                     if emitted:
                         raise  # 已经吐过 token，换备用也接不上，交给上层收尾
                     # 一个 token 都没吐：落到下面走备用
@@ -259,6 +308,8 @@ class LLMClient:
                 delta = self._delta_of(chunk)
                 if delta:
                     yield delta
+            with self._cb_lock:
+                self._error_count = max(0, self._error_count - 1)  # 备用成功，错误计数衰减（同同步路径）
             return
 
         raise RuntimeError(f"LLM 流式调用失败，也没配备用模型：{last_error}")

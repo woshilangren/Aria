@@ -11,10 +11,49 @@ from config.settings import load_app_config
 from tools.storage import KVStoreTool
 
 
+def _escape_stray_quotes(text: str) -> str:
+    """把 JSON 字符串值内部的裸英文引号转义掉（S12-2）。
+
+    LLM 在 reason/文本里写「他说"你"字」这类带 0x22 引号的内容是高频事故，
+    会直接把 JSON 撑坏。判定依据：字符串的**闭合引号**后面紧跟结构分隔符
+    （,}:]）；否则这个引号属于值的内容，转义它。
+    已知局限：值内引号后面恰好紧跟逗号时会误判——此时二次解析仍失败，
+    调用方走原有兜底，行为与修复前一致，不放大风险。
+    """
+    out = []
+    in_string = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_string and ch == "\\":
+            out.append(text[i:i + 2])  # 已是合法转义序列，原样保留
+            i += 2
+            continue
+        if ch == '"':
+            if not in_string:
+                in_string = True
+                out.append(ch)
+            else:
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                nxt = text[j] if j < n else ""
+                if nxt in ",}:]":
+                    in_string = False
+                    out.append(ch)
+                else:
+                    out.append('\\"')
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def parse_llm_json(raw: str) -> dict:
     """模型的输出经常裹着 ```json 围栏或者多余的话，剥出里面的 JSON。
 
-    解析不出来就抛异常，让调用方自己兜底。
+    解析不出来先试一次引号修复（S12-2：值内裸引号是 LLM 高频事故），
+    再失败才抛异常，让调用方自己兜底。
     """
     raw = (raw or "").strip()
     if raw.startswith("```"):
@@ -22,7 +61,11 @@ def parse_llm_json(raw: str) -> dict:
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1:
         raise ValueError("模型输出里没有 JSON")
-    return json.loads(raw[start : end + 1])
+    body = raw[start : end + 1]
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return json.loads(_escape_stray_quotes(body))
 
 
 class ClockTool:
@@ -65,6 +108,46 @@ class ClockTool:
             "晚上": "现在是晚上：可以问晚饭吃了吗、今天过得怎么样。",
             "深夜": "现在是深夜：绝不要问吃饭、说早安这类白天话；语气放轻放低，先关心他怎么还醒着、催他早点休息。",
         }.get(self.period(), "")
+
+    # ---- 间隔感知（N1）：她知道"多久没见"，而不是对 ISO 时间戳视而不见 ----
+    # 七档间隔 → 人话。真人对"五分钟没回"和"三天没聊"的接话方式完全不同，
+    # 光把 last_interaction 的原始时间戳塞进 prompt 模型基本无视，必须翻成人话。
+    _GAP_TIERS = (
+        (5 * 60, "刚聊完没两句", "话可以接得上文，不用重新打招呼"),
+        (60 * 60, "刚分开一会儿", ""),
+        (4 * 3600, "半天没见", "可以顺口问一句他刚才在忙什么"),
+        (12 * 3600, "大半天没聊了", "可以自然问问这一天过得怎么样"),
+        (24 * 3600, "昨天聊完到现在", "可以带一点'隔了一天'的感觉开场"),
+        (3 * 86400, "两三天没理我", "可以表达一点'这才回来'的意思，但别兴师问罪"),
+        (float("inf"), "好一阵子没见了", "关系越熟越可以直说想念或小小的不满，开场不用装没事"),
+    )
+
+    def gap_perception(self, last_iso: str, now=None) -> str:
+        """把"距上次聊天多久"翻成一条可注入 prompt 的分寸行。
+
+        last_iso 是 relationship.last_interaction 的 ISO 时间串；缺失或格式坏
+        返回空串（什么都不注入，绝不硬凑）。纯本地计算，零 LLM 成本。
+        now 参数留给测试注入固定时刻，生产代码不用传。
+        """
+        if not last_iso:
+            return ""
+        from datetime import datetime
+
+        try:
+            last = datetime.fromisoformat(last_iso)
+        except (ValueError, TypeError):
+            return ""
+        now = now or datetime.now()
+        gap = (now - last).total_seconds()
+        if gap < 0:  # 时钟被拨回去之类的脏数据，当"刚聊完"处理最安全
+            gap = 0
+        for threshold, phrase, hint in self._GAP_TIERS:
+            if gap < threshold:
+                line = f"距离上次聊天：{phrase}"
+                if hint:
+                    line += f"。{hint}"
+                return line
+        return ""
 
 
 class Logger:

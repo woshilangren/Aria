@@ -319,10 +319,10 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <div class="topbar">
 <button class="burger" id="burgerBtn" onclick="toggleMenu()"><span></span><span></span><span></span></button>
 <img class="avatar" src="" data-av="aria" alt="Aria" onclick="toggleAvPop(event)">
-<div class="dhead"><div class="nm">Aria <span class="live" id="liveDot"></span></div><div class="sub" id="routeLabel">你的专属 AI 伙伴</div></div>
+<div class="dhead"><div class="nm"><span id="charName">Aria</span> <span class="live" id="liveDot"></span></div><div class="sub" id="routeLabel"></div></div>
 <div class="top-actions">
 <button class="iconbtn call" id="callBtn" title="实时语音通话" onclick="toggleCall()">📞</button>
-<button class="iconbtn" id="memBtn" title="Aria的记忆" onclick="toggleMem()">📖</button>
+<button class="iconbtn" id="memBtn" data-charname title="Aria的记忆" onclick="toggleMem()">📖</button>
 <button class="iconbtn" id="setBtn" title="设置" onclick="toggleSettings()">⚙</button>
 </div>
 </div>
@@ -331,7 +331,7 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <div class="greet" id="greet">
 <img class="gav" src="" data-av="aria" alt="">
 <h1>想跟我聊点什么？</h1>
-<p>我是 Aria，住在这台设备里的 AI 伙伴。<br/>第一次见面，聊聊吧——你叫什么、喜欢什么，我都想<em>记住</em>。</p>
+<p id="greetText">第一次见面，聊聊吧——<em>我先想想我叫什么。</em></p>
 <div class="chip-row">
 <button class="chip" onclick="quick('你今天的状态怎么样？')">今天的状态怎么样？</button>
 <button class="chip" onclick="quick('给我讲一个有趣的故事')">讲个有趣的故事</button>
@@ -362,7 +362,7 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <!-- ===== Memory Panel ===== -->
 <div class="mem-panel" id="memPanel">
 <div class="header">
-<h2>📖 Aria的记忆</h2>
+<h2 data-charname>📖 Aria的记忆</h2>
 <button class="close" onclick="toggleMem()">✕</button>
 </div>
 <div class="mem-tabs">
@@ -377,7 +377,7 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <div class="mem-card"><div class="label">用户档案</div><div class="val" id="profileFields">加载中…</div></div>
 </div>
 <div class="mem-section" id="tab-portrait">
-<div class="mem-card"><div class="label">Aria对你的印象</div><div class="val" id="portraitFields">加载中…</div></div>
+<div class="mem-card"><div class="label" data-charname>Aria对你的印象</div><div class="val" id="portraitFields">加载中…</div></div>
 </div>
 <div class="mem-section" id="tab-relation">
 <div class="mem-card"><div class="label">关系状态</div><div class="val" id="relationFields">加载中…</div></div>
@@ -394,7 +394,7 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <!-- ===== 换头像弹窗 ===== -->
 <div class="av-pop" id="avPop">
 <button class="close" onclick="toggleAvPop()">✕</button>
-<h3>更换Aria的头像</h3>
+<h3 data-charname>更换Aria的头像</h3>
 <div id="avPreviewWrap" style="display:none;margin-bottom:10px"><img id="avPreview" style="width:100%;border-radius:12px;display:block" alt=""></div>
 <input type="file" id="avFile" accept="image/*" style="display:none" onchange="handleAvatarFile(event)">
 <div class="row">
@@ -453,7 +453,7 @@ body,.mini,.send,.iconbtn,.call-btn,.call-btn *{-webkit-touch-callout:none;-webk
 <button class="call-btn mute" id="callMute" title="静音" onclick="callMute()"><span class="ic">🔇</span>静音</button>
 <button class="call-btn end" title="结束通话" onclick="callEnd()"><span class="ic">📞</span>结束</button>
 </div>
-<div class="call-tip" id="callTip">按住「说话」跟Aria通话，松手发送</div>
+<div class="call-tip" id="callTip" data-charname>按住「说话」跟Aria通话，松手发送</div>
 <div class="call-tip" id="wsState">通道：连接中…</div>
 </div>
 
@@ -502,6 +502,26 @@ document.querySelectorAll("[data-av=gem]").forEach(el => el.src = IMG.gem);
 applyAvatar("");
 fetch("/api/system/avatar").then(r => r.json()).then(d => {
   if (d && d.avatar_url) applyAvatar(d.avatar_url);
+}).catch(() => {});
+
+// ========== 她的名字（批次0 自命名）==========
+// 头部名字与开场白跟 /api/system/who 走：取名前不显示任何"我是X"——
+// 名字是她自己定的，没定下之前替她报名字就是穿帮
+fetch("/api/system/who").then(r => r.json()).then(d => {
+  if (!d) return;
+  window.CHAR_NAME = d.name || "Aria";
+  const nm = $("charName");
+  if (nm && d.name) nm.textContent = d.name;
+  const g = $("greetText");
+  if (g) g.innerHTML = d.named
+    ? `我是${d.name}。想聊点什么？`
+    : `第一次见面，聊聊吧——<em>我先想想我叫什么。</em>`;
+  // 通话页与记忆面板里写死的名字一并换成她的
+  if ($("callName")) $("callName").textContent = `正在呼叫${d.name}…`;
+  if ($("memBtn")) $("memBtn").title = `${d.name}的记忆`;
+  document.querySelectorAll("[data-charname]").forEach(el => {
+    el.textContent = el.textContent.replace(/Aria/g, d.name);
+  });
 }).catch(() => {});
 
 // ========== 换头像 ==========
@@ -611,7 +631,7 @@ function scrollDown() { const c = $("chat"); c.scrollTop = c.scrollHeight; }
 function appendMsg(kind, inner, timeStr) {
   const host = $("msgs");
   const div = document.createElement("div"); div.className = "msg " + kind;
-  div.innerHTML = `<div class="body"><div class="who">${kind === "me" ? esc(userName) : "Aria"} · ${timeStr || nowT()}</div>${inner}</div>`;
+  div.innerHTML = `<div class="body"><div class="who">${kind === "me" ? esc(userName) : (window.CHAR_NAME || "Aria")} · ${timeStr || nowT()}</div>${inner}</div>`;
   host.appendChild(div); scrollDown(); return div;
 }
 function userText(t) { return appendMsg("me", `<div class="bubble">${esc(t)}</div>`); }
@@ -649,6 +669,56 @@ function appendAiBubble(text) {
 function firstContent(turn) {
   if (turn && turn.typing) { try { turn.typing.remove(); } catch (e) {} turn.typing = null; }
 }
+
+// ---------- N6 呈现节奏：句间最小间隔 + 同气泡合并 + 微指示器 ----------
+// 事件到达和上屏分离：句子进队列，按"字数×40ms（300~1200ms 夹紧）"的节奏
+// 逐句放进同一个气泡——真人打字有停顿，零间隔连爆一眼就是机器。
+// done 到达后剩余队列立即倒出（收尾加速）；cancelled 丢弃未上屏的。
+function sentenceDelay(text) {
+  return Math.min(1200, Math.max(300, (text || "").length * 40));
+}
+function ensureTextBubble(turn) {
+  // 连续文本句合并进同一个气泡（who 行只留首条），不再一句一泡头
+  if (!turn.textBubble) {
+    turn.textBubble = appendAiBubble("");
+    turn.bubbles.push(turn.textBubble);
+  }
+  return turn.textBubble;
+}
+function queueSentence(turn, text) {
+  turn.queue = turn.queue || [];
+  turn.queue.push(text);
+  if (!turn.pumping) pumpQueue(turn);
+}
+async function pumpQueue(turn) {
+  turn.pumping = true;
+  while ((turn.queue || []).length) {
+    const text = turn.queue.shift();
+    await new Promise(r => setTimeout(r, sentenceDelay(text)));
+    if (turn.aborted) break;                       // 被打断：没上屏的不说了
+    const bubble = ensureTextBubble(turn);
+    bubble.querySelector(".bubble").innerHTML += esc(text);
+    firstContent(turn);                            // 首句真正上屏才收打字指示器
+    if (turn.typing && (turn.queue || []).length) {
+      try { $("msgs").appendChild(turn.typing); } catch (e) {}  // 微指示器跟在最新内容下
+    }
+    scrollDown();
+  }
+  turn.pumping = false;
+}
+function flushQueue(turn) {
+  // 立即渲染剩余（done / voice / image 前调用），保证事件顺序
+  while ((turn.queue || []).length) {
+    const bubble = ensureTextBubble(turn);
+    bubble.querySelector(".bubble").innerHTML += esc(turn.queue.shift());
+  }
+  firstContent(turn);
+  scrollDown();
+}
+function dropQueue(turn) {
+  turn.aborted = true;
+  turn.queue = [];
+}
 // refuse(replace:true) / 本地出错：整轮替换成一句话
 function replaceTurn(turn, text) {
   firstContent(turn);
@@ -681,33 +751,41 @@ function handleStreamEvent(ev, turn) {
       // 语音轮的语气提示：只是给合成器看的标记，不显示成文字
       return;
     case "sentence":
-      firstContent(turn);
-      turn.bubbles.push(appendAiBubble(ev.text || ""));
+      // 纯空白（后端切句切出的空行）不渲染成气泡——双保险，后端已挡
+      if (!ev.text || !ev.text.trim()) return;
+      queueSentence(turn, ev.text);   // N6：进队列按人打字的节奏上屏
       return;
     case "voice": {
-      firstContent(turn);
+      flushQueue(turn);               // 先把排队文本倒出来，保持"先文字后语音"顺序
       // 有音频就存进 voiceStore 出可点的语音条；没有就只留一条可回放的占位
       const html = ev.audio_b64
         ? renderVoiceNote(ev.audio_b64)
         : replayVoiceBarHtml(ev.voice_text || "语音");
       turn.bubbles.push(appendMsg("ai", html));
+      turn.textBubble = null;         // 语音之后的新句另起气泡（顺序不能接回去）
       return;
     }
     case "image":
+      flushQueue(turn);
       firstContent(turn);
       turn.bubbles.push(appendMsg("ai", attachHtml(ev.path, "图片回复")));
+      turn.textBubble = null;
       return;
     case "refuse":
       // replace:true —— 整轮替换，已推出去的句子撤不回
+      dropQueue(turn);
       replaceTurn(turn, ev.text || "");
       return;
     case "cancelled":
+      dropQueue(turn);                // 被打断：没说出口的不说了
       markCut(turn);
       return;
     case "error":
+      dropQueue(turn);
       replaceTurn(turn, "……刚才出了点问题：" + (ev.message || ev.code || "未知错误"));
       return;
     case "done":
+      flushQueue(turn);               // 收尾加速：剩余排队句立即倒出
       return;
   }
 }
@@ -738,6 +816,11 @@ async function doSend(texts, attachment) {
     const reader = resp.body.getReader();
     const dec = new TextDecoder("utf-8");
     let buf = "";
+    let doneReceived = false;   // F7：流结束但没收到 done = 被中途掐断，不能当成功
+    const handleEv = ev => {
+      if (ev.type === "done" || ev.type === "cancelled" || ev.type === "error") doneReceived = true;
+      handleStreamEvent(ev, turn);
+    };
     while (true) {
       const rd = await reader.read();
       if (rd.done) break;
@@ -745,12 +828,17 @@ async function doSend(texts, attachment) {
       buf += dec.decode(rd.value, { stream: true });
       const out = parseSSEFrames(buf);   // 没凑齐 \n\n 的半帧会留在 out[1] 里
       buf = out[1];
-      out[0].forEach(ev => handleStreamEvent(ev, turn));
+      out[0].forEach(handleEv);
     }
     // 兜底：后端 done 一定以 \n\n 收尾，这里是防御（比如连接被中途掐断留下半帧）
     if (buf.trim()) {
       const out = parseSSEFrames(buf + "\n\n");
-      out[0].forEach(ev => handleStreamEvent(ev, turn));
+      out[0].forEach(handleEv);
+    }
+    if (!doneReceived) {
+      // 断流静默当成功（F7 的原样）：话说一半消失、UI 还显示"已连接"、
+      // 自动重发的路也被清掉。现在按断线处理，话留给用户重发
+      throw new Error("stream interrupted without done");
     }
     setLive("ok"); retrySend = null;
   } catch (e) {
@@ -768,13 +856,15 @@ async function doSend(texts, attachment) {
 function cancelInFlight() {
   const t = inFlight;
   if (!t) return;
-  // start 事件还没到就打断时 turnId 是 null，后端按"该会话当前活跃轮"来取消，一样命中
-  const body = { session_id: "default" };
-  if (t.turnId != null) body.turn_id = t.turnId;
-  fetch("/api/chat/cancel", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  }).catch(() => {});
+  // F4：turnId 还没到（start 事件未返回）就不发 cancel——后端现在拒绝
+  // turn_id 为空的取消（防误杀新一轮）。此时直接 abort 本地连接即可：
+  // 新一轮 start 自带"顶掉旧轮"语义，旧轮反正会被接管
+  if (t.turnId != null) {
+    fetch("/api/chat/cancel", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "default", turn_id: t.turnId })
+    }).catch(() => {});
+  }
   try { t.ctrl.abort(); } catch (e) {}
   markCut(t);
 }
@@ -970,7 +1060,7 @@ async function onVoiceMsg(ev) {
   if (typeof ev.data === "string") {
     // "我听到的是"是服务端收到录音的回执：通话里显示出来，才知道服务器活着收到了
     if (ev.data.startsWith("我听到的是：")) {
-      if (inCall) $("callTip").textContent = ev.data + "（Aria在想措辞…）";
+      if (inCall) $("callTip").textContent = ev.data + "（她在想措辞…）";
       return;
     }
     setLive("ok");
@@ -1150,7 +1240,10 @@ function doRecStop() {
   pcmChunks.forEach(c => { merged.set(c, off); off += c.length; });
   pcmChunks = [];
   ws.send(merged.buffer);
-  ws.send(new TextEncoder().encode("END"));
+  // END 必须是文本帧：TextEncoder().encode() 出来的是 Uint8Array，按 WebSocket
+  // 规范会作为二进制帧发送——后端只把文本帧当控制信号，二进制的 "END" 会被
+  // 当 PCM 追进音频缓冲，导致每轮语音回复被 8 秒心跳意外兜底、最多拖 8 秒才触发
+  ws.send("END");
   const m = "已发送 " + Math.round(total / 1024) + " KB，Aria在想措辞…";
   setWsState(m);
   if (inCall) $("callTip").textContent = m;
@@ -1424,7 +1517,7 @@ async function loadRelation() {
       html += `<div class="metric"><span class="mn">${m.label}</span><div class="bar"><div class="fill" style="width:${data[m.key] || 0}%;background:${m.color}"></div></div><span class="mv">${data[m.key] || 0}</span></div>`;
     });
     html += `<div style="margin-top:10px;font-size:11px;color:var(--text-faint)">`;
-    html += `互动次数：${data.interaction_count || 0} · 当前情绪：${data.mood_baseline || "平静"}`;
+    html += `互动次数：${data.interaction_count || 0} · 当前情绪：${data.mood || "平静"}`;
     if (data.last_interaction) html += ` · 最后互动：${data.last_interaction.slice(0, 10)}`;
     html += `</div>`;
     $("relationFields").innerHTML = html;
@@ -1505,6 +1598,27 @@ $("connMini").textContent = "已连接";
 applyUserName();
 loadUserName();
 loadHistory();
+
+// ========== N3 主动消息轮询：她也会先说话 ==========
+// 主动消息本体已落聊天库（刷新后历史一致），这里只负责"她先开口"的即时触达。
+// 游标存 localStorage：只拉上次见过之后的新消息，不会重复弹。
+(function proactivePoll() {
+  const KEY = "proactiveAfter";
+  async function poll() {
+    try {
+      const after = localStorage.getItem(KEY) || "";
+      const r = await fetch(`/api/chat/proactive/poll?session_id=default&after=${encodeURIComponent(after)}`);
+      if (!r.ok) return;
+      const d = await r.json();
+      (d.items || []).forEach(it => {
+        appendMsg("ai", `<div class="bubble">${esc(it.text)}</div>`, (it.time || "").replace("T", " ").slice(11, 16));
+        if (it.time && it.time > (localStorage.getItem(KEY) || "")) localStorage.setItem(KEY, it.time);
+      });
+    } catch (e) { /* 轮询失败静默，下一分钟再试 */ }
+  }
+  poll();
+  setInterval(poll, 60000);
+})();
 
 // 手机切后台会把 WS、音频上下文整个冻住：回前台一律重建，断掉的对话自动重发
 document.addEventListener("visibilitychange", () => {

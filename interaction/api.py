@@ -299,21 +299,41 @@ async def stream_message(payload: dict, request: Request):
         message = gateway["receiver"].receive(text, session_id, image_url=image_url)
 
         turn_id = None
+
+        # 断连看门狗（F11）：断连检查原来只在"事件到达时"做，思考模式/工具链
+        # 十几秒不产事件的空窗里客户端断开无人察觉，后端继续烧 token 完整生成
+        # 还写记忆。看门狗每 3 秒查一次，发现断开就取消该轮——管道自身的协作式
+        # 取消会收场并产出 cancelled 事件，这里不用动主循环。
+        async def _watch_disconnect():
+            while True:
+                await asyncio.sleep(3)
+                try:
+                    if await request.is_disconnected():
+                        TURN_REGISTRY.cancel(session_id, turn_id)
+                except Exception:
+                    return  # 连接对象不可用了，看门狗退场
+
+        watchdog = asyncio.create_task(_watch_disconnect())
+        gen = _get_orchestrator().astream(
+            message, synthesize_voice=True, want_voice=_wants_voice(text)
+        )
         try:
-            async for ev in _get_orchestrator().astream(
-                message, synthesize_voice=True, want_voice=_wants_voice(text)
-            ):
+            async for ev in gen:
                 if ev.get("type") == "start":
                     turn_id = ev.get("turn_id")
-                if await request.is_disconnected():
-                    # 前端走了：取消该轮，后端尽快收工
-                    TURN_REGISTRY.cancel(session_id, turn_id)
-                    break
                 yield _sse_frame(ev)
         except asyncio.CancelledError:
             # 服务端把这个响应生成器取消了，同样把该轮标掉
             TURN_REGISTRY.cancel(session_id, turn_id)
             raise
+        finally:
+            watchdog.cancel()
+            # 显式收摊：break/异常路径下管道的 finally（TURN_REGISTRY.finish、
+            # LLM 流关闭）立即执行，不等 GC 的 asyncgen 钩子
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     return StreamingResponse(_gen(), media_type="text/event-stream", headers=headers)
@@ -331,7 +351,7 @@ async def cancel_message(payload: dict) -> dict:
 
 
 @chat_router.get("/history")
-async def chat_history(session_id: str = "default", n: int = 100) -> dict:
+def chat_history(session_id: str = "default", n: int = 100) -> dict:
     """拉取某个会话的对话流水，前端刷新后靠它恢复聊天记录。
 
     库里存的可能是带 <voice> 标签的原文（实时链路为了合成语音而保留），
@@ -360,6 +380,19 @@ async def chat_history(session_id: str = "default", n: int = 100) -> dict:
             entry["voice_text"] = voice
         items.append(entry)
     return {"items": items}
+
+
+@chat_router.get("/proactive/poll")
+def proactive_poll(session_id: str = "default", after: str = "") -> dict:
+    """拉取她主动发的消息（N3）：前端每分钟轮询一次，after 是上次见到的时间。
+
+    主动消息本体已落 chat_log（intent='proactive'），刷新后历史照常还原，
+    这个接口只负责"她先开口"的即时触达。
+    """
+    from shared.singletons import services
+
+    items = services.get("kv_store").proactive_after(session_id, after or "2000-01-01", n=5)
+    return {"items": [{"text": it["text"], "time": it["time"]} for it in items]}
 
 
 @chat_router.post("/voice-replay")
@@ -525,9 +558,14 @@ async def voice_stream(websocket: WebSocket) -> None:
                         from tools.misc import ClockTool
 
                         if realtime_client is None:
+                            # instructions 内含向量召回（网络调用），扔线程池——
+                            # 在 WS 协程里同步跑会把整个事件循环冻结数秒（F15）
+                            instructions = await asyncio.to_thread(
+                                _build_realtime_instructions, session_id
+                            )
                             realtime_client = RealtimeDialogClient(
                                 session_id,
-                                instructions=_build_realtime_instructions(session_id),
+                                instructions=instructions,
                             )
                             await realtime_client.connect()
                         # 每轮刷新时段提示：通话跨时段（深夜别问吃饭）时她才反应得过来
@@ -553,7 +591,20 @@ async def voice_stream(websocket: WebSocket) -> None:
                         )
                         print(f"[voice] cascade 识别OK: {message.text[:40]}")
                         await stream.send_text(f"我听到的是：{message.text}")
-                        reply = await _get_orchestrator().handle(message)
+                        # cascade 轮也登记进轮次表（F10）：生成期间轮询连接状态，
+                        # 挂断/切后台即取消——不再"对着空气说完整段话"并写记忆
+                        from orchestration.cancellation import TURN_REGISTRY
+
+                        turn = TURN_REGISTRY.start(session_id)
+                        task = asyncio.create_task(_get_orchestrator().handle(message))
+                        try:
+                            while not task.done():
+                                done, _pending = await asyncio.wait({task}, timeout=1.0)
+                                if not stream.alive:
+                                    TURN_REGISTRY.cancel(session_id, turn.turn_id)
+                            reply = await task
+                        finally:
+                            TURN_REGISTRY.finish(session_id, turn.turn_id)
                         print(f"[voice] cascade 回复OK: {reply.text[:40]}")
                         audio = b""
                         try:
@@ -676,6 +727,22 @@ async def set_avatar(payload: _AvatarUpdate) -> dict:
     return {"ok": True, "avatar_url": data["avatar_url"]}
 
 
+@system_router.get("/who")
+async def get_who(session_id: str = "default") -> dict:
+    """她是谁：名字优先用她自己取的（批次0 自命名），没取过回落人设占位名。
+
+    named=True 表示名字是她本人在对话里定下的——前端据此决定开场白文案
+    （取名前不说"我是X"，那是在替她报名字）。
+    """
+    from capability import self_identity
+
+    rec = self_identity.get_self(session_id)
+    return {
+        "name": self_identity.display_name(session_id),
+        "named": bool(rec.get("name")),
+    }
+
+
 @system_router.post("/voice-route")
 async def switch_voice_route(payload: dict) -> dict:
     """切换实时语音路由（e2e 端到端 / cascade 级联 / realtime 实时专线）。"""
@@ -750,46 +817,46 @@ class _ProfileUpdate(BaseModel):
 
 
 @memory_router.get("/profile")
-async def _get_profile(session_id: str = "default"):
+def _get_profile(session_id: str = "default"):
     from shared.singletons import services
     return services.get("kv_store").read("profile", session_id) or {}
 
 
 @memory_router.put("/profile")
-async def _update_profile(update: _ProfileUpdate, session_id: str = "default"):
+def _update_profile(update: _ProfileUpdate, session_id: str = "default"):
     from capability.memory import ProfileUpdater
     ok = ProfileUpdater().set_field(session_id, update.field, update.value)
     return {"ok": ok}
 
 
 @memory_router.get("/portrait")
-async def _get_portrait(session_id: str = "default"):
+def _get_portrait(session_id: str = "default"):
     from shared.singletons import services
     return services.get("kv_store").read("portrait", session_id) or {}
 
 
 @memory_router.get("/relationship")
-async def _get_relationship(session_id: str = "default"):
+def _get_relationship(session_id: str = "default"):
     from shared.singletons import services
     return services.get("kv_store").read("relationship", session_id) or {}
 
 
 @memory_router.get("/diaries")
-async def _get_diaries():
+def _get_diaries():
     from shared.singletons import services
 
     return services.get("vector_store").list_diaries_enriched()
 
 
 @memory_router.delete("/diaries/{diary_id}")
-async def _delete_diary(diary_id: str):
+def _delete_diary(diary_id: str):
     from shared.singletons import services
 
     return {"ok": services.get("vector_store").delete_diary(diary_id)}
 
 
 @memory_router.get("/memories")
-async def _get_memories(q: str = "", session_id: str = "default"):
+def _get_memories(q: str = "", session_id: str = "default"):
     from shared.singletons import services
 
     vs = services.get("vector_store")
@@ -799,7 +866,7 @@ async def _get_memories(q: str = "", session_id: str = "default"):
 
 
 @memory_router.delete("/memories/{memory_id}")
-async def _delete_memory(memory_id: str):
+def _delete_memory(memory_id: str):
     from shared.singletons import services
 
     return {"ok": services.get("vector_store").delete_memory(memory_id)}

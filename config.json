@@ -33,7 +33,7 @@
     "enabled": true,
     "char_threshold": 60,
     "never_on_comfort": true,
-    "never_on_emotions": ["sad", "angry", "委屈"],
+    "never_on_emotions": ["sad", "angry"],
     "force_if_last_poor": true
   },
   "expression": {

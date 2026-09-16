@@ -87,7 +87,7 @@ def test_subtext_hints_kv_error(install_kv):
 
 # ------------------------- 词表兜底路径 -----------------------------
 def test_fallback_weather_intent(offline_pipeline):
-    intent, emotion, subtext = offline_pipeline.run("今天天气怎么样")
+    intent, emotion, subtext, _extras = offline_pipeline.run("今天天气怎么样")
     assert intent.intent == "weather"
     assert intent.confidence == 0.6
     assert emotion.emotion == "neutral"
@@ -95,18 +95,18 @@ def test_fallback_weather_intent(offline_pipeline):
 
 
 def test_fallback_comfort_intent_and_sad_emotion(offline_pipeline):
-    intent, emotion, _subtext = offline_pipeline.run("我好难过啊")
+    intent, emotion, _subtext, _extras = offline_pipeline.run("我好难过啊")
     assert intent.intent == "comfort"
     assert emotion.emotion == "sad"
 
 
 def test_fallback_image_intent(offline_pipeline):
-    intent, _emotion, _subtext = offline_pipeline.run("画一张小猫")
+    intent, _emotion, _subtext, _extras = offline_pipeline.run("画一张小猫")
     assert intent.intent == "image"
 
 
 def test_crisis_takes_priority_without_model(offline_pipeline):
-    intent, emotion, subtext = offline_pipeline.run("我真的不想活了")
+    intent, emotion, subtext, _extras = offline_pipeline.run("我真的不想活了")
     assert intent.intent == "comfort"
     assert emotion.is_crisis is True
     assert emotion.intensity == 1.0
@@ -114,7 +114,7 @@ def test_crisis_takes_priority_without_model(offline_pipeline):
 
 
 def test_empty_text_returns_default(offline_pipeline):
-    intent, emotion, subtext = offline_pipeline.run("   ")
+    intent, emotion, subtext, _extras = offline_pipeline.run("   ")
     assert intent.intent == "chat"
     assert emotion.emotion == "neutral"
     assert subtext == ""

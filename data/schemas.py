@@ -36,7 +36,7 @@ class RelationshipState:
     intimacy: int = 0
     affection: int = 0
     trust: int = 0
-    mood_baseline: str = "平静"
+    mood: str = "平静"  # MoodEngine 状态机输出（有累积/衰减语义），前端"当前情绪"读这个
     interaction_count: int = 0
     stage: str = "初识"
     last_interaction: str = ""
@@ -44,14 +44,28 @@ class RelationshipState:
 
 @dataclass
 class MemoryItem:
-    """一条被沉淀下来的长期记忆。"""
+    """一条被沉淀下来的长期记忆。
+
+    感受字段（S1，批次6）：生成时想一次就**冻死**，召回时只做受控调制、
+    绝不重新生成——同一件事两次回忆给出两种感受 = 自我打脸。
+    - feeling：第一人称纹理短语（"脸一直发烫，想找个地缝钻进去"），不是标签；
+    - appraisal：她的归因（她为什么这么感觉）；
+    - valence/arousal：效价 -1..1 / 唤醒度 0..1，给召回衰减与排序算的标量；
+    - peak_moment：感受峰值时刻，衰减锚点（空则用 timestamp）。
+    全部可缺省：旧记忆/感受生成失败时照存，只是没有纹理。
+    """
 
     memory_id: str
     session_id: str
-    kind: str  # hard_fact / preference / event / daily_summary
+    kind: str  # hard_fact / preference / event / daily_summary / user_flaw
     content: str
     importance: int = 3  # 1~5，越大越重要
     timestamp: str = ""
+    feeling: str = ""
+    appraisal: str = ""
+    valence: float = 0.0
+    arousal: float = 0.3
+    peak_moment: str = ""
 
 
 @dataclass

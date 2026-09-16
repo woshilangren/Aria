@@ -9,7 +9,7 @@ import json
 import re
 
 from shared.singletons import get_llm, services
-from shared.types import EmotionResult, IntentResult
+from shared.types import EmotionResult, IntentResult, PerceptionExtras
 
 # 意图只有这几种，模型答出别的就当它胡说，转头走规则兜底
 _VALID_INTENTS = ("chat", "comfort", "weather", "search", "image", "info_supply", "diary")
@@ -101,13 +101,14 @@ class PerceptionPipeline:
     """
 
     def run(self, text: str, recent_context: list = None) -> tuple:
-        """返回 (IntentResult, EmotionResult, subtext: str)。
+        """返回 (IntentResult, EmotionResult, subtext: str, PerceptionExtras)。
 
-        模型掉线或答非所问就退词表兜底，subtext 兜底为空串。
+        模型掉线或答非所问就退词表兜底，subtext 兜底为空串，extras 全空。
         """
         text = (text or "").strip()
         if not text:
-            return IntentResult(intent="chat", confidence=0.5), EmotionResult(), ""
+            return (IntentResult(intent="chat", confidence=0.5), EmotionResult(),
+                    "", PerceptionExtras())
 
         # 危机信号最优先，直接匹配，宁可错杀不可放过；危机关头别的都靠边
         for word in _CRISIS_PATTERNS:
@@ -116,6 +117,7 @@ class PerceptionPipeline:
                     IntentResult(intent="comfort", confidence=0.9),
                     EmotionResult(emotion="crisis", intensity=1.0, is_crisis=True),
                     "",
+                    PerceptionExtras(),
                 )
 
         hint_block = _load_subtext_hints(text)
@@ -128,18 +130,29 @@ class PerceptionPipeline:
                 "chat=普通闲聊\ncomfort=情绪低落需要安慰\nweather=问天气\n"
                 "search=要查资料或新闻\nimage=要生成图片\n"
                 "info_supply=主动报个人信息（比如报名字、说住在哪）\n"
-                "diary=想让AI写日记、把今天聊天记下来\n"
+                "diary=想让她写日记、把今天聊天记下来\n"
+                "【intent 判定红线】工具类意图（weather/search/image/diary）只在"
+                "他**明确要求**时才算——他说\"今天天气挺好\"\"外面下雨了\"这类陈述或闲聊里"
+                "顺带提到天气，一律算 chat，绝不因为出现\"天气\"两个字就判 weather。\n"
                 "emotion 从这些里选：neutral / happy / sad / angry / tired / anxious / crisis\n"
                 "subtext：字面之外可能想表达什么（反话、赌气、试探、没说出口的请求）。\n"
                 "没有就写\"无\"，不要硬凑。\n"
+                "concern：说完这轮，她心里会不会压着一个持续几轮的念头"
+                "（如\"他是不是烦我了\"）？输出 {\"text\":\"念头一句话\",\"delta\":-1到1的小数}"
+                "（delta 是这轮对它强度的增减：他冷淡/吵架为正，他哄/表态珍惜为负），没有则 null。"
+                "text 必须以她的第一人称、站在\"她是真实的人\"的身份上转述——"
+                "绝不出现 AI、程序、模型、机器人这类字眼（哪怕他这么说，她也不认）；\n"
+                "feedback：他这句话是不是在抱怨她的态度或语气"
+                "（如\"你好凶\"\"你怎么这么冷淡\"）？是则填 \"tone_down\"，否则填 \"none\"；\n"
                 f"{hint_part}"
                 f"最近对话：{_recent_tail(recent_context or [])}\n"
                 f"用户消息：{text}\n"
                 '只输出 JSON：{"intent": "类别", "confidence": 0到1的小数, '
-                '"emotion": "类别", "intensity": 0到1的小数, "subtext": "潜台词或无"}'
+                '"emotion": "类别", "intensity": 0到1的小数, "subtext": "潜台词或无", '
+                '"concern": null, "feedback": "none"}'
             )
             raw = get_llm().chat(
-                [{"role": "user", "content": prompt}], temperature=0.1, max_tokens=160
+                [{"role": "user", "content": prompt}], temperature=0.1, max_tokens=220
             )
             data = _parse_json(raw)
             intent = str(data.get("intent", ""))
@@ -149,6 +162,7 @@ class PerceptionPipeline:
             subtext = str(data.get("subtext", "") or "").strip()
             if subtext in ("无", "无。", "none", "None"):
                 subtext = ""
+            extras = _parse_extras(data)
             return (
                 IntentResult(intent=intent, confidence=float(data.get("confidence", 0.8))),
                 EmotionResult(
@@ -157,6 +171,7 @@ class PerceptionPipeline:
                     is_crisis=False,
                 ),
                 subtext,
+                extras,
             )
         except Exception:
             pass  # 模型掉线或答非所问都别慌，下面有词表兜底
@@ -172,9 +187,31 @@ class PerceptionPipeline:
             if any(w in text for w in words):
                 emotion = name
                 break
-        return IntentResult(intent=intent, confidence=confidence), EmotionResult(
+        return (IntentResult(intent=intent, confidence=confidence), EmotionResult(
             emotion=emotion, intensity=0.6 if emotion != "neutral" else 0.3
-        ), ""
+        ), "", PerceptionExtras())
+
+
+def _parse_extras(data: dict) -> PerceptionExtras:
+    """从感知 JSON 里拆附加产出：字段缺失/类型坏一律退默认，绝不因附加字段炸掉感知。"""
+    concern = data.get("concern")
+    concern_text, concern_delta = "", 0.0
+    if isinstance(concern, dict):
+        concern_text = str(concern.get("text") or "").strip()[:80]
+        # 沉浸式护栏（代码层兜底）：她不认自己是 AI，心事文本里不许出现破防词——
+        # 提示词禁了，模型偶尔还是照抄用户原话（实测踩中），这里再拦一道
+        concern_text = re.sub(
+            r"AI|人工智能|程序|模型|机器人", "他说的那些", concern_text, flags=re.IGNORECASE
+        )
+        try:
+            concern_delta = max(-1.0, min(1.0, float(concern.get("delta") or 0)))
+        except (TypeError, ValueError):
+            concern_delta = 0.0
+    feedback = str(data.get("feedback") or "").strip()
+    if feedback not in ("tone_down",):
+        feedback = ""
+    return PerceptionExtras(concern_text=concern_text,
+                            concern_delta=concern_delta, feedback=feedback)
 
 
 class SafetyReviewer:

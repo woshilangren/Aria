@@ -11,8 +11,52 @@ from tools.misc import ClockTool
 # LLM 挂了时的兜底话（内置默认；persona_config.json 的 fallback_replies.llm 可覆盖）
 _FALLBACK_REPLY = "……这会儿状态不太对，等一下再聊。"
 
-# 工具没跑出来任何东西时的兜底话（fallback_replies.no_result 可覆盖）
-_NO_RESULT_REPLY = "工具这边什么都没查到，换个问法试试？"
+# 没查到结果时的兜底话（fallback_replies.no_result 可覆盖）。
+# 沉浸式措辞：她是"人"，嘴里不能出现"工具"这种词
+_NO_RESULT_REPLY = "呃……这个我还真不知道。"
+
+# 兜底话的"现说"指引（S12 媒体如实告知原则的延伸）：出状况时她用自己当下的
+# 口吻承认，每次不一样——固定台词复读本身就是 AI 腔
+_FALLBACK_INTENT = {
+    "no_result": "他问的事你没弄明白——直说不知道，可以带点小情绪或不服气",
+    "search": "你想给他查点东西但没查到有用的——承认这次没辙，别装知道",
+    "image": "他让你弄张图但你没弄出来——说这次没成，别提任何工具字眼",
+    "tool_call": "他想让你办的事没办成——直说这次没成，别提任何工具字眼",
+    "review": "你刚才有句话没说出口——算了不说了，自然岔开",
+    "blocked": "他碰了你不想聊的话题——按你的性子拒绝或岔开",
+}
+
+
+def fallback_line(kind: str, session_id: str = "", default: str = "") -> str:
+    """兜底话的统一出口：能开口就现说一句（每次不一样），说不了落回固定台词。
+
+    两层兜底：
+    1. LLM 活着 → 以她的身份、按当下心情现说一句（绝不提工具/系统字眼）；
+    2. 任何失败 → 人设自定义台词 → 内置默认。
+    "llm" 类故障（模型本身挂了）直接跳过现说——那时生成必然失败，别白等。
+    """
+    if kind != "llm" and session_id:
+        try:
+            from capability import self_identity
+
+            name = self_identity.display_name(session_id)
+            rel = services.get("kv_store").read("relationship", session_id) or {}
+            mood = rel.get("mood") or "平常"
+            intent = _FALLBACK_INTENT.get(kind, "出了点小状况，自然承认")
+            line = (get_llm().chat(
+                [{"role": "user", "content": (
+                    f"你是{name}，一个真实生活的年轻女孩，此刻心情偏「{mood}」。\n"
+                    f"{intent}。一句话，30 字以内，口语，符合你此刻的心情；"
+                    "绝不提工具、系统、搜索、网络这类字眼。只输出这一句。"
+                )}],
+                temperature=0.9,
+                max_tokens=50,
+            ) or "").strip()
+            if line:
+                return line[:60]
+        except Exception:
+            pass  # 现说失败落固定台词，兜底链不能断
+    return _persona_fallback(kind, default or _FALLBACK_REPLY)
 
 
 def _persona_fallback(kind: str, default: str) -> str:
@@ -70,15 +114,17 @@ def persona_wrap(
     user_text: str,
     initial_text: str = "",
     extra: str = "",
+    session_id: str = "",
 ) -> FinalReply:
     """把工具跑出来的结果转述成角色的口吻。
 
     initial_text 是模型自己先说的版本，只当参考用，转述时重新润一遍。
     extra 是追加在系统提示词末尾的附加规矩（比如语音轮的情绪标注要求）。
     图片类结果顺手把图片路径带出去，上层好往页面塞图。
+    session_id 透传给兜底话出口：没查到结果时她说的是"现说的"，不是复读。
     """
     if not results:
-        return FinalReply(text=_persona_fallback("no_result", _NO_RESULT_REPLY))
+        return FinalReply(text=fallback_line("no_result", session_id, default=_NO_RESULT_REPLY))
 
     # 工具结果整理成清单，一行一个，转述的时候有据可依
     lines = []
