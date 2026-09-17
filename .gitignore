@@ -15,3 +15,9 @@ venv/
 # IDE 本地配置
 .vscode/
 .idea/
+
+# 作者本人专属设计文件与真机测试记录：永不入库
+core.md
+核心.md
+scripts/test_transcript.json
+

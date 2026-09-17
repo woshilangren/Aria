@@ -23,7 +23,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 class Settings:
     """所有配置项都集中在这，别的模块只管问这里要。"""
 
-    # ---- LLM（主模型走百炼，备用 GLM 只在主模型连不上时顶上）----
+    # ---- LLM（主模型当前 claude-sonnet-5 / nonelinear，备用 GLM 只在主模型连不上时顶上；
+    #      语音/向量/画图仍走百炼——LLM_API_KEY 与它们是独立变量）----
     llm_api_key: str
     llm_base_url: str
     llm_model: str

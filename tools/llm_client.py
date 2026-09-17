@@ -1,7 +1,8 @@
 """LLM 调用统一走这个文件，全项目不许自己另外建 OpenAI 客户端。
 
 好处就一个：换模型、换地址、加重试，改这里一处就够了。
-主模型（qwen3.8-flash）连不上或连续报错时，自动切备用（glm-5.3-flash）。
+主模型（当前 claude-sonnet-5，走 nonelinear 的 OpenAI 兼容端点）连不上或
+连续报错时，自动切备用（glm-5.3-flash）。参数按模型家族分发（见 _is_qwen）。
 """
 
 import json
@@ -21,7 +22,7 @@ class LLMClient:
         cfg = get_settings()
         if not cfg.llm_api_key:
             raise RuntimeError("LLM_API_KEY 没配，聊天功能没法用")
-        # 主客户端：qwen3.8-flash，走百炼的 OpenAI 兼容接口
+        # 主客户端：模型/地址/key 全来自 .env（当前 claude-sonnet-5 + nonelinear）
         self._client = OpenAI(
             api_key=cfg.llm_api_key,
             base_url=cfg.llm_base_url,
