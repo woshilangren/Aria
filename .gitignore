@@ -20,4 +20,6 @@ venv/
 core.md
 核心.md
 scripts/test_transcript.json
-
+docs/
+CLAUDE.md
+AGENTS.md
