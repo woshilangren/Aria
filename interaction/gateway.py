@@ -86,7 +86,6 @@ class MessageReceiver:
             text=(raw_text or "").strip(),
             input_mode="text",
             session_id=session_id,
-            timestamp=ClockTool().now(),
             image_url=image_url,
         )
 
@@ -100,7 +99,6 @@ class MessageReceiver:
             text=text,
             input_mode="voice",
             session_id=session_id,
-            timestamp=ClockTool().now(),
         )
 
 

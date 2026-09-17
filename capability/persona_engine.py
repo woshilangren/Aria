@@ -38,10 +38,12 @@ def _expression_cfg() -> dict:
 class PersonaEngine:
     """人设提示词的组装车间，谁来要回复就给谁一份现成的。"""
 
-    def __init__(self, keeper: SessionMemoryKeeper = None):
-        # 短期记忆的管家从外面塞进来，全项目共用一个，
-        # 不然两份记忆各记各的，聊着聊着就对不上了
-        self._keeper = keeper or SessionMemoryKeeper()
+    def __init__(self, keeper: SessionMemoryKeeper):
+        # 短期记忆的管家从外面塞进来，全项目共用一个。
+        # 改成必填参数：以前默认 or SessionMemoryKeeper() 是给 KEEPER 唯一性埋的雷——
+        # 谁哪天不传 keeper 就 new 出第二份，直接违反 CLAUDE.md 关键单例不变式。
+        # 现在不传就 TypeError 在启动期炸，不让 bug 跑到运行期。
+        self._keeper = keeper
 
     @property
     def keeper(self) -> SessionMemoryKeeper:
@@ -285,7 +287,6 @@ class PersonaEngine:
         return PromptPackage(
             system_prompt="\n\n".join(sections),
             context_messages=self._keeper.get_context(session_id),
-            tone_mode=mode,
         )
 
     @staticmethod

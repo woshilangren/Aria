@@ -2,7 +2,9 @@
 fastapi
 uvicorn[standard]
 gradio
-websockets
+websockets>=14,<17
+# websockets 锁范围：>=14 是 Starlette/FastAPI WS 服务器协议兼容下限（13 在 ASGI 协议层有回归），
+# <17 留出升级窗口（精确版本由 requirements.lock 在 CI 里钉死）。
 
 # ===== 向量记忆（工具层 / 数据层）=====
 chromadb

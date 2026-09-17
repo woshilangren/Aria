@@ -477,6 +477,16 @@ class KVStoreTool:
         """某时刻之后她主动发的话（N3 轮询），旧 -> 新。"""
         return self._session.proactive_after(session_id, after_iso, n)
 
+
+    def chat_log_hour_distribution(self, session_id: str, days: int = 14) -> dict:
+        """近 N 天 chat_log 的小时分布 {hour: count}；拿不到返回 {}。
+
+        K7 修的接口：以前 capability/proactive.py 自己 from data.sqlite_store import get_db
+        再摸 _lock/_conn，违反分层纪律。现在 SQL 收在 SessionStore 里，capability 只调门面。
+        """
+        return self._session.chat_log_hour_distribution(session_id, days)
+
+
     def recent_chat(self, session_id: str, n: int = 100) -> list:
         """取某会话最近 n 条聊天记录。
 

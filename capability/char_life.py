@@ -16,7 +16,6 @@
 from datetime import datetime
 
 from shared.singletons import services
-from tools.misc import ClockTool, parse_llm_json
 
 _SHAPES = ("忙碌工作日", "懒散周末", "朋友日", "加班日", "平常的一天")
 

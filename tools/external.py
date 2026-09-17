@@ -12,11 +12,8 @@ import httpx
 from ddgs import DDGS
 
 from config.settings import get_settings
+from tools.misc import has_key
 
-
-def _has_key(key: str) -> bool:
-    """key 存在且不是占位符（占位符以 your- 开头，比如 your-xxx）。"""
-    return bool(key) and not key.startswith("your-")
 
 # Open-Meteo 返回的是天气代码（weathercode），这里挑常见的翻成中文
 _WEATHER_CODES = {
@@ -104,7 +101,7 @@ class ImageGenTool:
     def generate(self, prompt: str) -> dict:
         cfg = get_settings()
         key = cfg.image_gen_api_key or cfg.llm_api_key
-        if not _has_key(key):
+        if not has_key(key):
             raise RuntimeError("画图服务没配置（IMAGE_GEN_API_KEY）")
         # 提交任务：注意 dashscope 的 size 用星号分隔（1024*1024），不是 x
         rsp = dashscope.ImageSynthesis.async_call(

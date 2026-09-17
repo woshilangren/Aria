@@ -9,11 +9,19 @@
 装配时机：import 本模块**不产生副作用**——不建任何服务、不起后台线程。真正的装配
 发生在应用 startup 的 lifespan 里。`app` 对象仍在模块顶层建好，所以 `uvicorn main:app`
 依然可用（代价是既不生成证书、也不开 8443）。
+
+P3-4 说明（codex 2026-09-17 审查指出）：`/api/system/health` 是**故意无需 token**——
+它是网关监控 / 运维探针的入口；要 ACCESS_TOKEN 才能访问会让"全裸"状态没法被
+监控看到（自打监控脸的意图）。这是有意的设计选择，代价是 enumeration 信标风险
+（拿到 health 的人能知道 `bind_host` + `_UNPROTECTED_STATE`）。运维侧缓解：
+把 `/api/system/health` 放在反向代理白名单内 / 用网络层 ACL 限制访问源。
 """
 
 import os
 import secrets
 import threading
+import time as _time
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,10 +29,59 @@ import uvicorn
 from fastapi import FastAPI
 
 from bootstrap import bootstrap
+from config.settings import get_settings
 from interaction.api import build_app
 
 # 视为“仅本机”的监听地址：绑这些地址不会被局域网/公网直接访问，不配口令也安全
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+# K10 监控位：当前是否处于"无口令对外监听"的危险状态。
+# 设了之后 /api/system/health 会持续暴露给监控/告警系统。
+# 配套每 10 分钟在日志里喊一次，直到有人配 ACCESS_TOKEN（或 BIND_HOST 改回 loopback）。
+_UNPROTECTED_STATE = {"active": False, "since": "", "reason": "", "bind_host": ""}
+_UNPROTECTED_LOCK = threading.Lock()
+_alarm_started = False
+
+
+def _start_unprotected_alarm() -> None:
+    """无口令对外监听状态被设置后，启动 daemon 线程每 10 分钟在控制台吼一次。
+
+    设计取舍：监控/告警系统更可靠的来源是 /api/system/health 的 _UNPROTECTED_STATE，
+    控制台告警是兜底——开发机/单人自用没接监控时不会让告警沉到底。
+    线程级不重复启动：模块级 _alarm_started 标志防多线程并发重复。
+    """
+    global _alarm_started
+    if _alarm_started:
+        return
+    _alarm_started = True
+
+    def _loop():
+        while True:
+            _time.sleep(600)  # 10 分钟
+            with _UNPROTECTED_LOCK:
+                st = dict(_UNPROTECTED_STATE)
+            if not st.get("active"):
+                return
+            # P1-2 自停（codex 2026-09-17 审查指出）：原版"持续告警"实际是"永久告警"——
+            # 没人改 active=False，daemon 一直吼到进程退出。
+            # 自停策略：每轮重新读 .env，发现 ACCESS_TOKEN 已配上 → 自动降级。
+            try:
+                get_settings.cache_clear()
+                if get_settings().access_token:
+                    with _UNPROTECTED_LOCK:
+                        _UNPROTECTED_STATE["active"] = False
+                    print("[K10] ACCESS_TOKEN 已配上，告警自动停止。")
+                    return
+            except Exception:
+                pass
+            print("=" * 64)
+            print(f"[持续警告·K10] 站点仍以无 ACCESS_TOKEN 对 {st.get('bind_host', '?')} 监听中。")
+            print(f"               自 {st.get('since', '?')} 起，原因：{st.get('reason', '?')}")
+            print("               现在任何 LAN 内设备都能访问所有接口与语音通道。")
+            print("=" * 64)
+
+    threading.Thread(target=_loop, daemon=True, name="unprotected-alarm").start()
+
 
 
 def create_app() -> FastAPI:
@@ -108,10 +165,17 @@ def _ensure_access_token(settings) -> None:
 
         _upsert_env_token(PROJECT_ROOT / ".env", new_token)
     except Exception as exc:
+        with _UNPROTECTED_LOCK:
+            _UNPROTECTED_STATE["active"] = True
+            _UNPROTECTED_STATE["since"] = datetime.now(timezone.utc).isoformat()
+            _UNPROTECTED_STATE["reason"] = f"写入 .env 失败：{exc}"
+            _UNPROTECTED_STATE["bind_host"] = settings.bind_host
+        _start_unprotected_alarm()
         print("=" * 64)
         print(f"[警告] 当前无访问口令且对外监听（BIND_HOST={settings.bind_host}），")
         print(f"       自动写入 .env 失败：{exc}")
         print("       请手动在 .env 配置 ACCESS_TOKEN，否则局域网内任何人都能访问。")
+        print("       已注册 /api/system/health 持续暴露此状态；监控可 GET 检测。")
         print("=" * 64)
         return
 

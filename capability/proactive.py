@@ -7,7 +7,6 @@
 
 import random
 import threading
-from collections import Counter
 from datetime import datetime, timedelta
 
 from config.settings import load_app_config
@@ -60,18 +59,22 @@ class ProactiveSpeaker:
         return hit_rate >= 0.4 or datetime.now().hour in hours
 
     def _hour_histogram(self, session_id: str) -> "dict | None":
-        """近 14 天 chat_log 的小时分布 {hour: count}；拿不到返回 None。"""
-        try:
-            from data.sqlite_store import get_db
+        """近 14 天 chat_log 的小时分布 {hour: count}；拿不到返回 None。
 
-            cutoff = (datetime.now() - timedelta(days=14)).isoformat(timespec="seconds")
-            with get_db()._lock:
-                rows = get_db()._conn.execute(
-                    "SELECT substr(created_at, 12, 2) AS h, COUNT(*) AS n FROM chat_log "
-                    "WHERE session_id=? AND created_at >= ? GROUP BY h",
-                    (session_id, cutoff),
-                ).fetchall()
-            return {int(r[0]): r[1] for r in rows}
+        P0-2 修复（codex 2026-09-17 审查指出）：以前 `services.get("kv_store") or KVStoreTool()`
+        在 kv_store 未注册时静默 new 第二份 sqlite 连接——绕开 CLAUDE.md "KEEPER 全项目
+        一份"的不变式（虽然字面是 KEEPER，但 kv_store 同样应是单例）。
+        现在的策略：拿不到就 return None，让上层 `_active_window` 走保守分支（数据不足不冷 ping），
+        而不是悄悄开个新连接。`KVStoreTool` 仍由 `bootstrap.py` 装配，缺了就该响在 startup，
+        不是这里二开。
+        """
+        from shared.singletons import services
+
+        kv = services.get("kv_store")
+        if kv is None:
+            return None
+        try:
+            return kv.chat_log_hour_distribution(session_id, days=14)
         except Exception:
             return None
 

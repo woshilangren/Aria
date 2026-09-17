@@ -8,8 +8,13 @@ on:
 
 jobs:
   test:
-    name: pytest (Python 3.14)
-    runs-on: ubuntu-latest
+    name: pytest (${{ matrix.os }} · py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.14"]
 
     # 全是**非密钥**占位值：测试进程绝不依赖任何真实 key（conftest 还会再兜一层）。
     # 不配置任何 secrets。
@@ -21,21 +26,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.14
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
+        # 两段：先 requirements.txt（约束范围）→ 再 requirements.lock（钉死精确版本）。
+        # README 说 lock 是"本机 pip freeze 快照"，这里**只用于 CI 版本钉死**，不替代 .txt 的范围约束。
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+          # 用 --no-deps 防 lock 与 .txt 范围冲突时 pip 自动放宽；冲突直接报错让维护者看到
+          pip install --no-deps -r requirements.lock
 
       - name: Lint (undefined names / redefinitions / syntax)
         # F821=用了未定义的名字（A2/A3 那类事故静态即报）；compileall 抓不到
-        run: |
-          ruff check --select F821,F822,F811,E9 .
+        run: ruff check --select F821,F822,F811,E9 .
 
       - name: Run tests
+        # Windows runner 上 %TEMP% 默认可写，无需 --basetemp；如未来出现 sandbox 风格受限再加
         run: python -m pytest

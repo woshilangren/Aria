@@ -8,13 +8,6 @@ from typing import Optional
 
 
 @dataclass
-class PersonaPrompt:
-    """拼好的一份提示词，喂给 LLM 用。"""
-
-    text: str
-
-
-@dataclass
 class MemoryBundle:
     """一次回忆打捞上来的所有东西。"""
 
@@ -79,7 +72,6 @@ class PromptPackage:
 
     system_prompt: str
     context_messages: list = field(default_factory=list)  # 短期记忆，[{"role","content"},...]
-    tone_mode: str = "chat"
 
 
 @dataclass
@@ -98,5 +90,4 @@ class InputMessage:
     text: str
     input_mode: str = "text"   # text / voice
     session_id: str = "default"
-    timestamp: str = ""
     image_url: str = ""        # 用户随消息上传的图片（可选），多模态模型跟着一起看

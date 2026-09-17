@@ -174,3 +174,12 @@ class Logger:
         """工具调用单独记一笔，以后排查"它到底调了啥"全靠这个。"""
         self._kv.log({"tool": tool_name, "arguments": arguments, "status": status, "result": result[:200]})
         self._logger.info(f"工具调用 {tool_name} {status}")
+
+
+def has_key(key: str) -> bool:
+    """key 存在且不是占位符（占位符以 your- 开头，比如 your-xxx）。
+
+    合并自 tools/external.py:17 + tools/speech.py:106，两份逻辑完全一致，
+    现统一到 tools.misc._has_key，两处 import 即可，避免后续两处实现漂移。
+    """
+    return bool(key) and not key.startswith("your-")

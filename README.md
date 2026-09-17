@@ -70,9 +70,9 @@ copy .env.example .env
 
 配置分两处，各管各的：
 
-**`.env`（密钥与地址）** — 从 `.env.example` 复制。主 LLM / 语音识别 / 语音合成 / 向量 / 画图走阿里云百炼（DashScope），一把 key 通吃；备用 LLM 默认配 GLM，只在主模型连不上时顶上。天气用 Open-Meteo（免费无 key），搜索用 DuckDuckGo（免费无 key）。
+**`.env`（密钥与地址）** — 从 `.env.example` 复制。**主 LLM = claude-sonnet-5（nonelinear OpenAI 兼容端点 `/v1`）**，独立于语音/向量/画图；**ASR / TTS / Realtime / 向量 / 画图走阿里云百炼（DashScope），一把 key 通吃**；备用 LLM 默认 GLM，只在主模型连不上时顶上。LLM 切到 nonelinear 之后，`LLM_API_KEY` 与 `ASR_API_KEY/TTS_API_KEY/EMBEDDING_API_KEY/IMAGE_GEN_API_KEY` 是**独立变量**——换 LLM 供应商不影响语音。天气用 Open-Meteo（免费无 key），搜索用 DuckDuckGo（免费无 key）。
 
-**`config.json`（业务参数）** — 温度、重试次数、闲置分钟数、记忆条数上限等，全部有内置默认值，不建也能跑。其中 `personality.quirk_rate` 控制随机小动作的触发概率（0~1，0 为关闭），`llm.enable_thinking` 控制 Qwen 系模型的思考开关。运行中可通过设置面板在线改，写回文件立即生效。
+**`config.json`（业务参数）** — 温度、重试次数、闲置分钟数、记忆条数上限等，全部有内置默认值，不建也能跑。其中 `personality.quirk_rate` 控制随机小动作的触发概率（0~1，0 为关闭）。`llm.enable_thinking` 是 Qwen 家族模型的家族内参数（`tools/llm_client._is_qwen` 自动分发），对 claude-sonnet-5 等不带 thinking 开关的模型**不发**——否则会 400 → 熔断 → 切备用。运行中可通过设置面板在线改，写回文件立即生效。
 
 **`data/persona_config.json`（人设）** — 见下节。
 

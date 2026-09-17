@@ -12,7 +12,7 @@
   "memory": {
     "max_turns_short_term": 12,
     "recall_top_k": 5,
-    "portrait_tag_limit": 20,
+    "portrait_tag_limit": 5,
     "profile_confidence_threshold": 0.6,
     "persona_decay_days": 14,
     "diary_max_entries": 30,
@@ -20,7 +20,10 @@
     "max_sessions": 8
   },
   "proactive": {
-    "idle_minutes": 30
+    "idle_minutes": 30,
+    "enabled": false,
+    "daily_max": 2,
+    "min_intimacy": 20
   },
   "tools": {
     "max_retry": 2,

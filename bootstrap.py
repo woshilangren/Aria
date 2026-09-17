@@ -49,13 +49,22 @@ def bootstrap() -> None:
     except Exception as exc:
         services.mark_error("vector_store", str(exc))
 
+    # 拆成两个 try：以前两个共用同一个 try，registry 初始化一失败就把 executor 一起带走，
+    # 等于工具表整体成功但 executor 不在工作位（key 是 `tool_registry` 拿不到真实原因）。
+    # 这次照搬 kv_store / vector_store 的写法。
     try:
-        from tools.registry import ToolExecutor, ToolRegistry
+        from tools.registry import ToolRegistry
 
         services.register("tool_registry", ToolRegistry())
-        services.register("tool_executor", ToolExecutor())
     except Exception as exc:
         services.mark_error("tool_registry", str(exc))
+
+    try:
+        from tools.registry import ToolExecutor
+
+        services.register("tool_executor", ToolExecutor())
+    except Exception as exc:
+        services.mark_error("tool_executor", str(exc))
 
     # 日记作者：真身在 capability 层，工具名片已在 registry 登记，
     # 这里把实例注册好、把工具入口注入进去（延迟 import 避开循环依赖）

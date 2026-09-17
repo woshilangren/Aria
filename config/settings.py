@@ -110,7 +110,10 @@ def load_app_config() -> dict:
         "memory": {
             "max_turns_short_term": 12,
             "recall_top_k": 5,
-            "portrait_tag_limit": 20,
+            "portrait_tag_limit": 5,  # 与 portrait 抽取 prompt 里的"标签不超过 5 个"对齐（memory.py:_decay_tags 取 [:limit]）
+            "max_sessions": 8,                # KEEPER 同时持有的会话上下文上限，超出最久未用淘汰
+            "profile_confidence_threshold": 0.6,  # 画像硬事实入库置信度门槛（参见 MemoryGatekeeper）
+            "persona_decay_days": 14,         # 标签多久没再被提到就过期清理（见 _decay_tags）
         },
         "proactive": {
             "idle_minutes": 30,

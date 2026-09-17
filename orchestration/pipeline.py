@@ -566,29 +566,36 @@ class DialoguePipeline:
         image_path = ""
         cancelled = False
 
-        async for ev in self.astream(message, synthesize_voice=False, want_voice=False):
-            t = ev.get("type")
-            if t == "emotion":
-                emotion = ev.get("emotion") or ""
-                desc = ev.get("desc") or ""
-            elif t == "sentence":
-                frags.append((ev.get("seq", 0), "text", ev.get("text", "")))
-            elif t == "voice":
-                frags.append((ev.get("seq", 0), "voice", ev.get("voice_text", "")))
-            elif t == "image":
-                image_path = ev.get("path", "") or ""
-                output_mode = "image"
-            elif t == "refuse":
-                frags = [(0, "text", ev.get("text", ""))]
-                emotion, desc = "", ""
-                output_mode, image_path = "text", ""
-            elif t == "done":
-                output_mode = ev.get("output_mode") or output_mode
-                image_path = ev.get("image_path") or image_path
-            elif t == "cancelled":
-                cancelled = True
-            elif t == "error":
-                return FinalReply(text=FallbackController().fallback_reply("llm"))
+        # astream 内部 finally 会调 TURN_REGISTRY.finish（详见 CLAUDE.md 关键单例）；
+        # 显式 try/finally 保证 error 分支提前 return 时也立即收尾，
+        # 避免靠 GC 终结器兜底让登记项短暂滞留。
+        _astream = self.astream(message, synthesize_voice=False, want_voice=False)
+        try:
+            async for ev in _astream:
+                t = ev.get("type")
+                if t == "emotion":
+                    emotion = ev.get("emotion") or ""
+                    desc = ev.get("desc") or ""
+                elif t == "sentence":
+                    frags.append((ev.get("seq", 0), "text", ev.get("text", "")))
+                elif t == "voice":
+                    frags.append((ev.get("seq", 0), "voice", ev.get("voice_text", "")))
+                elif t == "image":
+                    image_path = ev.get("path", "") or ""
+                    output_mode = "image"
+                elif t == "refuse":
+                    frags = [(0, "text", ev.get("text", ""))]
+                    emotion, desc = "", ""
+                    output_mode, image_path = "text", ""
+                elif t == "done":
+                    output_mode = ev.get("output_mode") or output_mode
+                    image_path = ev.get("image_path") or image_path
+                elif t == "cancelled":
+                    cancelled = True
+                elif t == "error":
+                    return FinalReply(text=FallbackController().fallback_reply("llm"))
+        finally:
+            await _astream.aclose()
 
         if cancelled:
             # 取消不当异常兜底成 llm 兜底话：这轮当没发生过，给个空回复
@@ -708,6 +715,13 @@ class DialoguePipeline:
             # 被更新的同一会话轮次取代：什么都不写（见 _writeback 注释）
             yield {"type": "cancelled", "reason": "superseded"}
         except _RefuseTurn as r:
+            # I13：refuse 降级也跑写回，让 was_poor 落 relationship.last_poor，否则
+            # force_if_last_poor 在降级后的下一轮永远不触发。_writeback 内部
+            # 检测 final_reply/draft_reply 都空时走 refuse-only 分支（只写关系层），
+            # 不写 KEEPER / chat_log / 蒸馏 / 画像——refuse 没说过话。
+            deferred = await asyncio.to_thread(self._writeback, state, handle)
+            self._check_cancel(handle)
+            _schedule_bg_writeback(deferred)
             yield {"type": "refuse", "text": r.text, "replace": True,
                    "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}
@@ -773,9 +787,8 @@ class DialoguePipeline:
                     held_text = frag[1]
                     has_followup = _subst_count(held_text) > 1
                     if has_followup or state.reaction_tagged:
-                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
-                            if ev.get("type") in ("sentence", "voice"):
-                                pushed = True
+                        pushed, evs = await self._flush_held(held_text, state, handle, synthesize_voice, seq)
+                        for ev in evs:
                             yield ev
                         continue
                     needs_substance = (
@@ -785,18 +798,16 @@ class DialoguePipeline:
                     )
                     if not needs_substance:
                         # 闲聊/短陈述：极简放行，不算敷衍
-                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
-                            if ev.get("type") in ("sentence", "voice"):
-                                pushed = True
+                        pushed, evs = await self._flush_held(held_text, state, handle, synthesize_voice, seq)
+                        for ev in evs:
                             yield ev
                         continue
                     # minimal_allowlist 白名单（F8 接线）：配置里点名的极简回复
                     # （"6"、"？"、"神了"……）正向放行——以前这串配置是从没被读过的摆设
                     allowlist = set(_expression_cfg().get("minimal_allowlist") or [])
                     if held_text.strip() in allowlist:
-                        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
-                            if ev.get("type") in ("sentence", "voice"):
-                                pushed = True
+                        pushed, evs = await self._flush_held(held_text, state, handle, synthesize_voice, seq)
+                        for ev in evs:
                             yield ev
                         continue
                     if attempt < _MAX_REWRITE:
@@ -858,6 +869,21 @@ class DialoguePipeline:
                 yield ev
             state.final_reply = fallback
             return
+
+    async def _flush_held(self, held_text, state, handle, synthesize_voice, seq):
+        """放行 held 短句：emit 一批 sentence/voice 事件，返回 (是否推出, 事件列表)。
+
+        I13 抽取：原 _astream_chat 三处相同的四行样板合并到这里——事故性复杂度
+        而非有意重复。pushed 只在确实产出 sentence/voice 时置位，由调用方
+        unpacking 返回值后再 yield。
+        """
+        pushed = False
+        out = []
+        async for ev in self._emit_frags([("sentence", held_text)], state, handle, synthesize_voice, seq):
+            if ev.get("type") in ("sentence", "voice"):
+                pushed = True
+            out.append(ev)
+        return pushed, out
 
     async def _emit_frags(self, frags, state, handle, synthesize_voice, seq):
         """把一批片段依次转成事件；出现既不该被推出去的 held 就当成普通句子（兜底）。"""
@@ -1071,6 +1097,31 @@ class DialoguePipeline:
         单轮不变式会让新轮先取消旧轮，旧轮本来就不该留痕。
         """
         session_id = state.session_id
+        # I13 refuse-only 分支：refuse 路径（_RefuseTurn 被外层 except 接走）的写回，
+        # final_reply / draft_reply 都空说明这轮没产出正文——但 was_poor=True 仍要
+        # 落库，否则 force_if_last_poor（见 :247-250）在降级后下一轮永远不触发。
+        # 机制只在"轮内重写成功"时生效，与 _think_needed 注释意图不符，而这
+        # 恰恰是最需要它的时候。其他副作用一律不走：KEEPER / chat_log / 蒸馏 / 画像
+        # 都是"这轮说过话"的产物，refuse 没说过。
+        if not (state.final_reply or state.draft_reply):
+            self._check_cancel(handle)
+            tracker = RelationshipTracker()
+            tracker.update(
+                state.session_id,
+                state.emotion.emotion if state.emotion else "neutral",
+                comfort_mode=state.comfort_mode,
+                was_poor=state.was_poor,
+                intensity=state.emotion.intensity if state.emotion else 0.5,
+                extras=state.extras,
+            )
+            self._check_cancel(handle)
+            try:
+                from capability.proactive import note_user_reply
+                note_user_reply(state.session_id)
+            except Exception:
+                pass
+            return []
+
         user_text = state.user_text
         # 普通聊天的回复还停在初稿里，先定稿再写回；标记落库前剥掉——
         # final_reply 存的是模型原始输出，不剥的话标记会进 chat_log 和短期记忆

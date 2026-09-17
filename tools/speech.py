@@ -25,6 +25,7 @@ from dashscope.audio.asr import Recognition, RecognitionCallback
 from dashscope.audio.tts_v2 import SpeechSynthesizer
 
 from config.settings import get_settings
+from tools.misc import has_key
 
 # dashscope 的 key 是模块级全局（dashscope.api_key），而这版 SDK 的
 # Recognition / SpeechSynthesizer 构造函数都不收 key，只能在调用前设全局。
@@ -103,10 +104,6 @@ def strip_emotion_marks(text: str) -> str:
     return clean
 
 
-def _has_key(key: str) -> bool:
-    """key 存在且不是占位符（占位符以 your- 开头，比如 your-xxx）。"""
-    return bool(key) and not key.startswith("your-")
-
 
 # 音色名没配的时候用这个兜底（百炼 qwen-tts 系的默认女声）
 _DEFAULT_VOICE = "Cherry"
@@ -137,7 +134,7 @@ class ASRTool:
         dashscope 对 wav 的支持最稳，采样率也从头里读，不用靠猜。
         """
         cfg = get_settings()
-        if not _has_key(cfg.asr_api_key):
+        if not has_key(cfg.asr_api_key):
             raise RuntimeError("语音识别服务没配置（ASR_API_KEY）")
         # 这版 SDK 的 key 不走构造参数，走全局设置（和 TTS 同一套路，调用前各设各的）
         # 格式判定：显式参数 > 魔数嗅探 > 文件名后缀
@@ -183,7 +180,7 @@ class TTSTool:
 
     def synthesize(self, text: str, instruction: str = "") -> bytes:
         cfg = get_settings()
-        if not _has_key(cfg.tts_api_key):
+        if not has_key(cfg.tts_api_key):
             raise RuntimeError("语音合成服务没配置（TTS_API_KEY）")
         # 文本里带的 [情绪] 和（语气描述）是给合成器的：拆出来转成指令，
         # 剥干净的正文才拿去念，标记绝不能被念出来

@@ -33,7 +33,8 @@ AI 伴侣类产品的"机器感"——秒回、全知、永不疲倦、上句不
 | 兜底界面 | Gradio | 自定义前端不存在时的最小可用聊天页 |
 | 结构化存储 | SQLite（WAL 模式） | 档案、画像、关系、聊天记录、KV 配置 |
 | 向量存储 | Chroma | 长期记忆、日记两个集合 |
-| 主 LLM | 通义千问系（DashScope OpenAI 兼容接口） | 对话、感知、蒸馏、画像 |
+| 主 LLM | claude-sonnet-5（nonelinear OpenAI 兼容端点 `/v1`） | 对话、感知、蒸馏、画像 |
+| **LLM/语音 key 边界** | `.env` 里 `LLM_API_KEY` 与 ASR/TTS/EMBEDDING/IMAGE_GEN 的 API key 是**独立变量**——换 LLM 供应商不影响语音 | 这是 2026-09 模型切到 nonelinear 时容易踩的坑，特此标出 |
 | 备用 LLM | GLM | 主模型连不上时自动顶上 |
 | 语音 | DashScope SDK（ASR / TTS / Omni Realtime） | 三条语音链路 |
 | 向量模型 | qwen3-vl-embedding（DashScope 原生接口） | 记忆与日记的语义召回 |

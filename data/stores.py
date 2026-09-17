@@ -6,7 +6,7 @@
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from config.settings import PROJECT_ROOT, get_settings
@@ -148,6 +148,31 @@ class SessionStore:
     def last_chat_per_session(self) -> list:
         """每个会话最后一次聊天的时间，闲置自动写日记的巡检全靠它点名。"""
         return get_db().last_chat_per_session()
+
+    def chat_log_hour_distribution(self, session_id: str, days: int = 14) -> dict:
+        """近 N 天 chat_log 的小时分布 {hour: count}；拿不到返回 {}。
+
+        加这个门面是有意为之：以前 proactive.py 自己在 capability 层
+        `from data.sqlite_store import get_db` + 摸 `_lock/_conn`，违反
+        `capability/__init__.py` 自己声明的分层纪律（只许向下到 tools），
+        见批次 K7 修复方案。SQL 走这里，capability 只调门面。
+
+        P1-1 修复（codex 2026-09-17 审查指出）：原版丢了 `_lock`——SQLite 单连接
+        + 多线程（FastAPI threadpool / proactive sweep / _sweep 并发）必须持锁，
+        否则 `_conn.execute` 撞 `Recursive use of cursors not allowed` 或读到脏数据。
+        """
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        with get_db()._lock:
+            rows = (
+                get_db()
+                ._conn.execute(  # noqa: SLF001 — 这是 data 层内部访问自己 store 的私有成员，capability 不允许
+                    "SELECT substr(created_at, 12, 2) AS h, COUNT(*) AS n FROM chat_log "
+                    "WHERE session_id=? AND created_at >= ? GROUP BY h",
+                    (session_id, cutoff),
+                )
+                .fetchall()
+            )
+        return {int(r[0]): r[1] for r in rows}
 
 
 class ImageAssetStore:

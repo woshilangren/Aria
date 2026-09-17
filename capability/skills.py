@@ -4,21 +4,12 @@
 key 没配的时候直接抛错让上层降级成纯文字，不装能用的样子。
 """
 
-import time
-
 from shared.singletons import get_llm, services
 from shared.types import MemoryBundle
 from tools.misc import ClockTool
 from tools.speech import strip_emotion_marks
 
 # 主动搭话的备用话术，模型不给力就按时间轮换着用
-_FALLBACK_TOPICS = (
-    "喂，今天过得怎么样？",
-    "别愣着，有话就说，我最讨厌干等着。",
-    "……一直不说话，我才不是担心你，只是随口问问。",
-)
-
-
 class CascadeVoiceEngine:
     """级联式语音：录音先转文字，回复再合成音频，两步分开走。"""
 
@@ -96,38 +87,3 @@ class SpeechDialogEngine:
         return get_llm().chat(messages)
 
 
-class ProactiveTopicGenerator:
-    """主动搭话：隔了一阵没动静，或者到点了，找句合适的话开口。"""
-
-    def generate(self, session_id: str, memory: MemoryBundle, trigger_type: str = "idle") -> str:
-        """想一句 30 字内的开场白，模型不行就用备用话术轮换。"""
-        clock = ClockTool()
-
-        # 把记得的用户情况整理几条出来，搭话才有针对性
-        known = []
-        for key, value in (memory.profile or {}).items():
-            if value:
-                known.append(f"{key}:{value}")
-        for item in (memory.distilled or [])[:3]:
-            if item.get("content"):
-                known.append(item["content"])
-
-        prompt = (
-            f"现在是一天中的{clock.period()}。触发原因：{trigger_type}。\n"
-            f"你记得的用户情况：{known if known else '还不了解对方'}\n"
-            "主动说一句话搭话，30 字以内，符合你的说话风格，别提任何机器相关的词。"
-        )
-        try:
-            text = get_llm().chat(
-                [{"role": "user", "content": prompt}],
-                temperature=0.9,
-                max_tokens=64,
-            )
-            text = (text or "").strip()
-            if text:
-                return text
-        except Exception:
-            pass
-
-        # 模型不行就按时间戳轮换备用话术，每次开口别重样
-        return _FALLBACK_TOPICS[int(time.time()) % len(_FALLBACK_TOPICS)]

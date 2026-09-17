@@ -78,17 +78,6 @@ class InfoGapCoordinator:
 class FallbackController:
     """异常降级决策中心：什么错、重试过几次，给个说法。"""
 
-    def decide(self, error_type: str, retry_count: int) -> str:
-        """返回 retry / degrade / abort 三种决策。"""
-        if error_type == "llm":
-            return "degrade" if retry_count >= 1 else "retry"
-        if error_type in ("voice_route", "search", "image"):
-            return "degrade" if retry_count >= 2 else "retry"
-        if error_type == "tool_call":
-            # 工具三级降级都失败了，别再折腾，直接认
-            return "abort"
-        return "degrade"
-
     # 各错误类型的内置兜底话；persona_config.json 的 fallback_replies 同键可覆盖。
     # 兜底话本身就跑在出错路径上，人设读不到必须无缝落回内置默认，不能再抛异常。
     # 沉浸式措辞：她是"人"，台词里绝不出现"工具"这类词（AI 腔 + 穿帮，双杀）
