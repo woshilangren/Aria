@@ -1,7 +1,14 @@
-"""所有存储类都合并在这一个文件里：人设、档案、画像、关系、聊天记录、图片、
-路由配置、日志，全是"读 JSON 文件 -> 变成对象 / 对象 -> 写回 JSON"这一套。
+"""所有存储类都合并在这一个文件里：人设、档案、画像、关系、她的身份、聊天记录、
+图片、路由配置、日志。没必要为每个 Store 单开一个文件，合在一起反而好找。
 
-没必要为每个 Store 单开一个文件，合在一起反而好找。
+底下是两类实现，别混：
+- **会话态数据**（Profile / Portrait / Relationship / Self / Session）只是
+  SQLiteStorage 的薄委托：整包 JSON 存在 SQLite 的一列里，SQL、锁、迁移全在
+  sqlite_store.py，这里原则上不写 SQL（唯一例外是 SessionStore.chat_log_hour_distribution，
+  它自己持锁摸 `_conn`，理由见它的 docstring）。
+- **单文件资源**（PersonaConfig / ImageAsset / RouteConfig / Log）才是原来那套
+  "读 JSON 文件 -> 变成对象 -> 写回 JSON"，正主分别是 data/persona_config.json
+  与 storage/ 下的索引/配置/日志。
 """
 
 import json
@@ -145,6 +152,18 @@ class SessionStore:
         """按时间段捞记录（含头不含尾），写日记就靠这个把某天的对话整段拎出来。"""
         return get_db().get_chats_between(session_id, start_iso, end_iso)
 
+    def proactive_after(self, session_id: str, after_iso: str, n: int = 5) -> list:
+        """某时刻之后她主动发的话（intent='proactive'），N3 轮询通道靠它增量拉取。
+
+        这个方法必须存在：批次 K7 把 capability 层"直摸 sqlite 私有成员"改成走门面时，
+        只搬了调用方（`proactive.py` / `api.py`），忘了在门面层补对应方法——
+        `KVStoreTool.proactive_after` 于是委托到一个不存在的属性，
+        `/api/chat/proactive/poll` 一调就 AttributeError。
+        因为 `proactive.enabled` 默认关、没人拉这个端点，故障一直没人看见。
+        （由 B7 门面冒烟测试抓出：hasattr 查不到这类"方法在、委托断了"的破损。）
+        """
+        return get_db().proactive_after(session_id, after_iso, n)
+
     def last_chat_per_session(self) -> list:
         """每个会话最后一次聊天的时间，闲置自动写日记的巡检全靠它点名。"""
         return get_db().last_chat_per_session()
@@ -167,7 +186,12 @@ class SessionStore:
                 get_db()
                 ._conn.execute(  # noqa: SLF001 — 这是 data 层内部访问自己 store 的私有成员，capability 不允许
                     "SELECT substr(created_at, 12, 2) AS h, COUNT(*) AS n FROM chat_log "
-                    "WHERE session_id=? AND created_at >= ? GROUP BY h",
+                    # length 这道条件不是多余的：created_at 短于 13 字符时 substr 得到
+                    # 空串，下面 int('') 抛 ValueError，而调用方 proactive._hour_histogram
+                    # 会把它吞成 None 走保守分支——主动关怀就此**静默不触发**。
+                    # 宁可这一桶不参与分布，也不许把整张分布表炸掉。
+                    "WHERE session_id=? AND created_at >= ? AND length(created_at) >= 13 "
+                    "GROUP BY h",
                     (session_id, cutoff),
                 )
                 .fetchall()

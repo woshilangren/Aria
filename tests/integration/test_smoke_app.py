@@ -57,9 +57,14 @@ def test_health_ok_with_token(client):
     body = resp.json()
     assert body["status"] == "ok"
     assert isinstance(body["services"], dict)
-    # 装配了 9 个服务：logger / kv_store / vector_store / tool_registry /
-    # tool_executor / diary_writer / llm / asr / tts
-    assert len(body["services"]) == 9
+    # bootstrap() 的装配清单。断言**名字集合**而不是数量：数量对不上只告诉你
+    # "10 != 9"，集合对不上会直接指出多了/少了哪一个。
+    assert set(body["services"]) == {
+        "logger", "kv_store", "vector_store", "tool_registry", "tool_executor",
+        "diary_writer", "llm", "asr", "tts", "persona_engine",
+    }
+    # 每个都装配成功（失败的服务在这里是 False，不是缺键）
+    assert body["services"] == {k: True for k in body["services"]}
 
 
 def test_health_unauthorized_without_token(client):

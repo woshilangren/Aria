@@ -41,15 +41,20 @@ class MoodEngine:
                comfort_mode: bool = False, intensity: float = 0.5) -> str:
         """根据上轮惯性 + 本轮情绪算新心情，返回心情标签（不落库，调用方负责写回）。
 
-        rel 会被就地写上 mood_left / mood_from 两个惯性字段。
+        rel 会被就地写上 mood_left / mood_from 两个惯性字段（部分分支也顺手写 mood，
+        但**一律以返回值为准**：唯一调用方 capability/memory.py 是
+        `rel["mood"] = self._mood_engine.update(...)`，返回值直接覆盖 rel["mood"]）。
         """
         # 安抚/危机轮强制心软（随机性给正经事让路），并把负面惯性化解一半——
-        # 哄是有效的，但一次哄不立刻翻篇
+        # 哄是有效的，但一次哄不立刻翻篇。
+        #
+        # 这里只写 mood_left，**不写 rel["mood"]**：落库由调用方负责，新心情从返回值走。
+        # 以前这里还多两行"负面惯性归零就把 rel['mood'] 改成心软"的条件写入——
+        # 调用方紧接着用返回值整包覆盖，那两行永远被盖掉，纯冗余（曾据此误判过
+        # "心情不落库"，已证伪）。删掉只为让意图清楚，返回值语义完全不变。
         if comfort_mode or emotion == "crisis":
             left = int(rel.get("mood_left") or 0)
             rel["mood_left"] = max(0, left // 2)
-            if rel.get("mood") in _NEGATIVE_MOODS and rel["mood_left"] <= 0:
-                rel["mood"] = "心软"
             return "心软"
 
         # 负面事件：直接置入对应心情，强度越高惯性越长（2~5 轮）
@@ -92,7 +97,10 @@ class QuirkDirector:
     """小动作骰子：每轮按概率掷一次，命中了挑一个小动作，输出注入指令。
 
     权重设计：翻缺点调侃 > 怼一句 > 岔开话题 > 提旧事 > 得意自夸 > 撒娇。
-    撒娇要亲密度过门槛才上桌；素材（缺点、旧事）没有的动作自动缺席。
+    撒娇的门槛是关系**阶段**（"亲近"/"挚友"才上桌），不是亲密度数值——
+    阶段本身就是亲密度的分档，再叠一道数值门槛就是两套口径互相骗人
+    （原来那个没人用的 `_CLINGY_INTIMACY = 20` 死常量已在 K5 删掉）。
+    素材（缺点、旧事）没有的动作自动缺席。
     """
 
     def roll(self, memory: MemoryBundle, stage: str = "初识",
@@ -115,8 +123,9 @@ class QuirkDirector:
             if item.get("content")
         ]
         # 生活面（N4）：她最近在琢磨的事——岔话题/翻旧账优先从这里取材，
-        # 有连续的、属于她自己的素材，"昨天说的那本书"才接得上
-        life_topic = char_life.consume_topic(session_id) if session_id else ""
+        # 有连续的、属于她自己的素材，"昨天说的那本书"才接得上。
+        # peek 不烧计数（I1）：烧不烧要等指令真拼出来才知道，见下面 commit。
+        life_topic = char_life.peek_topic(session_id) if session_id else ""
 
         # (动作名, 权重)，素材齐不齐决定了哪些动作能上桌
         actions = [("snark", 3), ("off_topic", 2), ("pride", 2)]
@@ -129,11 +138,23 @@ class QuirkDirector:
 
         total = sum(w for _n, w in actions)
         pick = random.uniform(0, total)
+        picked = actions[-1][0]
         for name, weight in actions:
             pick -= weight
             if pick <= 0:
-                return self._directive(name, flaws, distilled, mood, life_topic)
-        return ""
+                picked = name
+                break
+        # 走到 break 之外只有一种可能：random.uniform(0, total) 因为浮点舍入返回了
+        # **略大于** total 的值（CPython 的 uniform 是 a + (b-a)*random()，末端舍入
+        # 可能越界），一路减完还剩 1e-16 量级的正残余。picked 已经预置成最后一个
+        # 动作，所以骰子明明命中了却返回 "" 的白掷不会发生，动作越多也越不会撞上。
+        directive = self._directive(picked, flaws, distilled, mood, life_topic)
+        # 素材真被嵌进指令了才烧计数（I1）。六个动作里只有 off_topic / recall 用素材，
+        # 其余四种命中以前也各烧一次——约半数素材被白白消耗，而 used_count>=2 就退休，
+        # 等于把她的生活面提前掏空（"昨天说的那本书"再也提不起来）。
+        if life_topic and life_topic in directive:
+            char_life.commit_topic(session_id, life_topic)
+        return directive
 
     def _directive(self, name: str, flaws: list, distilled: list, mood: str,
                    life_topic: str = "") -> str:

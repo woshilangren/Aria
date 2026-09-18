@@ -8,6 +8,8 @@
 - RelationshipTracker：亲密度好感度这些数值的增减
 """
 
+import json
+import logging
 import re
 import threading
 import time
@@ -20,6 +22,67 @@ from data.schemas import MemoryItem
 from shared.singletons import services
 from shared.types import MemoryBundle
 from tools.misc import ClockTool, parse_llm_json
+
+# J2：复用 tools/misc.Logger 底下的同一个 "aria" logger——兜底哲学不变（降级照旧、
+# 聊天照常），但降级不许哑：凡吞异常处都留一条带异常信息的 warning。那边补上
+# FileHandler 后这些告警会自动落盘，这里不用（也不该）自己建 handler。
+logger = logging.getLogger("aria")
+
+
+def _enqueue_retry(kind: str, payload: dict) -> None:
+    """J12"静默遗忘需要补偿队列"的挂点：记忆写入类失败在这里落待重试标记。
+
+    队列表归 data 层（迁移机制在别的批次落地），所以只探测门面有没有
+    enqueue_retry(kind, payload_json)：有就入队等巡检消费；没有就退化成一条
+    带内容的告警日志——宁可吵，不可哑（本项目已发生三次"吞异常=功能静默死亡"）。
+    """
+    try:
+        from data.sqlite_store import get_db
+
+        enqueue = getattr(get_db(), "enqueue_retry", None)
+        if callable(enqueue):
+            enqueue(kind, json.dumps(payload, ensure_ascii=False)[:2000])
+            return
+    except Exception as exc:
+        logger.warning(f"[memory] 补偿队列写入失败（kind={kind}）: {exc}")
+        return
+    logger.warning(f"[memory] 补偿队列未落地，待重试留痕于此（kind={kind}）: "
+                   f"{json.dumps(payload, ensure_ascii=False)[:200]}")
+
+
+def remember_note(session_id: str, content: str, kind: str = "event",
+                  importance: int = 3, feeling: str = "", appraisal: str = "",
+                  valence: float = 0.0, arousal: float = 0.3) -> None:
+    """往长期记忆写一条。全项目**只有这里**负责构造 MemoryItem + 落向量库 + 失败补偿。
+
+    抽成模块级公开函数而不是留在 ConversationDistiller 里：G5 要在
+    capability/self_identity.py 里记"她改过口"，那条不该复制一份 MemoryItem 构造
+    和 J12 的补偿逻辑（复制一份 = 以后改一处忘一处）。
+    ⚠ 同层调用方注意环：memory → quirks → char_life → self_identity，所以
+    self_identity 里必须**函数内延迟 import** 本函数（memory.py 反向调
+    self_identity.display_name 用的也是同一招）。
+    """
+    item = MemoryItem(
+        memory_id=uuid.uuid4().hex,
+        session_id=session_id,
+        kind=kind,
+        content=content,
+        importance=importance,
+        timestamp=ClockTool().now(),
+        feeling=feeling,
+        appraisal=appraisal,
+        valence=valence,
+        arousal=arousal,
+        peak_moment=ClockTool().now() if feeling else "",
+    )
+    try:
+        services.get("vector_store").upsert_memory(item)
+    except Exception as exc:
+        # J12：向量库挂了聊天照常，但这正是"静默遗忘"——调用方那边状态可能
+        # 已经改了、长期记忆却没落，两边不一致且以前无任何痕迹。现在落一条
+        # 待重试标记进补偿队列（队列没落地时至少日志留痕），不许无声蒸发。
+        logger.warning(f"[memory] 长期记忆写入向量库失败（kind={kind}）: {exc}")
+        _enqueue_retry("vector_memory", dict(getattr(item, "__dict__", {}) or {}))
 
 
 class SessionMemoryKeeper:
@@ -38,15 +101,21 @@ class SessionMemoryKeeper:
         self._contexts = {}   # session_id -> [{"role","content"}, ...]
         self._summaries = {}  # session_id -> 被挤出去的旧对话浓缩成的摘要
         self._touched = {}    # session_id -> 最后被碰的单调时刻，LRU 淘汰用
+        # J12：被挤出上下文、等着摘要的旧消息。以前 _summarize 内联在 append 里，
+        # 溢出那一轮用户白等一次 LLM 往返；失败还把最老一半对话直接丢掉（静默遗忘）。
+        # 现在 append 只登记待办，慢调用由调用方在合适时机跑 run_pending_summary。
+        self._pending = {}    # session_id -> [{"role","content"}, ...]
+        self._pending_cap = max(200, int(self._max_turns) * 10)  # 持续失败时的内存保险丝
         self._lock = threading.Lock()
 
     def _evict_locked(self) -> None:
-        """会话数超上限时淘汰最久未碰的那个，三张字典一起清。要求已持锁。"""
+        """会话数超上限时淘汰最久未碰的那个，四张字典一起清。要求已持锁。"""
         while len(self._contexts) > self._max_sessions:
             victim = min(self._contexts, key=lambda k: self._touched.get(k, 0.0))
             self._contexts.pop(victim, None)
             self._summaries.pop(victim, None)
             self._touched.pop(victim, None)
+            self._pending.pop(victim, None)
 
     def append(self, session_id: str, role: str, text: str) -> None:
         if not text:
@@ -56,14 +125,14 @@ class SessionMemoryKeeper:
             context = self._contexts.setdefault(session_id, [])
             context.append({"role": role, "content": text})
             self._touched[session_id] = time.monotonic()
-            # 超长就把最老的一半摘出来；锁内只做截断，LLM 摘要放到锁外
+            # 超长就把最老的一半摘出来；锁内只做截断，摘要慢调用不在这条路上（J12）
             if len(context) > self._max_turns:
                 cut = len(context) // 2
                 old_part = context[:cut]
                 self._contexts[session_id] = context[cut:]
             self._evict_locked()
         if old_part:
-            self._summarize(session_id, old_part)
+            self._queue_pending(session_id, old_part)
 
     def append_turn(self, session_id: str, user_text: str, assistant_text: str) -> None:
         """成对追加一轮问答（F12）：一次加锁写进 user + assistant 两条。
@@ -88,10 +157,49 @@ class SessionMemoryKeeper:
                 self._contexts[session_id] = context[cut:]
             self._evict_locked()
         if old_part:
-            self._summarize(session_id, old_part)
+            self._queue_pending(session_id, old_part)
 
-    def _summarize(self, session_id: str, old_part: list) -> None:
-        """把被挤出去的旧对话压成摘要。慢调用在锁外做，做完再持锁写回。
+    def _queue_pending(self, session_id: str, old_part: list) -> None:
+        """把被挤出的旧对话登记成"需要摘要"的待办（J12），不在写回路径上烧 LLM。
+
+        待办积压超上限时丢最老的并大声告警：LLM 长期挂着时内存不能只增不减，
+        丢掉的份额靠补偿队列的待重试标记留痕，不做无声蒸发。
+        """
+        with self._lock:
+            queued = self._pending.setdefault(session_id, [])
+            queued.extend(old_part)
+            if len(queued) > self._pending_cap:
+                dropped = queued[:-self._pending_cap]
+                del queued[:-self._pending_cap]
+                logger.warning(f"[memory] 会话 {session_id} 的待摘要积压超上限，"
+                               f"丢弃最老 {len(dropped)} 条（摘要长期失败？）")
+
+    def has_pending_summary(self, session_id: str) -> bool:
+        """J12 接口：这个会话有没有等着摘要的旧对话（调用方决定何时消化）。"""
+        with self._lock:
+            return bool(self._pending.get(session_id))
+
+    def run_pending_summary(self, session_id: str) -> bool:
+        """J12 接口：消化"需要摘要"的待办。返回是否全部成功。
+
+        由调用方在合适的时机跑（如写回完成后的后台任务）——摘要的慢 LLM 调用
+        从此不再阻塞当轮回复。失败时待办**塞回队列**等下次重试（不丢 old_part），
+        同时落补偿队列标记；持续失败才会触到 _queue_pending 的上限保险丝。
+        """
+        with self._lock:
+            msgs = self._pending.pop(session_id, None)
+        if not msgs:
+            return True
+        if self._summarize(session_id, msgs):
+            return True
+        with self._lock:
+            # 塞回时排在期间新积压的前面，保持时间顺序
+            rest = self._pending.get(session_id, [])
+            self._pending[session_id] = (msgs + rest)[:self._pending_cap]
+        return False
+
+    def _summarize(self, session_id: str, old_part: list) -> bool:
+        """把被挤出去的旧对话压成摘要，成功 True / 失败 False。慢调用在锁外做。
 
         持锁做模型调用会把所有会话串行化，比不加锁还糟，所以这里先放开锁。
         摘要是"追加式"的：每次淘汰往旧摘要后面接一段，长会话里会无限膨胀——
@@ -121,8 +229,15 @@ class SessionMemoryKeeper:
                     temperature=0.3,
                     max_tokens=200,
                 )
-        except Exception:
-            return  # 摘要失败就丢掉最老的一半，聊天不能停
+        except Exception as exc:
+            # J12：摘要失败不再"丢掉最老一半、当没发生过"——待办由调用方塞回重试，
+            # 这里补一条持久化的待重试标记（静默遗忘需要补偿队列）
+            logger.warning(f"[memory] 会话 {session_id} 摘要失败（{len(old_part)} 条待重试）: {exc}")
+            _enqueue_retry("session_summarize", {
+                "session_id": session_id, "n_msgs": len(old_part),
+                "head": old_text[:200],
+            })
+            return False
         with self._lock:
             if needs_recompress:
                 # 重压缩是把"旧摘要+新段落"融成一段：直接替换，不能再追加
@@ -132,6 +247,7 @@ class SessionMemoryKeeper:
                 # 写回时以锁内最新值为准（期间别的线程可能已写入新摘要），避免丢更新
                 summary = self._summaries.get(session_id, "")
                 self._summaries[session_id] = f"{summary}\n{got}".strip() if summary else got
+        return True
 
     def get_context(self, session_id: str) -> list:
         """喂给模型的上下文：摘要放最前面（如果有），后面跟最近几轮原文。
@@ -158,7 +274,8 @@ class SessionMemoryKeeper:
                 return  # 内存里已经有了就不用折腾
         try:
             records = services.get("kv_store").read("session", session_id) or []
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 会话 {session_id} 短期记忆恢复失败（按空上下文继续）: {exc}")
             return
         restored = [
             {"role": r.get("role", "user"), "content": r.get("text", "")}
@@ -177,6 +294,7 @@ class SessionMemoryKeeper:
             self._contexts.pop(session_id, None)
             self._summaries.pop(session_id, None)
             self._touched.pop(session_id, None)
+            self._pending.pop(session_id, None)  # J12：待办跟着会话一起清，别摘要到上一段人生
 
 
 class MemoryRecaller:
@@ -189,19 +307,21 @@ class MemoryRecaller:
             bundle.profile = kv.read("profile", session_id) or {}
             bundle.portrait = kv.read("portrait", session_id) or {}
             bundle.relationship = kv.read("relationship", session_id) or {}
-        except Exception:
-            pass  # 存储挂了不该拦着聊天，空着继续
+        except Exception as exc:
+            logger.warning(f"[memory] 档案/画像/关系读取失败（空着继续，不拦聊天）: {exc}")
 
         try:
             top_k = load_app_config()["memory"]["recall_top_k"]
             bundle.distilled = services.get("vector_store").search_memory(query or session_id, top_k=top_k)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 长期记忆召回失败（按无记忆继续）: {exc}")
             bundle.distilled = []
 
         # 日记单独搜一遍：日记是角色的回忆，跟硬事实记忆不是一个味，都捞点才聊得起来
         try:
             bundle.diaries = services.get("vector_store").search_diary(query or session_id, top_k=3)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 日记召回失败（按无日记继续）: {exc}")
             bundle.diaries = []
         return bundle
 
@@ -231,13 +351,15 @@ class ProfileUpdater:
             # 走原子闭包（F3）：REST 端点与聊天写回线程并发改档案时不再互相覆盖
             kv.update("profile", session_id, _merge)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 档案字段 {field_name} 写入失败: {exc}")
             return False
 
     def get_field(self, session_id: str, field_name: str):
         try:
             return (services.get("kv_store").read("profile", session_id) or {}).get(field_name)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 档案字段 {field_name} 读取失败（按没有处理）: {exc}")
             return None
 
 
@@ -251,9 +373,16 @@ class MemoryGatekeeper:
       口误/玩笑"，仲裁失败保留候选下次重试（绝不把幻觉焊死在档案里）；
     - 配套：入池超过 14 天没晋升的候选过期放弃（巡检线程周期清理）。
     正则抽取的硬事实（确定性高）不在此列，仍走 apply_fact 直通。
+    列表型字段（likes/dislikes/notable_facts/health_notes）同样入闸（E3）：
+    逐项走候选池，晋升时包成 [项] 交给 apply_fact 做去重合并——单次 LLM
+    输出直通列表字段曾是幻觉焊死最宽的一扇门。
     """
 
     _PROMOTION_HITS = 2
+
+    # 列表合并语义的字段：与 ProfileUpdater.set_field 的 isinstance(value, list)
+    # 分支同一批。晋升时必须以 [content] 传值，否则字符串会整包替换掉已有列表。
+    _LIST_MERGE_FIELDS = frozenset({"likes", "dislikes", "notable_facts", "health_notes"})
 
     def process(self, session_id: str, field: str, content: str,
                 quote: str = "", confidence: float = 0.0) -> None:
@@ -271,41 +400,89 @@ class MemoryGatekeeper:
             return
         try:
             hits, cand_id = get_db().candidate_hit(session_id, field, content, quote)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 候选池写入失败，本轮放弃（field={field}）: {exc}")
             return  # 候选池挂了，本轮放弃（和记忆写入同一兜底哲学）
         if hits < self._PROMOTION_HITS:
             return  # 证据不足，继续攒
 
         # 达到晋升门槛：仲裁新旧值
-        distiller = ConversationDistiller()
         try:
             old = (services.get("kv_store").read("profile", session_id) or {}).get(field)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 仲裁前读旧值失败（按无旧值处理，field={field}）: {exc}")
             old = None
-        verdict = self._arbitrate(field, old, content, quote)
+        is_list_field = field in self._LIST_MERGE_FIELDS
+        if is_list_field and isinstance(old, list) and content in [str(x) for x in old]:
+            # 列表字段已有这一项：无变更可仲裁也无东西可合并，直接标晋升，
+            # 别让它每攒够 2 次就白烧一遍仲裁 LLM
+            self._mark_promoted(cand_id)
+            return
+        # 仲裁员看到的旧值统一成人话：列表摊平成顿号串，否则它拿 "['咖啡']" 比 "咖啡"
+        old_for_arb = "、".join(str(x) for x in old) if isinstance(old, list) else old
+        verdict = self._arbitrate(field, old_for_arb, content, quote, session_id=session_id)
         if verdict == "keep":
-            return  # 仲裁认定口误/玩笑：保留旧值，候选标晋升（不再反复仲裁）
+            # E2：注释曾经声称"候选标晋升"而代码什么都没做——被否决的值每次重现都
+            # 重跑一次仲裁 LLM，还可能哪天翻成 update 把口误焊进档案。现在真的标。
+            self._mark_promoted(cand_id)
+            return  # 仲裁认定口误/玩笑：保留旧值，候选已标晋升
         if verdict is None:
             return  # 仲裁失败（LLM 挂/输出坏）：不标晋升，下次出现重试
-        if distiller.apply_fact(session_id, field, content):
+        distiller = ConversationDistiller()  # E5：只有 update 路径才用得上，别在白跑的路径上构造
+        value = [content] if is_list_field else content
+        if distiller.apply_fact(session_id, field, value):
+            self._mark_promoted(cand_id)
+
+    @staticmethod
+    def _mark_promoted(cand_id: int) -> None:
+        """标晋升。失败只告警：候选会再攒一轮 hits 重仲裁一次，是浪费不是错误。"""
+        try:
+            from data.sqlite_store import get_db
+
+            get_db().mark_candidate_promoted(cand_id)
+        except Exception as exc:
+            logger.warning(f"[memory] 候选 {cand_id} 标晋升失败（可能重复仲裁一次）: {exc}")
+
+    @staticmethod
+    def _persona_line(session_id: str) -> str:
+        """仲裁员的人设行（E5）。CLAUDE.md 设计原则：任何 LLM 评判者必须看到人设，
+        否则会系统性惩罚人设规定的言行。取不到就空串（仲裁照跑，不拦）。"""
+        try:
+            from capability import self_identity
+
+            name = self_identity.display_name(session_id)
+            line = f"你是「{name}」，一个真实的人（沉浸式人设，绝不认自己是 AI）。"
             try:
-                from data.sqlite_store import get_db as _gdb
+                rel = services.get("kv_store").read("relationship", session_id) or {}
+                stage = str(rel.get("stage") or "") if isinstance(rel, dict) else ""
+            except Exception as exc:
+                logger.warning(f"[memory] 仲裁人设行读关系阶段失败（略过 stage）: {exc}")
+                stage = ""
+            if stage:
+                line += f"你和这位用户的关系阶段是「{stage}」。"
+            return line
+        except Exception as exc:
+            logger.warning(f"[memory] 仲裁人设行获取失败（用裸提示词继续）: {exc}")
+            return ""
 
-                _gdb().mark_candidate_promoted(cand_id)
-            except Exception:
-                pass
+    def _arbitrate(self, field: str, old, new: str, quote: str,
+                   session_id: str = "") -> "str | None":
+        """矛盾仲裁：返回 "update" / "keep" / None（失败）。无冲突直接 update。
 
-    def _arbitrate(self, field: str, old, new: str, quote: str) -> "str | None":
-        """矛盾仲裁：返回 "update" / "keep" / None（失败）。无冲突直接 update。"""
+        E5：判"真变更还是口误/玩笑"必须给他自己的原话（quote）——以前调用链把
+        quote 丢了，仲裁员对着"他的原话：（空）"硬判，等于掷骰子。
+        """
         if not old or str(old).strip() == new.strip():
             return "update"
         try:
             raw = services.get("llm").chat(
                 [
                     {"role": "system", "content": (
+                        f"{self._persona_line(session_id)}"
                         "你是档案仲裁员。档案里已有一个旧值，对话里出现了新信息。"
                         "判断新信息是【真变更】（他生活变了，应更新）还是【临时状态/口误/玩笑】"
-                        "（不应更新）。只输出 JSON：{\"action\":\"update\"或\"keep\","
+                        "（不应更新）。判的是**用户**的档案，只依据他的原话和上下文，"
+                        "你自己的设定不参与判断。只输出 JSON：{\"action\":\"update\"或\"keep\","
                         "\"reason\":\"一句话理由\"}。"
                     )},
                     {"role": "user", "content": f"字段：{field}\n旧值：{old}\n新值：{new}\n他的原话：{quote}"},
@@ -318,8 +495,19 @@ class MemoryGatekeeper:
             if action not in ("update", "keep"):
                 return None
             return action
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 仲裁失败（field={field}，保留候选下次重试）: {exc}")
             return None
+
+
+def _dialogue_fp(t) -> str:
+    """对话消息的"已计数"指纹（E6 去重用）：role + 内容前 80 字足以区分两条消息。
+
+    不是密码学场景，不需要哈希；存原文片段反而方便人工排查画像里数过什么。
+    """
+    if isinstance(t, dict):
+        return f"{t.get('role', '')}|{str(t.get('content', ''))[:80]}"
+    return str(t)[:80]
 
 
 class PortraitBuilder:
@@ -328,6 +516,9 @@ class PortraitBuilder:
     每 5 轮才跑一次（调用方控制），模型调用开销平摊在这几轮里；
     抽取结果带置信度，低于门槛的不入库——这是记忆防污染的第一道闸。
     失败就静默，别打扰聊天。
+    E6：调用方给的窗口可能重叠（每 5 轮取最近 N 条），每条消息带"已计数"
+    指纹存在画像记录里，只有**新消息**才喂模型——同一句话被数两次不算
+    "两次独立证据"，否则闸门的 "≥2 次晋升" 会被重叠窗口架空。
     """
 
     def refresh(self, session_id: str, recent_dialogues: list) -> None:
@@ -335,25 +526,39 @@ class PortraitBuilder:
             return
         try:
             kv = services.get("kv_store")
-            # 上下文元素是 {"role","content"} 字典，翻成人话再喂模型
+            # E6：先滤掉已计数过的消息（读画像是外部调用，坏了按"没数过"降级，
+            # 最坏退回旧行为=窗口重叠，不拦刷新本身）
+            try:
+                counted = set((kv.read("portrait", session_id) or {}).get("counted_fp") or [])
+            except Exception as exc:
+                logger.warning(f"[memory] 画像读已计数指纹失败（本次按全新窗口处理）: {exc}")
+                counted = set()
+            fresh = [t for t in recent_dialogues if _dialogue_fp(t) not in counted]
+            if not fresh:
+                return  # 窗口整个数过了：没有新证据，不烧 LLM 也不给幻觉重复计数
+            # 上下文元素是 {"role","content"} 字典，翻成人话再喂模型。
+            # C5：她的发言标"她"不标"AI"——每轮往判断模型脸上贴"她是 AI"，
+            # 再要求它写出"她绝不认自己是 AI"的产出，是心事漂向 meta 的机械根因
             chats = "\n".join(
                 (
-                    f"{'用户' if t.get('role') == 'user' else 'AI'}：{t.get('content', '')}"
+                    f"{'用户' if t.get('role') == 'user' else '她'}：{t.get('content', '')}"
                     if isinstance(t, dict)
                     else str(t)
                 )
-                for t in recent_dialogues[-10:]
+                for t in fresh[-10:]
             )
             raw = services.get("llm").chat(
                 [
                     {"role": "system", "content": (
                         "从聊天记录里总结用户画像，只输出 JSON：\n"
                         '{"portrait_tags": ["标签"], "core_needs": "一句话", "interests": ["兴趣"], '
-                        '"hard_facts": [{"field": "字段名", "value": "值", "confidence": 0到1的小数}], '
+                        '"hard_facts": [{"field": "字段名", "value": "值", "confidence": 0到1的小数, '
+                        '"quote": "用户说出这件事的原话片段"}], '
                         '"flaws": ["用户的缺点、翻车、出糗事"]}\n'
                         "标签不超过 5 个；hard_facts 的 field 只能取 "
                         "nickname/gender/age/city/occupation/birthday/likes/dislikes/notable_facts 之一，"
                         "只收用户明确说出口的事实，拿不准就给低 confidence；"
+                        "quote 必须是记录里真实出现过的原话（仲裁要用，编不出来就不给这条 fact）；"
                         "flaws 最多 3 条，看不出就给空列表。"
                     )},
                     {"role": "user", "content": chats},
@@ -366,10 +571,11 @@ class PortraitBuilder:
             limit = mem_cfg["portrait_tag_limit"]
             threshold = float(mem_cfg.get("profile_confidence_threshold", 0.6))
 
-            distiller = ConversationDistiller()
-            gate = MemoryGatekeeper()
-            # 硬事实入库（S4）：标量事实走"候选→晋升→仲裁"闸门，绝不直接入档；
-            # 列表字段（likes/dislikes）是合并语义（apply_fact 内部去重），保留直通
+            gate = MemoryGatekeeper()  # E5：无状态小对象，用到才建
+            distiller = None
+            # 硬事实入库（S4/E3）：标量和列表**都**走"候选→晋升→仲裁"闸门，绝不直接入档。
+            # 列表字段逐项入池（apply_fact 的合并语义在晋升后由闸门以 [项] 传值保留）——
+            # 以前列表单次 LLM 输出直通入档+入向量库，是幻觉焊死最宽的一扇门
             for fact in data.get("hard_facts") or []:
                 if not isinstance(fact, dict):
                     continue
@@ -381,15 +587,19 @@ class PortraitBuilder:
                 value = fact.get("value")
                 if not field or value in (None, ""):
                     continue
+                quote = str(fact.get("quote") or "")  # E5：原话一路带到仲裁员面前
                 if isinstance(value, list):
-                    if confidence >= threshold:
-                        distiller.apply_fact(session_id, field, value)
+                    for item in value:
+                        item = str(item or "").strip()
+                        if item:
+                            gate.process(session_id, field, item, quote=quote, confidence=confidence)
                 else:
-                    gate.process(session_id, field, str(value), confidence=confidence)
+                    gate.process(session_id, field, str(value), quote=quote, confidence=confidence)
 
             # 画像整包读改写走原子闭包（F3）：锁内只做纯合并计算，
             # 期间别的写方（语音写回/巡检）落的字段不会被这次覆盖掉
             new_flaws: list = []  # 闭包里算出的"这次真正新出现的缺点"，出锁后喂向量库
+            fresh_fps = [_dialogue_fp(t) for t in fresh]  # E6：本次计数的指纹，闭包纯计算用
 
             def _apply(old: dict) -> dict:
                 old = old or {}
@@ -399,6 +609,9 @@ class PortraitBuilder:
                     if flaw and flaw not in pre_flaws:
                         new_flaws.append(flaw)
                 kept_tags, tag_updated = self._decay_tags(old, data.get("portrait_tags"), limit)
+                # 指纹滚动保留最近 60 条（约 30 轮）：只需盖住相邻窗口的重叠量，
+                # 全量保留会让画像记录只增不减
+                kept_fp = list(dict.fromkeys(list(old.get("counted_fp") or []) + fresh_fps))[-60:]
                 return {
                     "portrait_tags": kept_tags,
                     "core_needs": data.get("core_needs") or old.get("core_needs", ""),
@@ -406,6 +619,7 @@ class PortraitBuilder:
                     "relationship_assessment": old.get("relationship_assessment", ""),
                     "user_flaws": self._merge_flaws(old.get("user_flaws"), data.get("flaws")),
                     "tag_updated": tag_updated,
+                    "counted_fp": kept_fp,
                     "updated_at": ClockTool().now(),
                 }
 
@@ -413,9 +627,11 @@ class PortraitBuilder:
 
             # 缺点/翻车记录：画像存一份（上面闭包里），向量库存一份（语义召回）
             for flaw in new_flaws[:3]:
+                if distiller is None:
+                    distiller = ConversationDistiller()  # E5：没有新缺点就一个都不用建
                 distiller.remember_flaw(session_id, flaw)
-        except Exception:
-            pass  # 画像更新失败无所谓，下轮再试
+        except Exception as exc:
+            logger.warning(f"[memory] 画像刷新失败（下轮再试，指纹未计数会自动重试）: {exc}")
 
     @staticmethod
     def _merge(old_list, new_list, limit: int) -> list:
@@ -464,10 +680,23 @@ class ConversationDistiller:
     """长期记忆沉淀：正则抓硬事实（比让模型抽又稳又省），重要的事写进向量库。"""
 
     # 硬事实抓取规则：字段名 -> 正则
+    # 正则通道是**直通入档**的（distill_turn -> apply_fact，无置信度无仲裁），
+    # 误报即永久档案——所以这里的取舍一律"宁漏勿误"：漏掉的还有 LLM 通道兜着，
+    # 焊错的没人救。E4 修过三个实测误报：
+    # - nickname："我叫了个车" 曾收进 "了个车"——叫 后排除动词补语（做/了/着/过/个），
+    #   捕获限 4 字（中文昵称几乎不超 4 字，贪到 10 字全是把谓语宾语当名字）；
+    # - age："我奶奶今年80岁" 曾收进用户年龄 80——我 与数字之间出现亲属称谓就不算
+    #   用户自己的年龄（亲属词表宁多勿少，同"宁漏勿误"）。
     _FACT_PATTERNS = [
-        ("nickname", re.compile(r"我(?:叫|的名字是|叫做)([\u4e00-\u9fa5A-Za-z0-9]{1,10})")),
+        ("nickname", re.compile(
+            r"我(?:叫(?!做|了|着|过|个)|的名字是|叫做)([\u4e00-\u9fa5A-Za-z0-9]{1,4})"
+        )),
         ("city", re.compile(r"我(?:住在|住|生活)在?([\u4e00-\u9fa5]{2,8}?)(?:市|区|省)")),
-        ("age", re.compile(r"我[\u4e00-\u9fa5，, ]{0,10}?(\d{1,2})岁")),
+        ("age", re.compile(
+            r"我(?![\u4e00-\u9fa5，, ]{0,10}(?:奶奶|爷爷|姥姥|姥爷|外婆|外公|儿子|女儿|孙子|孙女|"
+            r"老公|老婆|丈夫|妻子|爸|妈|叔|伯|舅|姨|姑|姐|哥|弟|妹|侄|甥))"
+            r"[\u4e00-\u9fa5，, ]{0,10}?(\d{1,2})岁"
+        )),
         ("birthday", re.compile(r"(?:我的)?生日(?:是)?(\d{1,2}月\d{1,2}[号日])")),
         ("occupation", re.compile(
             r"我(?:是|在做|从事)(?:一名)?(学生|老师|程序员|医生|护士|工程师|设计师|公务员|销售|司机|工人|厨师|会计|律师)"
@@ -478,14 +707,21 @@ class ConversationDistiller:
         "birthday": "生日是", "occupation": "职业是",
     }
 
-    # 匹配点跟前出现这些字就算否定（"我不叫X""我不住在Y"），别把反话当事实收
+    # 匹配点跟前或匹配段内部出现这些字就算否定（"我不叫X""我不住在Y"），别把反话当事实收
     _NEGATION_WORDS = ("不", "没", "别", "未")
 
     @classmethod
-    def _is_negated(cls, text: str, start: int) -> bool:
-        """匹配起点前两个字内出现否定词就当没说。"""
+    def _is_negated(cls, text: str, start: int, end: int = -1) -> bool:
+        """否定守卫：匹配起点前两个字内 **或匹配段内部** 出现否定词就当没说。
+
+        E4：以前只看起点前 2 字，而所有 pattern 都以"我+动词"锚定——"我不叫X"
+        的 叫 分支根本匹配不上，"我不住在上海"走的是裸 住 分支、否定词藏在
+        **span 内部**（我|不住在|上海）。起点前的窗口对这些 pattern 近乎死代码，
+        现在 span 内也查。end<0 表示调用方没给 span，退回只查起点前（兼容旧调用）。
+        """
         window = text[max(0, start - 2):start]
-        return any(n in window for n in cls._NEGATION_WORDS)
+        span = text[start:end] if 0 <= start <= end else ""
+        return any(n in window or n in span for n in cls._NEGATION_WORDS)
 
     def apply_fact(self, session_id: str, field: str, value) -> bool:
         """硬事实入库的唯一通道：值没变一条记忆都不加，变了连改口一起记。
@@ -496,7 +732,8 @@ class ConversationDistiller:
             return False
         try:
             old = (services.get("kv_store").read("profile", session_id) or {}).get(field)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] apply_fact 读旧值失败（按无旧值处理，field={field}）: {exc}")
             old = None
         if old == value:
             return False  # 老话重提，档案已对，别往向量库堆重复记忆
@@ -520,7 +757,8 @@ class ConversationDistiller:
             return
         for field, pattern in self._FACT_PATTERNS:
             m = pattern.search(user_text)
-            if not m or self._is_negated(user_text, m.start()):
+            # E4：span 一起交给否定守卫——否定词可能藏在匹配段内部（"我不住在上海"）
+            if not m or self._is_negated(user_text, m.start(), m.end()):
                 continue
             self.apply_fact(session_id, field, m.group(1))
 
@@ -551,6 +789,10 @@ class ConversationDistiller:
             )
             try:
                 data = parse_llm_json(raw)
+                # J2：这段路径上没有外部调用（纯解析），不许 except Exception 兜底——
+                # 解析器只会抛 ValueError 家族；输出不是对象是模型答非所问，显式判掉
+                if not isinstance(data, dict):
+                    raise ValueError(f"日总结输出不是 JSON 对象：{type(data).__name__}")
                 summary = str(data.get("summary") or "").strip()
                 feeling = str(data.get("feeling") or "").strip()[:60]
                 appraisal = str(data.get("appraisal") or "").strip()[:80]
@@ -559,14 +801,14 @@ class ConversationDistiller:
                     arousal = max(0.0, min(1.0, float(data.get("arousal") or 0.3)))
                 except (TypeError, ValueError):
                     valence, arousal = 0.0, 0.3
-            except Exception:
+            except ValueError:
                 summary, feeling, appraisal, valence, arousal = (raw or "").strip(), "", "", 0.0, 0.3
             if summary:
                 self._remember(session_id, summary, "daily_summary", 3,
                                feeling=feeling, appraisal=appraisal,
                                valence=valence, arousal=arousal)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"[memory] 日总结失败（今天不沉淀，聊天照常）: {exc}")
 
     def remember_flaw(self, session_id: str, flaw: str) -> None:
         """把用户的缺点/翻车记进长期记忆，语义召回时能捞出来当调侃素材。
@@ -580,23 +822,10 @@ class ConversationDistiller:
     def _remember(self, session_id: str, content: str, kind: str, importance: int,
                   feeling: str = "", appraisal: str = "",
                   valence: float = 0.0, arousal: float = 0.3) -> None:
-        item = MemoryItem(
-            memory_id=uuid.uuid4().hex,
-            session_id=session_id,
-            kind=kind,
-            content=content,
-            importance=importance,
-            timestamp=ClockTool().now(),
-            feeling=feeling,
-            appraisal=appraisal,
-            valence=valence,
-            arousal=arousal,
-            peak_moment=ClockTool().now() if feeling else "",
-        )
-        try:
-            services.get("vector_store").upsert_memory(item)
-        except Exception:
-            pass  # 向量库挂了就先不记，聊天照常
+        """沉淀一条长期记忆。真身在模块级 remember_note（G5 也要用，见那里的注释）。"""
+        remember_note(session_id, content, kind=kind, importance=importance,
+                      feeling=feeling, appraisal=appraisal,
+                      valence=valence, arousal=arousal)
 
 
 def _arc_from_entries(entries: list, limit: int = 3, now=None) -> str:
@@ -672,8 +901,19 @@ def recent_arc(session_id: str, limit: int = 3) -> str:
     try:
         entries = services.get("kv_store").recent_ledger(session_id, n=8)
         return _arc_from_entries(entries, limit=limit)
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"[memory] 关系氛围线聚合失败（本轮不注入）: {exc}")
         return ""  # 氛围线是增强项，任何异常都不注入
+
+
+# C6 反向标定词表：**只抓显式安抚/道歉**——她的话说出口之后，反过来校正状态
+# （注入了"别扭"、话却是哄人的，错的是状态不是话）。语气级的收敛（句子变短、
+# 用词变软）留给 H6 的 energy 观测，两者共用观测面，别在这里扩词表。
+_SOOTHE_WORDS = ("抱抱", "不生气", "别生气", "我错了", "是我不好", "对不起", "抱歉", "消消气")
+
+# 负面心情集：与 capability/quirks._NEGATIVE_MOODS 同一批标签（那边是模块私有，
+# 这里持一份副本；改动必须两边同步——persona_engine 也有一份同样的副本）。
+_NEG_MOODS = ("别扭", "低落", "慵懒", "心烦")
 
 
 class RelationshipTracker:
@@ -701,7 +941,8 @@ class RelationshipTracker:
 
     def update(self, session_id: str, emotion: str = "neutral",
                comfort_mode: bool = False, was_poor: bool = False,
-               intensity: float = 0.5, extras=None) -> dict:
+               intensity: float = 0.5, extras=None,
+               utterance_text: str = "") -> dict:
         """按情绪微调数值，一次原子闭包落好数值 + 心情 + 心事 + 收敛 + 阶段标记。
 
         was_poor（F8）：本轮是否被判敷衍/违规重写，收进闭包一起写。以前 pipeline
@@ -710,8 +951,14 @@ class RelationshipTracker:
         放进闭包后天然只生效一轮（下一轮写回会带着新值覆盖），且不再有第二次写。
         默认 False 保证旧调用方（如语音写回）不受影响。
 
-        intensity：本轮情绪强度（N2 惯性时长随它走）；extras（S2/N2）：感知的
-        附加产出（心事设置/加减 + 语气反馈），没有传 None。全部收进同一把锁。
+        intensity：本轮情绪强度（N2 惯性时长随它走）；extras（S2/N2/C7）：感知的
+        附加产出（心事实体信号 same_concern/resolved + 语气反馈），没有传 None。
+
+        utterance_text（C6 反向标定，取舍 #11）：她**本轮实际说出口的话**。
+        话是规范事实、状态是派生估计——话语明显是显式安抚而注入的心情还挂在
+        负面时，把 mood/mood_left 校回来（并走账本留痕），**绝不改那句话本身**。
+        默认空串：旧调用方（语音写回/巡检）行为完全不变，接线由调度层做。
+        全部收进同一把锁。
         """
         kv = services.get("kv_store")
         before = {"intimacy": None}  # 闭包里带出来，账本在锁外记（锁不可重入）
@@ -721,7 +968,8 @@ class RelationshipTracker:
                 # 第一次聊天，从人设配置里拿初始亲密度（读人设文件不经库锁，无死锁风险）
                 try:
                     default = kv.read("persona_config", "").default_intimacy
-                except Exception:
+                except Exception as exc:
+                    logger.warning(f"[memory] 读初始亲密度失败（按 0 起）: {exc}")
                     default = 0
                 rel = {
                     "intimacy": default, "affection": 0, "trust": 0,
@@ -754,20 +1002,53 @@ class RelationshipTracker:
             rel["mood"] = self._mood_engine.update(
                 rel, emotion, comfort_mode=comfort_mode, intensity=intensity
             )
-            # 心事（S2）：感知可设置/加减，安抚化解（减半），每轮自动衰减（时间冲淡）
+            # C6 反向标定：她的话说出口之后，反过来校正状态。话语命中显式安抚词、
+            # 心情却还挂在负面 → 状态错了，归"平常"、清惯性。硬边界（取舍 #11）：
+            # 只动 mood/mood_left/mood_from 这些数值，当轮推出去的话一个字不碰——
+            # 做成"发现不一致就重写回复"= 流式下事后撒谎。翻盘走账本，可审计。
+            if utterance_text and rel.get("mood") in _NEG_MOODS:
+                hit = next((w for w in _SOOTHE_WORDS if w in utterance_text), "")
+                if hit:
+                    before["mood_recal"] = (rel.get("mood"), hit)  # 账本锁外记，与亲密度账本同一纪律
+                    rel["mood"] = "平常"
+                    rel["mood_left"] = 0
+                    rel["mood_from"] = ""
+            # 心事（S2/C7）：concern 是实体 {id,text,created_at,intensity}。
+            # 旧病：强度有惯性而文本每轮整句覆盖——同一个强度值每轮挂到不同念头上，
+            # 状态被劈成两个不同步的对象（"每轮重掷骰子"）。现在由感知在**同一次
+            # 调用**里判 same_concern/resolved：延续=实体不变强度惯性；翻篇=关旧开新。
             concern = dict(rel.get("concern") or {})
-            if extras is not None and getattr(extras, "concern_text", ""):
-                concern["text"] = extras.concern_text
-                old_i = float(concern.get("intensity") or 0)
-                concern["intensity"] = round(
-                    max(0.0, min(1.0, old_i + float(extras.concern_delta or 0))), 3
-                )
+            if extras is not None and getattr(extras, "resolved", False):
+                concern = {"text": "", "intensity": 0.0}  # 他化解了这个念头：直接归零翻篇
+            elif extras is not None and getattr(extras, "concern_text", ""):
+                text = extras.concern_text
+                try:
+                    delta_c = float(extras.concern_delta or 0)
+                except (TypeError, ValueError):
+                    delta_c = 0.0
+                if extras.same_concern and concern.get("text"):
+                    # 同一个念头的延续：实体不变（id/created_at 保留），文本允许换
+                    # 措辞，强度走惯性
+                    concern["text"] = text
+                    old_i = float(concern.get("intensity") or 0)
+                    concern["intensity"] = round(max(0.0, min(1.0, old_i + delta_c)), 3)
+                else:
+                    # 新念头（same=false 关旧开新；或 same=true 但旧念头已衰减殆尽）。
+                    # 起点 0.5+delta 而不是 0+delta：0+delta 起点在 delta<0.35 时
+                    # 永远压在 persona_engine 的表达门槛之下——文本入了库、强度在
+                    # 衰减、她却从不把它说出口（隐藏 bug）
+                    concern = {
+                        "id": uuid.uuid4().hex,
+                        "text": text,
+                        "created_at": ClockTool().now(),
+                        "intensity": round(max(0.0, min(1.0, 0.5 + delta_c)), 3),
+                    }
             if comfort_mode:
                 # 哄/道歉：心事强度减半（化解），不立刻翻篇
                 concern["intensity"] = round(float(concern.get("intensity") or 0) * 0.5, 3)
             ci = float(concern.get("intensity") or 0) * 0.9
             if ci <= 0.05:
-                concern = {"text": "", "intensity": 0.0}  # 归零即翻篇
+                concern = {"text": "", "intensity": 0.0}  # 归零即翻篇（实体 id 一起清）
             else:
                 concern["intensity"] = round(ci, 3)
                 concern.setdefault("text", "")
@@ -787,7 +1068,8 @@ class RelationshipTracker:
 
         try:
             rel = kv.update("relationship", session_id, _bump)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 关系数值原子更新失败（本轮数值不落账）: {exc}")
             return {}
         # 账本在锁外记：append_ledger 自己会拿 SQLite 锁。锁已是可重入的 RLock，
         # 闭包内再取不会自锁，但"可重入"只保证不死锁、不保证语义——嵌套写库会
@@ -804,8 +1086,22 @@ class RelationshipTracker:
                     "tired": "平平常常聊了一会儿",
                 }.get(emotion or "neutral", "又聊了一轮")
                 kv.log_relationship_change(session_id, old_v, rel.get("intimacy", 0), reason)
-        except Exception:
-            pass  # 账本是审计面，写失败不影响数值本身
+        except Exception as exc:
+            logger.warning(f"[memory] 关系账本写入失败（数值本身已生效）: {exc}")
+        # C6 反向标定的翻盘也走账本（delta=0 的纯审计行）：状态被"她实际说的话"
+        # 校正过必须可追溯，不然哪天心情对不上注入值，查无对证
+        recal = before.get("mood_recal")
+        if recal and rel:
+            old_mood, hit = recal
+            try:
+                kv.log_relationship_change(
+                    session_id, rel.get("intimacy", 0), rel.get("intimacy", 0),
+                    f"反向标定：她实际说了「{hit}」这类安抚话，注入的心情「{old_mood}」"
+                    f"与话语不符，已归「平常」（C6：只校数值，不动说出口的话）",
+                    (utterance_text or "")[:80],
+                )
+            except Exception as exc:
+                logger.warning(f"[memory] 反向标定账本写入失败（校正本身已生效）: {exc}")
         return rel
 
     @staticmethod
@@ -817,7 +1113,8 @@ class RelationshipTracker:
         try:
             rel = services.get("kv_store").read("relationship", session_id) or {}
             return rel.get("stage", "初识")
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[memory] 读关系阶段失败（按「初识」处理）: {exc}")
             return "初识"
 
     @staticmethod

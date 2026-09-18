@@ -20,7 +20,7 @@ Aria 是一个跑在自己电脑上的 AI 伴侣程序：能聊天、能打电�
 
 **工具调用**
 - 内置天气、联网搜索、图片生成、写日记四个工具
-- 三级降级：模型原生 tool call → 模型文本规划 → 规则表，模型不支持 function calling 也能跑
+- 两级降级：模型原生 tool call → 规则表兜底，模型不支持 function calling 也能跑
 
 **对话体验**
 - 逐句流式：模型生成到哪一句就发哪一句，不用等整条说完。文字聊天走 SSE，一句一个气泡
@@ -115,7 +115,7 @@ storage/                 运行时数据（.gitignore 已排除，备份这一�
 
 分层规则：`interaction → orchestration → capability → tools → data`，只许向下调用。服务的装配不在 import 期做，而是放在应用 startup 的 lifespan 里——所以 `import main` 没有副作用。
 
-一轮对话的完整链路、兜底逻辑、语音三条通道的取舍，见 [ARCHITECTURE.md](ARCHITECTURE.md)。这一轮改了什么、为什么改，见 [修改日志.md](修改日志.md)。
+一轮对话的完整链路、兜底逻辑、语音三条通道的取舍，见 [ARCHITECTURE.md](ARCHITECTURE.md)。这一轮改了什么、为什么改，见 [开发日志.md](开发日志.md)。
 
 ## 数据与隐私
 
@@ -126,7 +126,7 @@ storage/                 运行时数据（.gitignore 已排除，备份这一�
 
 ## 已知未验证的地方
 
-不假装都测过（详见 [修改日志.md](修改日志.md) 第十节）：
+不假装都测过（详见 [开发日志.md](开发日志.md) 第十节"真实测试（验收记录）"）：
 
 - SSE 流式**没有经过内网穿透实测**。如果你用 cpolar 之类把服务穿到手机上，要自己确认句子是不是真的逐句到达——部分穿透服务会缓冲 SSE，症状是攒到最后一起冒出来，本机测不出来
 - `requirements.lock` 是本机 `pip freeze` 出来的参考，没在全新机器上验证过安装

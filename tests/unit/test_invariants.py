@@ -154,3 +154,72 @@ def test_kv_update_rejects_non_whitelisted_tables(tmp_path, monkeypatch, registe
     for table in ("session", "image", "route_config", "persona_config"):
         with pytest.raises(ValueError):
             kv.update(table, "x", lambda d: d)  # noqa: ARG005
+
+
+# =================== 9. I10：双端口只能装配一次 ===================
+
+def test_double_lifespan_assembles_once(monkeypatch) -> None:
+    """两个 server 跑同一个 app 对象时，装配只许发生一次。
+
+    `python main.py` 会在 daemon 线程里再起一个 uvicorn.Server 跑 8443，
+    和主线程的 8000 共用同一个 `app`——于是 lifespan 被执行两遍。
+    没有 _ASSEMBLY_STATE 守卫时的三个后果：
+      ① bootstrap() 两遍：服务重复构造、services registry 被二次覆盖；
+      ② IdleDiaryWatcher 两个实例：防重入的 _done 是**实例级**集合，跨实例不去重
+         → 同一天同一会话可能写两篇日记、主动消息双发；
+      ③ _ensure_access_token 两个线程并发 → 可能各生成一个口令互相覆盖 .env。
+    """
+    import asyncio
+
+    from fastapi import FastAPI
+
+    import main as main_mod
+
+    calls = {"token": 0, "bootstrap": 0, "new": 0, "start": 0, "stop": 0}
+
+    def _count(key):
+        def _inc(*_a, **_k):
+            calls[key] += 1
+        return _inc
+
+    monkeypatch.setattr(main_mod, "_ensure_access_token", _count("token"))
+    monkeypatch.setattr(main_mod, "bootstrap", _count("bootstrap"))
+    # 用裸 FastAPI 顶掉 build_app：隔离 gradio 的 lifespan，本测试只验装配守卫
+    monkeypatch.setattr(main_mod, "build_app", lambda: FastAPI())
+
+    class FakeWatcher:
+        def __init__(self) -> None:
+            calls["new"] += 1
+
+        def start(self) -> None:
+            calls["start"] += 1
+
+        def stop(self) -> None:
+            calls["stop"] += 1
+
+    # lifespan 内部是 `from capability.proactive import IdleDiaryWatcher`（调用时才查），
+    # 所以 patch 模块属性就生效
+    monkeypatch.setattr(proactive_mod, "IdleDiaryWatcher", FakeWatcher)
+    # 守卫是模块级状态，必须归零再测，否则上一个用例的残留会让 first 判定失真
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "servers", 0)
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "watcher", None)
+
+    app = main_mod.create_app()
+    factory = app.router.lifespan_context
+
+    async def _two_servers() -> None:
+        # 外层 = 先起来的 server，内层 = 第二个 server；两者重叠期正是双端口的真实形态
+        async with factory(app):
+            assert calls["bootstrap"] == 1
+            assert calls["new"] == 1 and calls["start"] == 1
+            async with factory(app):
+                assert calls["bootstrap"] == 1, "第二个 server 不该再装配一遍"
+                assert calls["token"] == 1, "口令兜底也只该跑一次"
+                assert calls["new"] == 1, "只能有一个 IdleDiaryWatcher 实例"
+            # 内层退出后外层还在对外服务，巡检不能被停掉
+            assert calls["stop"] == 0, "先退出的 server 不该停掉还在服务的那个的巡检"
+        assert calls["stop"] == 1, "最后一个 server 退出时才收尾"
+        assert main_mod._ASSEMBLY_STATE["servers"] == 0
+        assert main_mod._ASSEMBLY_STATE["watcher"] is None
+
+    asyncio.run(_two_servers())

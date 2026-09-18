@@ -513,8 +513,11 @@ fetch("/api/system/who").then(r => r.json()).then(d => {
   const nm = $("charName");
   if (nm && d.name) nm.textContent = d.name;
   const g = $("greetText");
+  // F1：d.name 是**服务端来的、由 LLM 从对话里抽取的**字符串，必须 esc。
+  // 上一行 nm.textContent 天然安全，但这里拼进 innerHTML——名字里带 <img onerror=...>
+  // 就能同源执行脚本，直接读走 localStorage 里的总口令。
   if (g) g.innerHTML = d.named
-    ? `我是${d.name}。想聊点什么？`
+    ? `我是${esc(d.name)}。想聊点什么？`
     : `第一次见面，聊聊吧——<em>我先想想我叫什么。</em>`;
   // 通话页与记忆面板里写死的名字一并换成她的
   if ($("callName")) $("callName").textContent = `正在呼叫${d.name}…`;
@@ -631,7 +634,7 @@ function scrollDown() { const c = $("chat"); c.scrollTop = c.scrollHeight; }
 function appendMsg(kind, inner, timeStr) {
   const host = $("msgs");
   const div = document.createElement("div"); div.className = "msg " + kind;
-  div.innerHTML = `<div class="body"><div class="who">${kind === "me" ? esc(userName) : (window.CHAR_NAME || "Aria")} · ${timeStr || nowT()}</div>${inner}</div>`;
+  div.innerHTML = `<div class="body"><div class="who">${kind === "me" ? esc(userName) : esc(window.CHAR_NAME || "Aria")} · ${timeStr || nowT()}</div>${inner}</div>`;
   host.appendChild(div); scrollDown(); return div;
 }
 function userText(t) { return appendMsg("me", `<div class="bubble">${esc(t)}</div>`); }
@@ -1023,6 +1026,11 @@ const TARGET_RATE = 16000;
 let ws = null, wsOpen = false, recording = false;
 let audioCtx = null, micStream = null, micProcessor = null;
 let pcmChunks = [], pcmBytes = 0, recTimer = null, sec = 0;
+// F6：客户端侧的音频缓冲上限。16kHz 单声道 16bit = 32000 字节/秒，4MB ≈ 2 分钟。
+// 一句话不可能超过这个长度；而服务端上限是 10MB，客户端必须**更早**触顶，
+// 否则长按一小时约 115MB，手机标签页先被系统杀掉，那段音频也根本发不出去。
+const PCM_BYTES_CAP = 4 * 1024 * 1024;
+let pcmCapHit = false;
 
 function setWsState(text) { const el = $("wsState"); if (el) el.textContent = "通道：" + text; }
 
@@ -1031,7 +1039,7 @@ function openVoiceWS() {
   const _tok = localStorage.getItem("ariaToken") || "";
   ws = new WebSocket("/api/voice/stream" + (_tok ? "?token=" + encodeURIComponent(_tok) : ""));
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { wsOpen = true; setWsState("已连接"); };
+  ws.onopen = () => { wsOpen = true; setWsState("已连接"); wsRetryDelay = 3000; wsNextRetry = 0; };
   ws.onmessage = onVoiceMsg;
   ws.onclose = ev => {
     wsOpen = false; setLive("off");
@@ -1047,8 +1055,17 @@ function openVoiceWS() {
 // 语音通道断了自动拉起；平时 8 秒一声心跳（服务端当作无效控制帧忽略），
 // 让 NAT/代理/省电没有理由掐空闲连接——之前"页面加载就挂一条闲置 WS"的姿势，
 // 等到通话用它时连接已经陈旧，6~17 秒内就被掐死（只在通话时建连才可靠）
+// F6：固定 3 秒无限重试会在服务器关机后一直打——手机白耗电、日志白刷屏。
+// 改指数退避封顶 30 秒；连上就在 onopen 里复位，所以真断线时恢复速度不受影响。
+let wsRetryDelay = 3000, wsNextRetry = 0;
 setInterval(() => {
-  if (ws && !wsOpen && ws.readyState === WebSocket.CLOSED) openVoiceWS();
+  if (ws && !wsOpen && ws.readyState === WebSocket.CLOSED) {
+    const now = Date.now();
+    if (now < wsNextRetry) return;
+    wsNextRetry = now + wsRetryDelay;
+    wsRetryDelay = Math.min(wsRetryDelay * 2, 30000);
+    openVoiceWS();
+  }
 }, 3000);
 setInterval(() => {
   if (wsOpen && ws && ws.readyState === WebSocket.OPEN && !recording) {
@@ -1158,6 +1175,16 @@ async function ensureMic() {
   } catch (e) { alert("麦克风不可用：" + e.message); return false; }
   // 采样率固定 16k：浏览器自动重采样，Realtime/ASR 直接吃
   audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_RATE });
+  // F6：`{sampleRate}` 是**请求**不是保证——老 Safari / 部分 WebView 会无视它，
+  // 按硬件采样率（通常 48k）建 context。而我们跟后端约定的是 16k 裸 PCM，
+  // 于是 ASR 收到的是"花栗鼠音频"：识别率崩掉，但**前后端都不报错**，
+  // 表现只是"她听不清我说什么"，极难查。所以建完必须核对实际采样率，
+  // 不一致就在采集回调里自己做线性插值重采样到 TARGET_RATE。
+  const srcRate = audioCtx.sampleRate || TARGET_RATE;
+  const needResample = srcRate !== TARGET_RATE;
+  if (needResample) {
+    console.warn(`[audio] AudioContext 实际 ${srcRate}Hz，请求的 ${TARGET_RATE}Hz 被忽略，改为软件重采样`);
+  }
   // 关键：WebView/Via 这类内核创建出来的 AudioContext 默认是 suspended，
   // 不 resume 采集回调永远不会跑，麦克风看着开了实际一个字节都不出
   if (audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
@@ -1166,9 +1193,34 @@ async function ensureMic() {
   micProcessor.onaudioprocess = e => {
     if (!recording) return; // 平时空转只丢数据，保住蓝牙通话通道不被反复开关
     const inp = e.inputBuffer.getChannelData(0);
-    const pcm = new Int16Array(inp.length);
-    for (let i = 0; i < inp.length; i++) {
-      const s = Math.max(-1, Math.min(1, inp[i]));
+    // F6：客户端侧也要有上限。服务端限 10MB，但客户端不限的话长按一小时约 115MB，
+    // 手机浏览器标签页先被系统杀掉，而且这段音频根本发不出去。
+    if (pcmBytes >= PCM_BYTES_CAP) {
+      if (!pcmCapHit) {
+        pcmCapHit = true;
+        try { $("callTip").textContent = "这段太长了，我先记到这儿——松开结束吧"; } catch (err) {}
+      }
+      return;
+    }
+    let samples = inp;
+    if (needResample) {
+      // 线性插值降采样到 TARGET_RATE。对 ASR 足够（语音识别本身对插值误差不敏感），
+      // 而且只在"浏览器无视了 sampleRate 请求"这条本来就已经坏掉的路径上才走。
+      const ratio = TARGET_RATE / srcRate;
+      const outLen = Math.max(1, Math.round(inp.length * ratio));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const pos = i / ratio;
+        const i0 = Math.floor(pos);
+        const i1 = Math.min(i0 + 1, inp.length - 1);
+        const frac = pos - i0;
+        out[i] = inp[i0] * (1 - frac) + inp[i1] * frac;
+      }
+      samples = out;
+    }
+    const pcm = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
       pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     pcmChunks.push(pcm);
@@ -1195,7 +1247,7 @@ async function recStart(e) {
     if (!wsOpen) { $("connMini").textContent = "语音通道连不上，稍后再试"; return; }
   }
   if (!(await ensureMic())) return;
-  recording = true; pcmChunks = []; pcmBytes = 0;
+  recording = true; pcmChunks = []; pcmBytes = 0; pcmCapHit = false;
   $("mic").classList.add("mic-live"); $("recbar").classList.add("on");
   sec = 0; $("rect").textContent = "0:00";
   recTimer = setInterval(() => {
@@ -1514,11 +1566,15 @@ async function loadRelation() {
     ];
     let html = `<div style="margin-bottom:12px"><span style="font-size:18px;font-weight:700">${esc(data.stage || "初识")}</span></div>`;
     metrics.forEach(m => {
-      html += `<div class="metric"><span class="mn">${m.label}</span><div class="bar"><div class="fill" style="width:${data[m.key] || 0}%;background:${m.color}"></div></div><span class="mv">${data[m.key] || 0}</span></div>`;
+      // 数值夹到 0..100 再拼进 style：属性上下文里插未校验的服务端值同样能 breakout
+      const v = Math.max(0, Math.min(100, Number(data[m.key]) || 0));
+      html += `<div class="metric"><span class="mn">${m.label}</span><div class="bar"><div class="fill" style="width:${v}%;background:${m.color}"></div></div><span class="mv">${v}</span></div>`;
     });
     html += `<div style="margin-top:10px;font-size:11px;color:var(--text-faint)">`;
-    html += `互动次数：${data.interaction_count || 0} · 当前情绪：${data.mood || "平静"}`;
-    if (data.last_interaction) html += ` · 最后互动：${data.last_interaction.slice(0, 10)}`;
+    // F6：同一段里 stage 转义了、这三个没转义——不一致本身就是隐患。mood 现在来自
+    // MoodEngine 的固定池，但它是**服务端来的字符串**，不该靠"上游目前只会给固定值"来保证安全。
+    html += `互动次数：${esc(String(data.interaction_count || 0))} · 当前情绪：${esc(data.mood || "平静")}`;
+    if (data.last_interaction) html += ` · 最后互动：${esc(String(data.last_interaction).slice(0, 10))}`;
     html += `</div>`;
     $("relationFields").innerHTML = html;
   } catch (e) {

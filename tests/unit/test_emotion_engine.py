@@ -73,13 +73,44 @@ def test_concern_set_decay_and_clear(kv):
     ex = PerceptionExtras(concern_text="他是不是烦我了", concern_delta=0.3)
     rel = t.update("s1", "neutral", extras=ex)
     assert rel["concern"]["text"] == "他是不是烦我了"
-    assert 0.25 <= rel["concern"]["intensity"] <= 0.3   # 0.3 加成后再衰减 0.9
+    # C7：新念头起点是 0.5+delta 再衰减 0.9 → (0.5+0.3)*0.9 = 0.72。
+    # 以前是 0+delta（0.3*0.9=0.27），那个起点在 delta<0.35 时永远压在
+    # persona_engine 的表达门槛之下——文本入了库、强度在衰减，她却从不把它说出口。
+    assert rel["concern"]["intensity"] == pytest.approx(0.72)
+    assert rel["concern"]["id"]                       # 实体有 id，不是一团自由文本
 
-    # 连续多轮无事件：自动衰减到归零翻篇（0.3 * 0.9^n < 0.05 需约 17 轮，给足 25）
-    for _ in range(25):
+    # 连续多轮无事件：自动衰减到归零翻篇。0.72 * 0.9^n <= 0.05 需 n>=26，给到 30
+    for _ in range(30):
         rel = t.update("s1", "neutral")
     assert rel["concern"]["text"] == ""
     assert rel["concern"]["intensity"] == 0.0
+    assert not rel["concern"].get("id")               # 归零即翻篇，实体 id 一起清
+
+
+def test_concern_continuation_keeps_entity_and_uses_inertia(kv):
+    """C7：同一个念头的延续——实体不变（id/created_at 保留），强度走惯性不重新起算。"""
+    t = RelationshipTracker()
+    first = t.update("s4", "neutral", extras=PerceptionExtras(
+        concern_text="他是不是烦我了", concern_delta=0.3))
+    rel = t.update("s4", "neutral", extras=PerceptionExtras(
+        concern_text="他是不是嫌我烦", concern_delta=0.3, same_concern=True))
+    assert rel["concern"]["id"] == first["concern"]["id"]
+    assert rel["concern"]["created_at"] == first["concern"]["created_at"]
+    assert rel["concern"]["text"] == "他是不是嫌我烦"     # 措辞可以换
+    # 惯性：0.72 + 0.3 = 1.02 钳到 1.0，再衰减 0.9 → 0.9（不是从 0.5 重新起算）
+    assert rel["concern"]["intensity"] == pytest.approx(0.9)
+
+
+def test_concern_new_entity_replaces_old(kv):
+    """C7：same_concern=False 是关旧开新——换实体、换 id、强度从 0.5+delta 起算。"""
+    t = RelationshipTracker()
+    first = t.update("s5", "neutral", extras=PerceptionExtras(
+        concern_text="他是不是烦我了", concern_delta=0.3))
+    rel = t.update("s5", "neutral", extras=PerceptionExtras(
+        concern_text="实习转正会不会没戏", concern_delta=0.1, same_concern=False))
+    assert rel["concern"]["id"] != first["concern"]["id"]
+    assert rel["concern"]["text"] == "实习转正会不会没戏"   # 文本不再漂到旧念头上
+    assert rel["concern"]["intensity"] == pytest.approx(0.54)   # (0.5+0.1)*0.9
 
 
 def test_confort_halves_concern(kv):

@@ -1,7 +1,10 @@
-"""能力层 - 语音通道和主动搭话
+"""能力层 - 语音通道
 
 语音两条路：级联式（先转文字再合成）和端到端对话式。
 key 没配的时候直接抛错让上层降级成纯文字，不装能用的样子。
+（主动搭话的备用话术类 ProactiveTopicGenerator 已在批次 K5 删除——零闸门、
+一旦被接线即绕过主动开口的全部四道闸，删掉比接线安全；主动开口走
+capability/proactive.py。）
 """
 
 from shared.singletons import get_llm, services
@@ -9,7 +12,7 @@ from shared.types import MemoryBundle
 from tools.misc import ClockTool
 from tools.speech import strip_emotion_marks
 
-# 主动搭话的备用话术，模型不给力就按时间轮换着用
+
 class CascadeVoiceEngine:
     """级联式语音：录音先转文字，回复再合成音频，两步分开走。"""
 

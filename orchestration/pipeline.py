@@ -31,6 +31,8 @@ import asyncio
 import base64
 import itertools
 import re
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
@@ -126,6 +128,29 @@ def _strip_reaction_tag(text: str) -> str:
     if t.startswith(tag):
         return t[len(tag):].lstrip()
     return text
+
+
+def _log_exc(where: str) -> None:
+    """把当前异常连 traceback 记下来（J2）。
+
+    为什么必须有：本文件的泛型 `except Exception` 以前是**完全静默**的。
+    A2 的 5 处裸 `session_id` NameError 就是被它吞掉的——任何编程错误都会被
+    转成一次兜底重发，看起来像"模型挂了"，查不出真因。
+    这也是 A1（日记子系统静默死亡）能隐身一整个提交周期的同一个病。
+
+    优先走 services 里的 Logger（J1 之后带 RotatingFileHandler，能落盘事后查）；
+    拿不到就退回 stderr。**这个函数自己绝不能抛异常**——它只在错误路径上被调用，
+    再抛一次就把原始异常盖掉了。
+    """
+    tb = traceback.format_exc()
+    try:
+        lg = services.get("logger")
+        if lg is not None and hasattr(lg, "error"):
+            lg.error(f"[pipeline] {where}:\n{tb}")
+            return
+    except Exception:
+        pass
+    print(f"[pipeline] {where} 异常：\n{tb}", file=sys.stderr)
 
 
 class _ReviewReject(Exception):
@@ -627,7 +652,10 @@ class DialoguePipeline:
         want_voice=True 时，若整轮一个 `<voice>` 都没出，补发一个 `voice` 事件兜底
         （用户明确点名要语音的场景）。
         """
-        KEEPER.restore(message.session_id)
+        # I12：restore 内部是 SQLite 读（冷启动首轮要把整段会话记录捞回来），
+        # 同文件其他慢调用都进了 to_thread，唯独这里以前漏了——直接在事件循环上同步跑，
+        # 期间 SSE 推送、poll、语音通道全都卡住。
+        await asyncio.to_thread(KEEPER.restore, message.session_id)
         state = TurnState(
             user_text=message.text,
             session_id=message.session_id,
@@ -851,7 +879,12 @@ class DialoguePipeline:
             state.was_poor = True
             raise _RefuseTurn(fallback_line("review", state.session_id, default=FallbackController().fallback_reply("review")))
         except Exception:
-            # 主/备模型都挂了，或中途断流
+            # 主/备模型都挂了，或中途断流。
+            # J2：**这条路径以前完全静默**——A2 的 5 处裸 `session_id` NameError 就是被它
+            # 吞掉的：任何编程错误都会被转成一次兜底重发，看起来像"模型挂了"，
+            # 而兜底文本还会被写回记忆，污染"她说过什么"。降级行为本身是对的
+            # （兜底哲学：聊天不能断），但**不能哑**——至少要留下 traceback。
+            _log_exc("_astream_chat 降级")
             if streamer.emitted_content:
                 # 已经推过内容：接不上，按现有内容收尾
                 async for ev in self._emit_frags(streamer.finish(), state, handle, synthesize_voice, seq):
@@ -895,9 +928,14 @@ class DialoguePipeline:
 
     # ---------- 工具链：完整文本 -> 同一套句子装配器 ----------
     async def _astream_tool(self, state, handle, synthesize_voice, seq):
-        # 注意：工具链不做审核重写，与 chat 链的差异是有意的。
-        # 工具链的文本来自工具结果（天气/搜索结果等）拼装，不是模型自由发挥，
-        # 命中审核只走"整轮降级"（由 _emit_frag 抛 _RefuseTurn），不重跑工具。
+        # 注意：工具链不做审核**重写**，与 chat 链的差异是有意的（CLAUDE.md 取舍 #2）。
+        # 但它**照样过审**——`_emit_frag` 对每一句都跑 SafetyReviewer。
+        # 差别只在裁决：chat 链没推过内容时还能重写，工具链一律"整轮降级"，
+        # 因为工具文本是结果拼装、重写等于让它再犯一次同样的错，而且工具贵、有副作用。
+        #
+        # C4 修的坑：`_emit_frag` 抛的是 `_ReviewReject`（它只负责"报告没过"，不自己拍板），
+        # 而这里以前不接它 → 一路冒到 astream 的泛型 except → 变成 `error` 事件，
+        # 且**被审核拦下的原话会随 `str(exc)` 推给前端**。审核拦的东西不该给用户看见。
         await asyncio.to_thread(self._toolcall, state, handle)
         self._check_cancel(handle)
         if not state.final_reply:
@@ -905,12 +943,20 @@ class DialoguePipeline:
             self._check_cancel(handle)
         text = state.final_reply or state.draft_reply
         streamer = _ReplyStreamer(state.voice_mode)
-        for frag in streamer.feed(text) + streamer.finish():
-            if frag[0] == "held":
-                # 工具链路不做整轮重写（与 chat 路径一致的流式取舍）：直接当一句交给审核
-                frag = ("sentence", frag[1])
-            async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
-                yield ev
+        try:
+            for frag in streamer.feed(text) + streamer.finish():
+                if frag[0] == "held":
+                    # 工具链路不做整轮重写（与 chat 路径一致的流式取舍）：直接当一句交给审核
+                    frag = ("sentence", frag[1])
+                async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
+                    yield ev
+        except _ReviewReject:
+            # 整轮降级：不重写、不重跑工具，换成一句人设化的兜底话。
+            # 已经推出去的句子撤不回（前端按 refuse 的 replace 语义整轮替换）。
+            raise _RefuseTurn(fallback_line(
+                "review", state.session_id,
+                default=FallbackController().fallback_reply("review"),
+            ))
         state.final_reply = text
 
     # ---------- 片段 -> 事件 ----------
@@ -983,7 +1029,10 @@ class DialoguePipeline:
         pipeline = PerceptionPipeline()
         recent = KEEPER.get_context(state.session_id)[-4:]
         with ThreadPoolExecutor(max_workers=2) as pool:
-            ft = pool.submit(pipeline.run, state.user_text, recent)
+            # session_id 必须传：感知侧要靠它取人设与关系阶段（C5）。不传就退化成
+            # "无人设上下文"，系统性惩罚人设规定的言行（踩坑 #10 实测：判傲娇短回复
+            # 为敷衍，越聊越冷）。
+            ft = pool.submit(pipeline.run, state.user_text, recent, state.session_id)
             fr = pool.submit(MemoryRecaller().recall, state.user_text, state.session_id)
             intent, emotion, subtext, extras = ft.result()
             state.memory = fr.result()
@@ -1073,12 +1122,18 @@ class DialoguePipeline:
     def _respond(self, state: TurnState) -> None:
         """把工具结果转述成人话。模型初答只是参考，要重说一遍。"""
         extra = _VOICE_EMOTION_RULE if state.voice_mode else ""
+        # memory / engine 必须传：pipeline 手上正握着这两样（state.memory 是感知步
+        # 召回的、_ENGINE 是建在全项目唯一 KEEPER 上的那一份）。不传的话
+        # response_generator 会自己去读三次 KV，再临时 new 一份只读 keeper——
+        # 那份的短期上下文取自 session 表，比内存里的 KEEPER 最多旧一轮（C1）。
         reply = persona_wrap(
             state.tool_results or [],
             _enrich_telegraph(state.user_text),
             initial_text=state.draft_reply,
             extra=extra,
             session_id=state.session_id,
+            memory=state.memory,
+            engine=_ENGINE,
         )
         state.final_reply = reply.text
         state.output_mode = reply.output_mode
@@ -1212,6 +1267,9 @@ class DialoguePipeline:
             was_poor=state.was_poor,
             intensity=emotion.intensity if emotion else 0.5,
             extras=state.extras,
+            # C6 反向标定：传她这轮**真说出口**的正文，安抚话能把误判的负面心情
+            # 校回来。用 clean_reply 不用 final_reply——后者还带着语音轮的情绪标签。
+            utterance_text=clean_reply,
         )
 
         # 用户开口 = 她的主动消息被回应了（N3 收手环）：清等待标记、重置连击。
@@ -1252,12 +1310,27 @@ class DialoguePipeline:
         ]
         freeze_text = re.sub(r"</?voice>", "", clean_reply or "")
 
+        # user_text 是 G1-G4 披露预算闸门的输入（他这轮问过什么 → 她可以冻什么）。
+        # 不传就是闸门按"问过"放行——compose 侧已经不催她倒档案了，冻结侧不接
+        # 就只剩半边生效。
         def _bg_freeze(handle=handle, sid=session_id, text=freeze_text, lines=her_lines,
-                       count=rel.get("interaction_count", 0)):
+                       count=rel.get("interaction_count", 0), asked=user_text):
             if handle is not None and handle.is_cancelled():
                 return  # 迟到的取消：什么都不写
             self_identity.maybe_freeze(sid, text, recent_her_lines=lines,
-                                       interaction_count=count)
+                                       interaction_count=count, user_text=asked)
 
         deferred.append(_bg_freeze)
+
+        # J12：短期记忆的摘要不再内联在 append_turn 里（那是一次秒级 LLM 调用，
+        # 阻塞在写回路径上）。append_turn 只登记待办，这里打包成后台闭包，
+        # 由持有 running loop 的一方调度——工作线程内没有事件循环（I11）。
+        # 没待办就不排任务，普通轮次零开销。
+        if KEEPER.has_pending_summary(session_id):
+            def _bg_summary(handle=handle, sid=session_id):
+                if handle is not None and handle.is_cancelled():
+                    return  # 迟到的取消：什么都不写
+                KEEPER.run_pending_summary(sid)
+
+            deferred.append(_bg_summary)
         return deferred

@@ -42,11 +42,17 @@ class PerceptionExtras:
     concern_*：会压在她心里、影响之后几轮的念头（文本 + 本轮强度增减）；
     feedback：他在抱怨她的态度/语气时为 "tone_down"，进关系收敛层（calm），
     绝不改性格内核——"收敛不是改变"是批次的宪法。
+    same_concern / resolved（C7）：心事是**实体**不是自由文本，这两个是它的换挡
+    信号——延续同一件（强度走惯性）还是关旧开新，以及这轮有没有把它化解掉。
     """
 
     concern_text: str = ""
     concern_delta: float = 0.0
     feedback: str = ""
+    # 缺字段时 same_concern 默认 true：延续是保守读法，强度惯性接续总比凭空
+    # 开一个新实体稳（否则同一件事每轮都被当成新心事，强度永远从头涨）。
+    same_concern: bool = True
+    resolved: bool = False
 
 
 @dataclass

@@ -11,6 +11,8 @@ __pycache__/
 .venv/
 venv/
 .ruff_cache/
+# pytest 的临时工作区（沙箱拒绝默认 basetemp 路径时用它，见开发日志"环境坑"备忘）
+.pytest_work_tmp/
 
 # IDE 本地配置
 .vscode/

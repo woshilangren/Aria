@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -193,6 +194,26 @@ _gateway = None
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
+# 允许内嵌给模型看的图片后缀。**不含 .svg**——与上传端点（upload_file）的策略保持一致：
+# SVG 能内嵌 <script>，同源执行会读走 localStorage 里的口令。虽然在 <img> 上下文里
+# SVG 脚本不执行，但两处策略不一致本身就是隐患（万一有人手工往 uploads 放了 svg，
+# 或将来改用 <object>/iframe 渲染就会中招）。
+_ATTACHMENT_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+def _sanitize_attachment(image_url: str) -> str:
+    """把前端传来的附件地址校验一遍，合法就转成 base64 data URL，否则返回空串。
+
+    单一来源：`/send` 与 `/stream` 以前各写一份后缀白名单（两份都还带着 .svg，
+    与上传端点的策略矛盾）。同一条规则有两个主人就一定会漂移，收到这里。
+    """
+    if not image_url or not image_url.startswith("/uploads/"):
+        return ""
+    if not image_url.lower().split("?")[0].endswith(_ATTACHMENT_EXTS):
+        return ""
+    return _upload_to_data_url(image_url)
+
+
 def _upload_to_data_url(upload_path: str) -> str:
     """把 /uploads/ 下的图片读成 base64 data URL，模型不依赖网络就能看。
 
@@ -238,12 +259,8 @@ async def send_message(payload: dict) -> dict:
         # 空消息不进图：白跑一整条管线还让模型对着空气说话
         return {"text": "一句话都不说吗？想聊什么直接说吧。", "output_mode": "text", "image_path": ""}
     gateway = _get_gateway()
-    image_url = payload.get("attachment") or payload.get("image_url") or ""
     # 只认 /uploads/ 开头的相对图片地址；模型在云端拉不到本地，直接读文件转 base64 内嵌
-    if image_url and (image_url.startswith("/uploads/") and image_url.lower().split("?")[0].endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"))):
-        image_url = _upload_to_data_url(image_url)
-    else:
-        image_url = ""
+    image_url = _sanitize_attachment(payload.get("attachment") or payload.get("image_url") or "")
     message = gateway["receiver"].receive(text, payload.get("session_id", "default"), image_url=image_url)
     reply = await _get_orchestrator().handle(message)
     # render 内部有秒级同步网络调用，扔线程池，别堵住事件循环（否则并发语音通话一起僵死）
@@ -289,14 +306,8 @@ async def stream_message(payload: dict, request: Request):
             return
 
         gateway = _get_gateway()
-        image_url = payload.get("attachment") or payload.get("image_url") or ""
-        # 与 /send 同一套图片处理：只认 /uploads/ 相对路径，转 base64 内嵌
-        if image_url and image_url.startswith("/uploads/") and image_url.lower().split("?")[0].endswith(
-            (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
-        ):
-            image_url = _upload_to_data_url(image_url)
-        else:
-            image_url = ""
+        # 与 /send 同一套图片处理：走同一个助手，别再各写一份后缀白名单（会漂移）
+        image_url = _sanitize_attachment(payload.get("attachment") or payload.get("image_url") or "")
         message = gateway["receiver"].receive(text, session_id, image_url=image_url)
 
         turn_id = None
@@ -362,6 +373,9 @@ def chat_history(session_id: str = "default", n: int = 100) -> dict:
     from interaction.gateway import extract_voice
     from shared.singletons import services
 
+    # n 必须夹上限：这个参数直接透传进 SQL 的 LIMIT，不夹的话任何持有口令的客户端
+    # 都能用 ?n=99999999 把整张 chat_log 拉进内存（单用户场景不致命，但没有理由不设）
+    n = max(1, min(int(n or 100), 500))
     recs = services.get("kv_store").recent_chat(session_id, n)
     items = []
     for r in recs:
@@ -390,9 +404,20 @@ def proactive_poll(session_id: str = "default", after: str = "") -> dict:
     主动消息本体已落 chat_log（intent='proactive'），刷新后历史照常还原，
     这个接口只负责"她先开口"的即时触达。
     """
+    from config.settings import load_app_config
     from shared.singletons import services
 
-    items = services.get("kv_store").proactive_after(session_id, after or "2000-01-01", n=5)
+    # I5：`proactive.enabled` 以前只挡住"生成"，挡不住"投递"——关掉之后这个端点
+    # 照样把库里已有的主动消息返回给前端。安全阀要真的关得住，两头都得关。
+    if not load_app_config().get("proactive", {}).get("enabled", False):
+        return {"items": []}
+    # after 为空时不回放历史：原缺省值 "2000-01-01" 会让前端一丢游标
+    # 就把最近 5 条老消息当成"她刚主动开口"重新弹出来。
+    # 历史还原本来就走 /history（intent='proactive' 的行也在里面），不需要这里补。
+    if not after:
+        return {"items": []}
+
+    items = services.get("kv_store").proactive_after(session_id, after, n=5)
     return {"items": [{"text": it["text"], "time": it["time"]} for it in items]}
 
 
@@ -545,12 +570,20 @@ async def voice_stream(websocket: WebSocket) -> None:
                         emotion = ""
                         try:
                             pipeline = PerceptionPipeline()
-                            _intent, emo, _st = await asyncio.to_thread(
-                                pipeline.run, user_text, KEEPER.get_context(session_id)[-4:]
+                            # run() 返回 4 元组 (intent, emotion, subtext, extras)——
+                            # 这里以前按 3 个解包，每轮必抛 ValueError 被下面的 except
+                            # 吞掉，e2e 语音写回的 emotion 因此**一直是空串**。
+                            # session_id 要传：感知侧靠它取人设与关系阶段（C5）。
+                            _intent, emo, _subtext, _extras = await asyncio.to_thread(
+                                pipeline.run, user_text,
+                                KEEPER.get_context(session_id)[-4:], session_id
                             )
                             emotion = emo.emotion
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # 感知是补网，挂了不该拦着这轮语音；但**不许静默**——
+                            # 上面那个解包 bug 就是被 pass 藏了不知多久（J2）。
+                            logging.getLogger("aria").warning(
+                                "[voice] e2e 感知失败，本轮 emotion 落空: %r", exc)
                         await asyncio.to_thread(
                             _realtime_writeback, session_id, user_text, reply_text, emotion
                         )
@@ -727,7 +760,23 @@ async def get_avatar() -> dict:
 @system_router.put("/avatar")
 async def set_avatar(payload: _AvatarUpdate) -> dict:
     """设置角色的头像 URL。URL 会存进 DATA_DIR/avatar.json，下次启动也记得。"""
-    data = {"avatar_url": (payload.avatar_url or "").strip()}
+    from urllib.parse import urlparse
+
+    url = (payload.avatar_url or "").strip()
+    # F5f：这个值会被前端直接当 <img src> 渲染，所以入库前要校验。
+    # 只收两种形态：http(s) 绝对 URL，或以 "/" 开头的站内相对路径（如 /static/xxx.png）。
+    # 挡住的是 data: / javascript: / file: 这类 scheme、以及超长串——
+    # 单用户场景下这不是"防黑客"，是防止手滑粘错东西之后每次刷新都静默坏掉、
+    # 而 avatar.json 里躺着一个查不出来的值。
+    if url:
+        if url.startswith("/"):
+            ok = not url.startswith("//") and len(url) <= 500  # "//" 是协议相对 URL，等于外链
+        else:
+            parsed = urlparse(url)
+            ok = parsed.scheme in ("http", "https") and bool(parsed.netloc) and len(url) <= 2000
+        if not ok:
+            return {"ok": False, "error": "头像 URL 只接受 http(s) 绝对地址或以 / 开头的站内路径"}
+    data = {"avatar_url": url}
     path = _avatar_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -801,17 +850,43 @@ async def set_runtime_config(payload: _RuntimeConfig) -> dict:
         llm["temperature"] = max(0.0, min(2.0, payload.temperature))
     if payload.max_tokens is not None:
         llm["max_tokens"] = max(64, int(payload.max_tokens))
-    # 落盘到项目根 config.json
+
+    # 落盘到项目根 config.json。
+    # **只写用户改过的这三个键，不要把 cfg 整个 dump 回去**：cfg 是 defaults 与
+    # config.json 合并后的全量，直接写回会有两个后果——① config.json 里任何不在
+    # defaults 里的顶层段被静默抹掉；② 从此分不清哪些是用户覆盖、哪些是默认值。
+    # config.json 的语义应当始终是"只放覆盖项"。
     import json as _json
     from config.settings import PROJECT_ROOT
 
     path = PROJECT_ROOT / "config.json"
+    on_disk: dict = {}
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = _json.load(f)
+            if isinstance(loaded, dict):
+                on_disk = loaded
+    except (OSError, ValueError):
+        on_disk = {}  # 读不回来就当空文件重建；下面的写入失败会如实报出去
+
+    disk_llm = dict(on_disk.get("llm") or {})
+    if payload.thinking is not None:
+        disk_llm["enable_thinking"] = llm["enable_thinking"]
+    if payload.temperature is not None:
+        disk_llm["temperature"] = llm["temperature"]
+    if payload.max_tokens is not None:
+        disk_llm["max_tokens"] = llm["max_tokens"]
+    on_disk["llm"] = disk_llm
+
     try:
         with open(path, "w", encoding="utf-8") as f:
-            _json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
-    return {"ok": True, **llm}
+            _json.dump(on_disk, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        # 以前这里是 `except OSError: pass`：内存已改、磁盘没改，重启后配置悄悄回滚，
+        # 而调用方拿到的是 {"ok": True}。**改配置失败必须让调用方知道。**
+        return {"ok": False, "persisted": False, "error": f"写入 config.json 失败：{exc}", **llm}
+    return {"ok": True, "persisted": True, **llm}
 
 
 # ---------- 记忆管理 API ----------
@@ -880,11 +955,56 @@ def _delete_memory(memory_id: str):
 
 
 # ---------- 应用工厂 ----------
+_LOOPBACK_HOSTNAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+def _ws_origin_ok(scope) -> bool:
+    """WebSocket 握手的同源校验（F2）。
+
+    为什么需要：**WebSocket 不受同源策略约束**——浏览器里任何网页都能
+    `new WebSocket("ws://127.0.0.1:8000/api/voice/stream")`。而 `.env.example`
+    推荐的"本机/内网自用可留空口令"模式下 `_TokenGuard` 是全站放行的，
+    于是她浏览的任意恶意页面都能：烧掉真金白银的 ASR/LLM/TTS 额度、
+    并以她的身份往记忆和日记里写东西（`_realtime_writeback`）。
+    这道门必须放在 token 判定**之前**，因为恰恰是 token 为空时最需要它。
+
+    放行规则：
+    - **不带 Origin 一律放行**——非浏览器客户端（作者自己的脚本、原生 app）不发这个头，
+      而浏览器发起的 WebSocket 握手必带，所以这不会给网页攻击留口子。
+    - 带 Origin 则要求其主机名与 Host 头一致。**只比主机名不比端口**：双端口部署下
+      页面可能从 8443 加载而 WS 连 8000（反之亦然）。
+    - localhost / 127.0.0.1 / ::1 互相视为同一台机器（浏览器对本地地址的写法不统一）。
+    """
+    from urllib.parse import urlparse
+
+    headers = {}
+    for k, v in scope.get("headers") or []:
+        try:
+            headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+        except Exception:
+            continue
+    origin = headers.get("origin", "").strip()
+    if not origin:
+        return True
+
+    origin_host = (urlparse(origin).hostname or "").strip().lower()
+    host_header = headers.get("host", "") or headers.get(":authority", "")
+    request_host = host_header.rsplit(":", 1)[0].strip("[]").lower() if host_header else ""
+    if not origin_host or not request_host:
+        # Origin 解析不出来、或拿不到 Host：无法确认同源，按拒绝处理（保守）
+        return False
+    if origin_host == request_host:
+        return True
+    return origin_host in _LOOPBACK_HOSTNAMES and request_host in _LOOPBACK_HOSTNAMES
+
+
 class _TokenGuard:
     """访问口令门卫：.env 配了 ACCESS_TOKEN 就全站鉴权（HTTP 查头/查参，WS 查握手参数）。
 
     公网部署时记忆、档案、API key 全暴露在请求路径上，没这道门等于裸奔。
-    口令留空（默认）则完全放行——本机/内网使用不想输口令就不配。
+    口令留空则 HTTP 侧完全放行——本机/内网使用不想输口令就不配。
+    **但 WebSocket 是例外**：它不受同源策略约束，无口令模式下任何网页都能连上来，
+    所以 WS 握手永远要过 `_ws_origin_ok` 的同源校验，与有没有口令无关。
     """
 
     def __init__(self, app):
@@ -901,6 +1021,12 @@ class _TokenGuard:
         path = scope.get("path", "")
         if path.startswith(self._PUBLIC_PATHS) or path in ("/", "/index.html"):
             await self.app(scope, receive, send)
+            return
+
+        # F2：WebSocket 先过同源校验，**在 token 判定之前**——恰恰是"本机自用没配口令"
+        # 这个模式下全站放行，此时这道门是挡住恶意网页的唯一防线。理由见 _ws_origin_ok。
+        if scope["type"] == "websocket" and not _ws_origin_ok(scope):
+            await send({"type": "websocket.close", "code": 1008})
             return
 
         from config.settings import get_settings

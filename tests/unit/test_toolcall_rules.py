@@ -79,9 +79,10 @@ def test_build_rule_args_weather_fallback_city():
     assert _build_rule_args("weather", "天气怎么样", "广州") == {"city": "广州"}
 
 
-def test_build_rule_args_weather_default_city():
-    # 抠不到又没 fallback -> 兜底"上海"
-    assert _build_rule_args("weather", "今天天气", "") == {"city": "上海"}
+def test_build_rule_args_weather_no_city_gives_up():
+    # I4：抠不到又没 fallback -> 空参数，让 L3 安检拦下来，由上层追问城市。
+    # 以前这里硬编"上海"——自信地答错城市比承认不知道更伤"像人"。
+    assert _build_rule_args("weather", "今天天气", "") == {}
 
 
 def test_build_rule_args_search():
@@ -115,13 +116,17 @@ def test_guard_ok(guard):
 def test_guard_unknown_tool(guard):
     ok, reason = guard.check(ToolCallSpec(tool_name="nope", arguments={}))
     assert ok is False
-    assert "没有这个工具" in reason
+    # C3：reason 会回填给模型，模型顺口就把它说给用户（真机 turn 7 的「工具这边
+    # 什么都没查到」）。所以这里必须是中性内部码，一个中文字都不带。
+    assert reason == "E_UNKNOWN_FN:nope"
+    assert "工具" not in reason and "参数" not in reason
 
 
 def test_guard_missing_required_param(guard):
     ok, reason = guard.check(ToolCallSpec(tool_name="weather_query", arguments={}))
     assert ok is False
     assert "city" in reason
+    assert "工具" not in reason and "参数" not in reason
 
 
 def test_guard_no_required_params_ok(guard):

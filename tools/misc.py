@@ -5,10 +5,18 @@
 
 import json
 import logging
+import logging.handlers
 import re
 
-from config.settings import load_app_config
+from config.settings import get_settings, load_app_config
 from tools.storage import KVStoreTool
+
+# 文件日志的轮转参数（J1）：5MB × (1 + 3 份备份) ≈ 最多占 20MB 磁盘。
+# 为什么必须有上限：这是 24/7 常驻进程，无轮转的日志跑几个月就能把盘写满，
+# 而"盘满"会以 SQLite 写失败的形式表现在完全不相干的地方，排查成本极高。
+_LOG_FILE_NAME = "aria.log"
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+_LOG_BACKUP_COUNT = 3
 
 
 def _escape_stray_quotes(text: str) -> str:
@@ -151,7 +159,14 @@ class ClockTool:
 
 
 class Logger:
-    """日志：控制台一份、文件一份，工具调用还会单独记到 tool_calls.jsonl。"""
+    """日志：控制台一份、文件一份（`DATA_DIR/logs/aria.log`，5MB × 3 份轮转），
+    工具调用还会单独记到 tool_calls.jsonl。
+
+    文件这一份以前只写在 docstring 里、代码里从来没有——这正是 A1 事故
+    （往 VectorStoreTool 类中间插了个模块级函数，7 个方法被吞成死代码，
+    日记子系统整体死亡）能隐身一整个迭代周期的使能条件：控制台一滚屏就没了，
+    134 个测试又全绿，事后没人能回去翻"当时到底报了什么"。
+    """
 
     def __init__(self):
         cfg = load_app_config()["log"]
@@ -163,6 +178,35 @@ class Logger:
             console = logging.StreamHandler()
             console.setFormatter(fmt)
             self._logger.addHandler(console)
+            # 文件 handler 建不出来就退回纯控制台，绝不因为"日志落不了盘"
+            # 把 Logger 本身弄成不可用——那等于连"她出事了"这件事也一起弄丢
+            file_handler = self._make_file_handler(fmt)
+            if file_handler is not None:
+                self._logger.addHandler(file_handler)
+
+    @staticmethod
+    def _make_file_handler(fmt: logging.Formatter):
+        """建轮转文件 handler；建不出来（目录只读 / 盘满 / 权限不够）返回 None。
+
+        路径跟 `get_settings().data_dir` 走，**不硬编码 `storage/`**：配了 DATA_DIR
+        的部署，日志必须落在它真正的数据目录里，和 `interaction/api.py` 的
+        `_avatar_file()` 是同一个理由——硬编码会让日志写进一个没人看的目录，
+        于是"文件一份"又变成一句注释里的承诺。
+        """
+        try:
+            log_dir = get_settings().data_dir / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                log_dir / _LOG_FILE_NAME,
+                maxBytes=_LOG_MAX_BYTES,
+                backupCount=_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setFormatter(fmt)
+            return handler
+        except OSError as exc:
+            print(f"[log] 文件日志不可用（{exc}），本次只用控制台")
+            return None
 
     def info(self, msg: str) -> None:
         self._logger.info(msg)
@@ -180,6 +224,8 @@ def has_key(key: str) -> bool:
     """key 存在且不是占位符（占位符以 your- 开头，比如 your-xxx）。
 
     合并自 tools/external.py:17 + tools/speech.py:106，两份逻辑完全一致，
-    现统一到 tools.misc._has_key，两处 import 即可，避免后续两处实现漂移。
+    现统一到 tools.misc.has_key（原名 _has_key，附七 P1-5 一并去掉了下划线：
+    它是跨模块被 import 的公开口子，不是模块私有），两处 import 即可，
+    避免后续两处实现漂移。
     """
     return bool(key) and not key.startswith("your-")

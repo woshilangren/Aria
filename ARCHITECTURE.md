@@ -94,7 +94,7 @@ _perceive ────────── 意图+情绪（一次 LLM）∥ 记忆
    ▼
 按意图分流
    ├── 工具意图（weather / search / image / diary）
-   │     _toolcall  三级降级
+   │     _toolcall  两级降级（L2 已删，见第四节工具层）
    │       ├ 缺城市 → 追问话术直接写成 final_reply，不瞎查默认城市
    │       └ 其余   → 跑工具，模型的初答留成 draft_reply
    │     _respond   把工具结果转述成人话（上面没定稿时才走）
@@ -200,11 +200,12 @@ done 事件（full_text / output_mode / image_path）
 - 两台都挂：抛异常给上层，回复生成器接住换兜底话，对话不断
 - 备用 GLM 是"始终思考"模型，不支持关闭思考，调用时固定带 `thinking_effort: low` 并摘掉思考开关参数，否则每条回复先烧几百推理 token、延迟 20 秒起步
 
-**工具层（capability/toolcall.py）三级降级**
+**工具层（capability/toolcall.py）两级降级**
 - L1：模型原生 function calling，模型自己决定调什么、调完自己组织答案
-- L2：模型不支持工具调用时，让模型文本规划出工具名和参数，代码手动执行
-- L3：连规划都失败时，规则表硬编码 + 正则抠参数，模型再怎么抽风都有底
-- 三级全失败：按 `FallbackController` 的决策重试或放弃，给一句人设化的兜底话
+- L3：规则表硬编码 + 正则抠参数，模型再怎么抽风都有底
+- 两级全失败：给一句人设化的兜底话（表在 `capability/response_generator.py`，`persona_config.json` 的自定义台词按权重混进池子）
+- **L2 已删（D3）**：它曾是"模型不支持 function calling 时，让模型用文本规划出工具名和参数、代码手动执行"。意图只有 4 个固定值（weather/search/image/diary），L3 的规则表 + 正则已经覆盖，L2 那一层白花一次模型调用，还多开一处"重跑有副作用的工具"的口子（见 I3 的幂等账本）
+- **代价（作者要求备注）**：删掉之后，"模型不支持 function calling"的场景只剩 L3，规则表没有 LLM 规划的参数灵活性。当前 4 个固定意图够用；将来意图扩到两位数，要把规划层加回来，**届时必须连同 I3 的幂等账本一起接**，否则又是三倍画图
 
 **流程层（orchestration/pipeline.py + managers.py）**
 - 句级审核不过 → 按统一规则裁决：**还没推出过任何内容才允许重写**（最多 `_MAX_REWRITE` 次），一旦推出过内容就只能整轮替换成兜底话。规则细节和"为什么这是有意的能力下降"见第四节

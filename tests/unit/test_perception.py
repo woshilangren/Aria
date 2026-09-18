@@ -118,3 +118,52 @@ def test_empty_text_returns_default(offline_pipeline):
     assert intent.intent == "chat"
     assert emotion.emotion == "neutral"
     assert subtext == ""
+
+
+# --------------------- SafetyReviewer 出戏话（C4）---------------------
+@pytest.mark.parametrize("text", [
+    "工具这边什么都没查到",      # 真机 turn 7 原句，这条模式就是为它加的
+    "工具没有返回结果",
+    "接口未响应",
+    "系统查不到数据",
+    "我调用了工具去查",
+    "调用接口失败了",
+    "搜索失败了，换个说法",
+    "查询出错了",
+    "作为一个AI我不能这么想",    # 原有字面量不许因为加了正则就失效
+    "我是程序，没有感觉",
+    "我是模型",
+])
+def test_review_blocks_system_voice(text):
+    from capability.perception import SafetyReviewer
+
+    ok, reason = SafetyReviewer().review(text, "output")
+    assert ok is False
+    assert "出戏" in reason
+
+
+@pytest.mark.parametrize("text", [
+    "他就是个工具人",
+    "我翻翻工具箱",
+    "工具人没什么用",        # 把正则间距放宽去够 turn 7 那句，就会开始误杀这一句
+    "工具箱没带上",
+    "这系统没什么毛病",
+    "我没查到你说的那本书",   # 主语是"我"不是工具，是她自己在说话
+    "这个工具挺好用的",
+    "帮你查一下天气",
+    "今天天气不错",
+])
+def test_review_does_not_block_legitimate_wording(text):
+    """误杀的代价是**整轮降级**（_ReviewReject → refuse），远高于漏杀，所以宁可窄。"""
+    from capability.perception import SafetyReviewer
+
+    ok, reason = SafetyReviewer().review(text, "output")
+    assert ok is True, f"误杀了正常话：{reason}"
+
+
+def test_review_meta_check_only_on_output():
+    """input 模式只查违禁词，不查出戏话——出戏是**她**说的问题，不是他说的。"""
+    from capability.perception import SafetyReviewer
+
+    ok, _ = SafetyReviewer().review("工具这边什么都没查到", "input")
+    assert ok is True

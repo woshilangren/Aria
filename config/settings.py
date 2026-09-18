@@ -28,10 +28,17 @@ class Settings:
     llm_api_key: str
     llm_base_url: str
     llm_model: str
+    # 模型家族（J13-4）：qwen / claude / glm / auto。
+    # 为什么不能靠模型名猜：原来只有 `"qwen" in model` 这一条判据，而 qwq / qvq 系
+    # 名字里不含 "qwen"，会被当成 Claude 剥掉 enable_thinking —— 开源 qwen3 非流式
+    # 默认 thinking=true，剥了参数就是 400。auto = 保留旧的按名字猜（默认值，
+    # 现有部署一行 .env 都不用改，行为完全不变）；填了显式家族就以配置为准。
+    llm_family: str
     llm_supports_tool_call: bool
     llm_fallback_api_key: str
     llm_fallback_base_url: str
     llm_fallback_model: str
+    llm_fallback_family: str       # 同上，备用模型的家族
 
     # ---- 语音 / 图片 / 外部服务（没配就等于这个功能不可用）----
     asr_api_key: str
@@ -74,10 +81,12 @@ def get_settings() -> Settings:
         llm_api_key=getenv("LLM_API_KEY", ""),
         llm_base_url=getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         llm_model=getenv("LLM_MODEL", "qwen3.8-flash"),
+        llm_family=getenv("LLM_FAMILY", "auto"),
         llm_supports_tool_call=getenv("LLM_SUPPORTS_TOOL_CALL", "true").lower() == "true",
         llm_fallback_api_key=getenv("LLM_FALLBACK_API_KEY", ""),
         llm_fallback_base_url=getenv("LLM_FALLBACK_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
         llm_fallback_model=getenv("LLM_FALLBACK_MODEL", "glm-5.3-flash"),
+        llm_fallback_family=getenv("LLM_FALLBACK_FAMILY", "auto"),
         asr_api_key=getenv("ASR_API_KEY", ""),
         asr_base_url=getenv("ASR_BASE_URL", ""),
         asr_model=getenv("ASR_MODEL", "qwen-audio-3.0-asr-flash-streaming"),
@@ -148,6 +157,22 @@ def load_app_config() -> dict:
             "long_input_require_split": True,
             "force_cut_chars": 40,
         },
+        # 外部同步调用的墙钟上限（J3）。以前这三处 dashscope 调用完全没有超时，
+        # 而它们都跑在 asyncio.to_thread 的**默认线程池**里：一个僵死请求占住一个
+        # 池线程且永不释放，攒够 min(32, cpu+4) 个之后所有 offload 调用（包括
+        # SQLite 写回）开始排队——表现是"整个服务卡死"，而日志里一条报错都没有。
+        # 这是 24/7 运行最大的挂起风险，所以每个都必须有上限。
+        "timeouts": {
+            # 整段语音转写：一句话几秒到几十秒，60 秒还没回就是链路挂了，
+            # 再等下去用户早就走开了
+            "asr_seconds": 60,
+            # 语音合成：SDK 原生吃 timeout_millis（超时抛 TimeoutError 并在 finally
+            # 里关掉 websocket），比外面包线程池干净，所以直接把这个值传进去
+            "tts_seconds": 60,
+            # 画图任务轮询：qwen-image pro 出图常态十几秒到一两分钟，给 5 分钟。
+            # 超时后 SDK 返回 status_code=408 / code=WaitTaskTimeout，不会挂住
+            "image_seconds": 300,
+        },
         "log": {"level": "INFO"},
     }
     path = PROJECT_ROOT / "config.json"
@@ -162,3 +187,18 @@ def load_app_config() -> dict:
             # 配置文件写坏了也别让程序起不来，用默认值凑合
             pass
     return defaults
+
+
+def timeout_seconds(name: str, default: float) -> float:
+    """安全读 `timeouts.<name>`（J3）：缺失 / 类型坏 / 非正数一律退回 default。
+
+    为什么不让调用方直接 `load_app_config()["timeouts"][name]`：config.json 是用户
+    可改的，写成 `"asr_seconds": "60s"` 或直接删掉整段都有可能——直接下标会抛
+    KeyError 把语音链路整个炸掉，把字符串透传给 SDK 则会在更深的地方炸。
+    兜底哲学要求"读不到返回默认值而不是抛异常"，这个口子就是那条纪律的落点。
+    """
+    try:
+        val = float(load_app_config().get("timeouts", {}).get(name, default))
+    except (TypeError, ValueError, AttributeError):
+        return float(default)
+    return val if val > 0 else float(default)

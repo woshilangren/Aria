@@ -106,13 +106,85 @@ def test_char_life_ensure_generates(kv):
     assert "记忆的书" in rec["items"][0]["detail"]
 
 
-def test_consume_topic_retires_after_two_uses(kv):
+def test_peek_does_not_burn_but_commit_does(kv):
+    """I1：挑与烧分离——peek 不烧计数，commit 才烧，用满两次即退休。
+
+    以前 quirks 掷骰子命中就调 consume_topic（挑+烧一体），而六个动作里只有
+    off_topic / recall 真用素材，其余四种白烧一次 → 素材被提前掏空。
+    """
     char_life.ensure("t1")
-    first = char_life.consume_topic("t1")
+    first = char_life.peek_topic("t1")
     assert "记忆的书" in first
-    char_life.consume_topic("t1")
-    # 用满两次 → 退休，没有可用的了
-    assert char_life.consume_topic("t1") == ""
+    # 只挑不烧：连挑三次还是同一条，计数一格没动（这条就是 I1 的回归闸）
+    assert char_life.peek_topic("t1") == first
+    assert char_life.peek_topic("t1") == first
+    char_life.commit_topic("t1", first)
+    assert char_life.peek_topic("t1") == first      # 烧了一次，还可用
+    char_life.commit_topic("t1", first)
+    assert char_life.peek_topic("t1") == ""         # 用满两次 → 退休
+
+
+def test_commit_unknown_topic_is_noop(kv):
+    """烧一条已经不在池里的素材：什么都不该动，更不能烧到别人头上。"""
+    char_life.ensure("t1")
+    real = char_life.peek_topic("t1")
+    char_life.commit_topic("t1", "早就被挤掉的一条")
+    assert char_life.peek_topic("t1") == real       # 真素材一格没烧
+
+
+class _StubRandom:
+    """钉死 quirks 的随机源：骰子必过闸，且落在指定的那个动作上。"""
+
+    def __init__(self, uniform_value: float):
+        self._u = uniform_value
+
+    def random(self) -> float:
+        return 0.0                    # 必过 quirk_rate 闸（0.0 >= rate 恒假）
+
+    def uniform(self, a, b) -> float:
+        return self._u
+
+    def choice(self, seq):
+        return seq[0]
+
+
+def _used_count(session_id: str) -> int:
+    items = (char_life.get(session_id).get("items") or [])
+    return sum(int(it.get("used_count") or 0) for it in items)
+
+
+# 无 flaws / 无 distilled / stage=初识 时桌面是 snark3 off_topic2 pride2 recall2，
+# total=9，累计边界 3 / 5 / 7 / 9（有 life_topic 才上得了 recall 这张桌）
+@pytest.mark.parametrize("pick,action,burns", [
+    (1.0, "snark", False),
+    (4.0, "off_topic", True),
+    (6.0, "pride", False),
+    (8.0, "recall", True),
+])
+def test_quirk_roll_only_burns_topic_when_used(kv, monkeypatch, pick, action, burns):
+    """I1 调用方侧：只有 off_topic / recall 真嵌了素材才烧计数。
+
+    改之前 roll 一命中就 consume_topic，snark / pride 这两种命中白烧一次——
+    约半数素材被白白消耗，used_count>=2 就退休，她的生活面被提前掏空。
+    """
+    from capability import quirks
+    from shared.types import MemoryBundle
+
+    char_life.ensure("t1")
+    topic = char_life.peek_topic("t1")
+    assert topic                                    # 前置：确实有素材可用
+    monkeypatch.setattr(quirks, "random", _StubRandom(pick))
+    monkeypatch.setattr(quirks, "load_app_config",
+                        lambda: {"personality": {"quirk_rate": 1.0}})
+
+    directive = quirks.QuirkDirector().roll(MemoryBundle(), stage="初识",
+                                            mood="平常", session_id="t1")
+    assert directive                                # 骰子命中就不许返回空串
+    assert (topic in directive) is burns
+    # 断言**确切计数**，不用 `(_used_count()==1) is burns`：后者在多烧一次时
+    # used_count 变 2，`2==1` 为假正好和 burns=False 撞上，snark/pride 会假绿
+    # （反证跑出来过这个坑）。
+    assert _used_count("t1") == (1 if burns else 0)
 
 
 def test_shape_line_only_today(kv):

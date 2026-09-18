@@ -100,3 +100,15 @@ def bootstrap() -> None:
         services.register("tts", TTSTool())
     except Exception as exc:
         services.mark_error("tts", str(exc))
+
+    # 人设引擎：真身是 orchestration/pipeline.py 的模块级 _ENGINE（建在全项目唯一
+    # 那份 KEEPER 上）。只有组合根允许向上 import 调度层，所以这一行只能在这里。
+    # 注册上以后，工具链路的 response_generator._persona_engine() 就不用再走
+    # "临时 new 一份只读 keeper"的退化分支——那条路的短期上下文取自 session 表，
+    # 比内存里的 KEEPER 最多旧一轮，而且每轮多三次 KV 读（C1）。
+    try:
+        from orchestration.pipeline import _ENGINE
+
+        services.register("persona_engine", _ENGINE)
+    except Exception as exc:
+        services.mark_error("persona_engine", str(exc))

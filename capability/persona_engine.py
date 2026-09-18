@@ -8,8 +8,10 @@ from shared.singletons import services
 from shared.types import MemoryBundle, PromptPackage
 from tools.misc import ClockTool
 
+import json
 from datetime import datetime
 
+from config.settings import PROJECT_ROOT
 from capability.memory import SessionMemoryKeeper, recent_arc
 from capability import self_identity, char_life
 
@@ -33,6 +35,33 @@ def _expression_cfg() -> dict:
         return load_app_config().get("expression", {}) or {}
     except Exception:
         return {}
+
+
+# H7 兜底：JSON 里 expression_rules 缺失/写坏时的最后两条——只是安全网，
+# 不是第二主人（规则的正主永远是 persona_config.json 的 expression_rules 字段，
+# 一条规则只能有一个主人）。写坏配置不能崩、也不能让 AI 腔闸完全失守（CLAUDE.md 配置体系）。
+_EXPRESSION_RULES_FALLBACK = (
+    "他刚说过的事，绝对不要复述。要反应，不要总结。",
+    "不要用\"首先/其次/最后\"\"综上所述\"\"值得注意的是\"这类词。",
+)
+
+
+def _expression_rules() -> list:
+    """读 persona_config.json 的 expression_rules（说话的规矩的唯一主人）。
+
+    为什么直接读 JSON 而不走 kv.read("persona_config")：PersonaConfig dataclass
+    （data/schemas.py，不归本文件）还没有这个字段，门面也就带不出来；直接读文件
+    与 PersonaConfigStore 同源，且解析失败返回兜底而不是抛——配置写坏不拦聊天。
+    """
+    try:
+        raw = json.loads((PROJECT_ROOT / "data" / "persona_config.json")
+                         .read_text(encoding="utf-8"))
+        rules = raw.get("expression_rules") or []
+        if isinstance(rules, list) and rules:
+            return [str(r) for r in rules if str(r).strip()]
+    except Exception:
+        pass
+    return list(_EXPRESSION_RULES_FALLBACK)
 
 
 class PersonaEngine:
@@ -70,8 +99,9 @@ class PersonaEngine:
             sections.append(persona.taboos)
 
         # 她自己的身份（批次0"种子+涌现"）：已冻结的Inject"你是谁"，
-        # 未冻结的注入"你的第一次"引导自命名——内容全部是她本人定下的
-        for identity_section in self_identity.compose_sections(session_id):
+        # 未冻结的按披露预算只注入"下一个槽"（G3）——user_text 必须透传，
+        # 闸门靠它判断"他上一句问过什么"；内容全部是她本人定下的
+        for identity_section in self_identity.compose_sections(session_id, user_text=user_text):
             sections.append(identity_section)
 
         # 反顺从基调：她不是应声虫，怎么说话看她心情（安抚模式收起这股劲）
@@ -244,17 +274,12 @@ class PersonaEngine:
         )
 
         # ---- 对抗 AI 腔：真人说话是增量式，只说对方还不知道的部分 ----
-        sections.append(
-            "【说话的规矩】\n"
-            "1. 他刚说过的事，绝对不要复述。要反应，不要总结。\n"
-            "2. 不要解释他显然已经知道的背景。\n"
-            "3. 可以只说半句，可以省略，可以跳着说。\n"
-            "4. 不知道就直说：\"我也说不上来\"\"就是怪\"\"反正就是\"。\n"
-            "5. 不要用\"首先/其次/最后\"\"综上所述\"\"值得注意的是\"这类词。\n"
-            "6. 有起伏——有的话重，有的话随便，不要每句都一样力度。\n"
-            "7. 允许跑题、联想、突然想起别的。\n"
-            "8. 可以有口癖：\"嗯\"\"就是\"\"怎么说呢\"\"不是\"。"
-        )
+        # H7：规矩的正主是 persona_config.json 的 expression_rules，这里只负责
+        # 组装——以前引擎里硬编一份、config 里又写一份，两个主人必然漂移
+        # （config 用户可改、引擎是代码）。现在引擎不再持有规则正文。
+        sections.append("【说话的规矩】\n" + "\n".join(
+            f"{i}. {r}" for i, r in enumerate(_expression_rules(), 1)
+        ))
 
         # ---- 反应前缀协议（F8 接线）：以前管道里有完整的识别/剥离/放行逻辑， ----
         # ---- 但没有任何提示词告诉模型可以用，整套机制实际是死的。现在接通。 ----
@@ -281,7 +306,9 @@ class PersonaEngine:
                 sections.append(
                     "【这一轮别压字数】\n"
                     "他这次说了很多，里面不止一个要点。每个问题、每个要点都要答到，"
-                    "不要压字数。可以分几段，每个要点另起一句，不要挤成一段。"
+                    "不要压字数。可以分几段，每个要点另起一句，不要挤成一段。\n"
+                    "这一轮以这条为准：\"一轮最多一个问题\"只约束短输入的闲聊轮，"
+                    "长输入轮先把每个要点答到，问题最多也只是一个。"
                 )
 
         return PromptPackage(

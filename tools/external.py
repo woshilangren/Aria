@@ -11,8 +11,12 @@ import dashscope
 import httpx
 from ddgs import DDGS
 
-from config.settings import get_settings
+from config.settings import get_settings, timeout_seconds
 from tools.misc import has_key
+
+# config.json 的 timeouts 段缺失/写坏时的兜底上限（秒），与 config/settings.py 的
+# defaults 保持一致
+_IMAGE_TIMEOUT_DEFAULT = 300.0
 
 
 # Open-Meteo 返回的是天气代码（weathercode），这里挑常见的翻成中文
@@ -94,7 +98,8 @@ class ImageGenTool:
     """文字生图：走百炼的异步任务接口（先提交任务，再轮询到出图）。
 
     qwen-image-3.0-pro 不支持同步一次出图，流程是 async_call 提交 ->
-    wait 轮询 -> 拿到图片 URL -> 下载落盘。图存到 storage/images 下，
+    wait 轮询 -> 拿到图片 URL -> 下载落盘。图存到 `DATA_DIR/images` 下
+    （跟着 get_settings().data_dir 走，不是写死的 storage/images），
     返回值里带路径，写回流程会登记到图片库。
     """
 
@@ -113,10 +118,31 @@ class ImageGenTool:
         )
         if rsp.status_code != 200:
             raise RuntimeError(f"画图任务提交失败：{rsp.status_code} {rsp.message}")
-        # wait 内部自带轮询，出图或失败才返回
-        rsp = dashscope.ImageSynthesis.wait(task_id=rsp.output.task_id, api_key=key)
-        if rsp.status_code != 200 or rsp.status != "SUCCEEDED":
-            raise RuntimeError(f"画图任务没成功：{rsp.status} {rsp.message}")
+        # wait 内部自带轮询，出图或失败才返回。
+        #
+        # J3：必须显式传 wait_timeout——SDK 的默认值是 -1，也就是"无限轮询"。
+        # 这是全项目唯一一处能把 asyncio.to_thread 默认线程池的线程永久占住的调用，
+        # 攒够几个就是整个服务卡死（连 SQLite 写回都排队）。超时后 SDK 不抛异常，
+        # 而是返回 status_code=408 / code=WaitTaskTimeout，正好落进下面的失败分支。
+        #
+        # 顺带修掉这一行上两个"必炸"的缺陷（改这行才发现，都属于同一条调用）：
+        # 1. 形参名是 `task`，不是 `task_id`。原来写 `wait(task_id=...)`，task_id 掉进
+        #    **kwargs、位置参数 task 没人给 → TypeError: missing a required argument: 'task'。
+        #    最坏的地方是它炸在 async_call **之后**：任务已经提交、钱已经花了，图却永远拿不到。
+        # 2. `rsp.status` 这个属性不存在（ImageSynthesisResponse 上只有 output.task_status），
+        #    读它直接 AttributeError —— 连"画图失败"的报错信息都构造不出来。
+        wait_timeout = int(timeout_seconds("image_seconds", _IMAGE_TIMEOUT_DEFAULT))
+        rsp = dashscope.ImageSynthesis.wait(
+            task=rsp.output.task_id,
+            api_key=key,
+            wait_timeout=wait_timeout,
+        )
+        if rsp.status_code != 200:
+            # 408/WaitTaskTimeout 走这条：把 SDK 给的 code 一起带上，别只说"没成功"
+            raise RuntimeError(f"画图任务没成功：{rsp.status_code} {rsp.code} {rsp.message}")
+        task_status = getattr(rsp.output, "task_status", "") if rsp.output is not None else ""
+        if task_status != "SUCCEEDED":
+            raise RuntimeError(f"画图任务没成功：{task_status} {rsp.message}")
         url = rsp.output.results[0].url
         # 结果给的是图片链接，下载回来存本地
         image_dir = cfg.data_dir / "images"

@@ -10,6 +10,11 @@
 标签既不能被念出来，也不能进聊天记录。
 
 key 没配的时候直接报错，别装作能用的样子，上层会自己降级成纯文字。
+
+每一次 dashscope 调用都有明确的墙钟上限（J3，取值在 config.json 的 timeouts 段）：
+ASR 走"专用线程池 + future.result(timeout)"（这版 SDK 的 Recognition.call 压根
+不收超时参数），TTS 走 SDK 原生的 timeout_millis。没有上限的调用是 24/7 运行
+最大的挂起风险——它挂住的是线程，不是协程，不会自己醒。
 """
 
 import io
@@ -19,13 +24,62 @@ import struct
 import tempfile
 import threading
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback
 from dashscope.audio.tts_v2 import SpeechSynthesizer
 
-from config.settings import get_settings
+from config.settings import get_settings, timeout_seconds
 from tools.misc import has_key
+
+# config.json 的 timeouts 段缺失/写坏时的兜底上限（秒），与 config/settings.py 的
+# defaults 保持一致——两处都得有，因为 timeout_seconds 需要一个"配置全丢"时的落点
+_ASR_TIMEOUT_DEFAULT = 60.0
+_TTS_TIMEOUT_DEFAULT = 60.0
+
+# dashscope 的同步调用一律丢进这个**专用**线程池，再在外面用 future.result(timeout)
+# 卡住上限（J3）。
+#
+# 为什么不直接让它跑在 asyncio.to_thread 的默认池里：默认池是全项目共享的
+# （SQLite 写回、文件读写、感知/画像那些慢调用全靠它 offload），而一个挂死的
+# ASR 请求会占住一个池线程且**永不释放**；攒够 min(32, cpu+4) 个之后，所有
+# offload 调用开始排队——表现是"整个服务卡死"，而日志里一条报错都没有。
+# 隔离到专用池后，最坏也只是语音功能自己降级，写回那条命脉不受牵连。
+#
+# max_workers 给 4 而不是 1：超时之后底下那个线程可能仍被占着（见 _run_bounded
+# 里的说明），单 worker 会让一次挂死之后的所有语音请求永久排队。4 个既有缓冲，
+# 又给"最多同时挂着几个僵尸"封了顶。
+_DASHSCOPE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dashscope")
+
+
+def _run_bounded(fn, timeout_s: float, what: str):
+    """在专用池里跑 fn，超过 timeout_s 就不再等它，抛 RuntimeError。
+
+    必须说清楚的一点：超时只是"**我们不等了**"，底下那个线程可能还在跑。
+    这版 dashscope 的 `Recognition.call()` 是同步阻塞的 websocket 收流循环，
+    没有可以安全调用的取消口子——`stop()` 只翻 `_running` 标志、并不会中断
+    `call()` 里正在迭代的那个响应生成器。所以超时后必须把这笔僵尸调用大声记下来：
+    静默丢弃就等于把"专用池正在被蚕食"这件事藏起来，正是 J3 要治的那个病
+    （兜底哲学：外部服务失败可以降级，但必须留痕）。
+
+    统一抛 RuntimeError 而不是内建的 TimeoutError：本模块既有的失败契约就是
+    RuntimeError（key 没配也是它），上层 skills.py / gateway.py 靠它降级成纯文字。
+    """
+    future = _DASHSCOPE_POOL.submit(fn)
+    try:
+        return future.result(timeout=timeout_s)
+    except _FutureTimeout:
+        # 还没被 worker 取走的话 cancel() 能拦下来；已经在跑的拦不住，只能记账
+        still_running = not future.cancel()
+        note = (
+            "；底层调用仍挂在专用池线程里（已与 asyncio 默认池隔离，不会拖死写回）"
+            if still_running else ""
+        )
+        print(f"[speech] {what} 超过 {timeout_s:.0f}s 未返回，已放弃等待{note}")
+        raise RuntimeError(f"{what}超时（{timeout_s:.0f}s）") from None
+
 
 # dashscope 的 key 是模块级全局（dashscope.api_key），而这版 SDK 的
 # Recognition / SpeechSynthesizer 构造函数都不收 key，只能在调用前设全局。
@@ -166,9 +220,28 @@ class ASRTool:
                     format=fmt,
                     sample_rate=sr,
                 )
-                result = recognition.call(file=tmp.name)
+                # J3：这版 SDK 的 Recognition.call() 不收任何超时参数（1.27.2 的
+                # 签名只有 file / phrase_id / 几个识别开关 + **kwargs，kwargs 全被
+                # 透传成请求参数），内部又是同步阻塞的 websocket 收流循环——挂住就是
+                # 永久挂住。所以只能从外面包一层：专用线程池 + future.result(timeout)。
+                #
+                # 已知代价（属于 J14 的范畴，这里只记账不动手）：超时后本函数会带着
+                # 异常退出 with 块、把 _DASHSCOPE_LOCK 放掉，而底下那个僵尸调用可能
+                # 还在跑；此时若另一个请求进来重设 dashscope.api_key，就出现了这把锁
+                # 本来要防的"key 被覆盖"窗口。不放锁则是永久死锁，两害相权取其轻——
+                # 窗口只有"僵尸还没读完请求参数"那么长，且专用池已经把爆炸半径限制
+                # 在语音功能内。
+                result = _run_bounded(
+                    lambda: recognition.call(file=tmp.name),
+                    timeout_seconds("asr_seconds", _ASR_TIMEOUT_DEFAULT),
+                    "语音识别（ASR）",
+                )
             return _extract_text(result.get_sentence() if result else None)
         finally:
+            # 就算 ASR 超时留下了僵尸线程，这里删临时文件也是安全的：SDK 在
+            # call() 的头几毫秒就把整个文件读进自己的队列再关掉了文件句柄，
+            # 而超时是几十秒量级的事；万一真撞上（Windows 下删被占用的文件会
+            # 抛 PermissionError），下面这个 OSError 兜底会把它咽掉，只漏一个临时文件。
             try:
                 os.unlink(tmp.name)
             except OSError:
@@ -206,7 +279,19 @@ class TTSTool:
         if instruction:
             kwargs["instruction"] = instruction
         # 设 key -> 构造 -> 发起调用，整段持锁（见 _DASHSCOPE_LOCK 的注释）
+        timeout_s = timeout_seconds("tts_seconds", _TTS_TIMEOUT_DEFAULT)
         with _DASHSCOPE_LOCK:
             dashscope.api_key = cfg.tts_api_key
             synthesizer = SpeechSynthesizer(**kwargs)
-            return synthesizer.call(clean)
+            try:
+                # J3：这版 SDK 的 SpeechSynthesizer.call 原生就收 timeout_millis
+                # （1.27.2 签名：call(text, timeout_millis=None)），超时抛 TimeoutError，
+                # 并且 streaming_complete 的 finally 里会 __cleanup_task() 把 websocket
+                # 关掉——比 ASR 那样从外面包线程池干净得多，所以能用原生的就用原生的。
+                return synthesizer.call(clean, timeout_millis=int(timeout_s * 1000))
+            except TimeoutError as exc:
+                # 转成 RuntimeError：本模块既有的失败契约就是它（key 没配也是 RuntimeError），
+                # 上层靠它降级成纯文字；把内建 TimeoutError 直接漏出去，只 catch
+                # RuntimeError 的地方就会漏接。超时本身要留痕，别静默。
+                print(f"[speech] 语音合成（TTS）超过 {timeout_s:.0f}s 未完成，本次按失败处理")
+                raise RuntimeError(f"语音合成超时（{timeout_s:.0f}s）") from exc

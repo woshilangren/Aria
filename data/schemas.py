@@ -51,7 +51,13 @@ class MemoryItem:
     - feeling：第一人称纹理短语（"脸一直发烫，想找个地缝钻进去"），不是标签；
     - appraisal：她的归因（她为什么这么感觉）；
     - valence/arousal：效价 -1..1 / 唤醒度 0..1，给召回衰减与排序算的标量；
-    - peak_moment：感受峰值时刻，衰减锚点（空则用 timestamp）。
+    - peak_moment：感受峰值时刻。⚠ **它现在什么都不做**——设计意图是当衰减锚点
+      （空则退回 timestamp），但 `upsert_memory` 落 Chroma 的 metadata 里没有这个键，
+      召回侧的衰减只读 `meta["timestamp"]`，所以"峰值时刻影响遗忘速度"这套机制
+      **不存在**。值只在内存对象里活着（以及 J12 的 vector_memory 重试 payload 里）。
+      要么补写 metadata + 补用（会改变记忆衰减行为），要么删字段 + 删这句——
+      两条都是作者的取舍，别由 agent 替作者定（见 计划与设计.md 待定项）。
+      在拍板之前，这里不许再把它写成已经生效的机制。
     全部可缺省：旧记忆/感受生成失败时照存，只是没有纹理。
     """
 

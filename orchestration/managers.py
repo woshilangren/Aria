@@ -3,10 +3,12 @@
 这堆类都是"只做决定、不干活"的角色：
     - VoiceRouteManager：语音三路由的决策与热切换
     - InfoGapCoordinator：缺信息 → 追问 → 补充 → 入档 的循环协调
-    - FallbackController：异常降级的决策中心
+    - FallbackController：异常降级的说法出口（兜底话表本身收口在能力层，见 H4）
 """
 
 from capability.memory import ProfileUpdater
+# H4：兜底话的唯一 merge base 住在能力层，这里向下取（orchestration → capability 合法）
+from capability.response_generator import fallback_line
 from shared.singletons import services
 
 # 语音路由的三个方案名
@@ -76,27 +78,29 @@ class InfoGapCoordinator:
 
 
 class FallbackController:
-    """异常降级决策中心：什么错、重试过几次，给个说法。"""
+    """异常降级决策中心：什么错，给个说法。
 
-    # 各错误类型的内置兜底话；persona_config.json 的 fallback_replies 同键可覆盖。
-    # 兜底话本身就跑在出错路径上，人设读不到必须无缝落回内置默认，不能再抛异常。
-    # 沉浸式措辞：她是"人"，台词里绝不出现"工具"这类词（AI 腔 + 穿帮，双杀）
-    _REPLIES = {
-        "llm": "……这会儿状态不太对，等一下再聊。",
-        "voice_route": "语音这边不太顺畅，先打字聊吧。",
-        "search": "呃……这个我还真不知道，你问住我了。",
-        "image": "图没弄出来，晚点再试试。",
-        "tool_call": "这事儿这次没办成，回头再说吧。",
-        "blocked": "这个话题我不聊，换一个吧。",
-        "review": "刚才想说什么来着……算了，换件事说吧。",
-    }
+    H4：这里曾经自己维护一份 `_REPLIES`（7 键），与 `capability/response_generator.py`
+    的 `_FALLBACK_REPLY` / `_NO_RESULT_REPLY` / `_FALLBACK_INTENT` 和
+    `data/persona_config.json` 的 `fallback_replies` 三张表并存，已经实测漂移
+    （同一个 search 故障，这边「…你问住我了。」那边「呃……这个我还真不知道。」）。
+    现在**代码里只剩一份 merge base**，住在 `capability/response_generator.py`，
+    这里向下取用。
+
+    base 为什么不住在本文件：分层规则是 interaction → orchestration → capability，
+    调度层 import 能力层合法，反过来是越层——`response_generator.fallback_line`
+    拿不到 managers，所以表只能放在两者中更低的那一层。
+
+    注：K5 里那个 `.decide(...)` 决策方法已在前一批删除（全仓零调用点，
+    重写决策实际由 pipeline 的 attempt / _MAX_REWRITE 硬编），本类现在只管"给个说法"。
+    """
 
     def fallback_reply(self, error_type: str) -> str:
-        """按错误类型给一句符合人设的兜底话。"""
-        replies = dict(self._REPLIES)
-        try:
-            persona = services.get("kv_store").read("persona_config", "")
-            replies.update(getattr(persona, "fallback_replies", None) or {})
-        except Exception:
-            pass  # 出错路径上的人设读取再挂掉，也不影响兜底话出口
-        return replies.get(error_type, replies["llm"])
+        """按错误类型给一句符合人设的兜底话。
+
+        与 `fallback_line` 共用同一份表、同一条解析路径（人设自定义 → 内置多条模板
+        → 按心情调味随机取一），所以两个出口不可能再说出两套口径。
+        没有 session_id 就不做心情调味——本方法的调用方（api.py 的语音路由降级、
+        pipeline 的 error 分支）手上不一定有会话，宁可口吻中性也不要瞎猜心情。
+        """
+        return fallback_line(error_type)

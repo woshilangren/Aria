@@ -37,6 +37,10 @@ _FAKE_ENV = {
     "LLM_BASE_URL": "http://127.0.0.1:9/v1",
     "LLM_MODEL": "test-model",
     "LLM_SUPPORTS_TOOL_CALL": "true",
+    # 家族分发（J13-4）也必须钉住：不钉就会从真 .env 漏进来，
+    # 作者哪天写了 LLM_FAMILY=qwen，家族相关的测试会跟着悄悄变行为。
+    "LLM_FAMILY": "auto",
+    "LLM_FALLBACK_FAMILY": "auto",
     "LLM_FALLBACK_API_KEY": "",
     "LLM_FALLBACK_BASE_URL": "http://127.0.0.1:9/v1",
     "LLM_FALLBACK_MODEL": "test-fallback-model",
