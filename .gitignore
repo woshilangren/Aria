@@ -25,3 +25,4 @@ scripts/test_transcript.json
 docs/
 CLAUDE.md
 AGENTS.md
+.qoder/
