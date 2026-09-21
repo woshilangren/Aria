@@ -10,6 +10,12 @@
    细化到各自的 `tmp_path`）。
 3. **全局服务注册表 `services` 用例之间互不污染** —— 每个用例前后对
    `ServiceRegistry` 内部字典做快照/还原。
+4. **进程级单例的可变状态同样隔离（R05a）** —— KEEPER（短期记忆管家）、
+   TURN_REGISTRY（活跃轮登记）、_BG_TASKS（后台写回任务）都是模块级单例，
+   它们不在 `services` 注册表里，之前从没人清：一个用例真跑完一轮 handle，
+   下一用例就能在 KEEPER 里读到上一用例的对话（隔离探针实测复现）。
+   现在每例前后做快照/还原；后台任务必须等其实际结束（含 to_thread 线程里的
+   同步函数跑完）才恢复 DB/registry——只清空任务集合等于什么都没做。
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -84,9 +91,62 @@ def _clear_settings_cache() -> None:
     load_app_config.cache_clear()
 
 
+# --------------------------------------------------------------------------
+# R05a：进程级单例的跨用例隔离（KEEPER / TURN_REGISTRY / _BG_TASKS）
+# --------------------------------------------------------------------------
+def _keeper_snapshot(keeper):
+    """KEEPER 四张内部字典的快照（锁内；列表浅拷一层防原地 append）。"""
+    with keeper._lock:
+        return (
+            {sid: list(msgs) for sid, msgs in keeper._contexts.items()},
+            dict(keeper._summaries),
+            dict(keeper._touched),
+            {sid: list(msgs) for sid, msgs in keeper._pending.items()},
+        )
+
+
+def _keeper_restore(keeper, snap) -> None:
+    """原地把四张字典恢复成快照。不清空重建而是 clear+update：别处可能握着
+    KEEPER 实例（_ENGINE 建在唯一 KEEPER 上），字典对象身份不动最稳。"""
+    contexts, summaries, touched, pending = snap
+    with keeper._lock:
+        keeper._contexts.clear()
+        keeper._contexts.update(contexts)
+        keeper._summaries.clear()
+        keeper._summaries.update(summaries)
+        keeper._touched.clear()
+        keeper._touched.update(touched)
+        keeper._pending.clear()
+        keeper._pending.update(pending)
+
+
+def _drain_bg_tasks(tasks: set, timeout: float = 10.0) -> None:
+    """等后台写回任务实际结束，超时大声失败（R05a）。
+
+    任务体是 `asyncio.to_thread(fn)`：fn 跑在默认线程池的线程上，**外层
+    task.cancel 不会让线程里的同步函数停下来**。所以这里绝不能只把集合清空
+    ——必须先取消未完成的任务、再等它们真正 done（asyncio.run 退出时本就会
+    cancel 所有任务并 shutdown 默认线程池，这里是对 TestClient 等其他入口的
+    兜底），超时没结束就报错：宁可这个用例红，也不能让它的后台写入漏进
+    下一个用例。
+    """
+    for t in list(tasks):
+        if not t.done():
+            t.cancel()
+    deadline = time.monotonic() + timeout
+    while any(not t.done() for t in list(tasks)):
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"后台写回任务在 {timeout}s 内未结束，会串染下一用例："
+                f"{[t for t in tasks if not t.done()]}"
+            )
+        time.sleep(0.01)
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """每个用例：独立 DATA_DIR（tmp_path）+ 干净的全局服务注册表 + 重置 DB 单例。
+    """每个用例：独立 DATA_DIR（tmp_path）+ 干净的全局服务注册表 + 重置 DB 单例
+    + KEEPER / TURN_REGISTRY / _BG_TASKS 快照还原（R05a）。
 
     get_db() 是模块级懒加载单例：只换 DATA_DIR 不重置它，第二个用例起拿到的
     还是第一个用例临时目录里的库——跨用例数据串味（身份冻结测试实测踩中）。
@@ -106,9 +166,30 @@ def _isolate(tmp_path, monkeypatch):
     saved_errors = dict(services._errors)
     services._services = {}
     services._errors = {}
+
+    # 模块级单例不在 services 注册表里，单独快照（R05a）。turn_id 计数器
+    # （TurnRegistry._ids）**有意**不还原：跨用例唯一性比可复现更重要。
+    import orchestration.pipeline as _pipeline_mod
+    from orchestration.cancellation import TURN_REGISTRY
+
+    keeper = _pipeline_mod.KEEPER
+    saved_keeper = _keeper_snapshot(keeper)
+    saved_active = dict(TURN_REGISTRY._active)
+    saved_bg = set(_pipeline_mod._BG_TASKS)
+
     try:
         yield
     finally:
+        # 顺序即语义：先等后台线程真正收工（它们可能还在写库/写 KEEPER），
+        # 再恢复内存状态，最后才动 DB 单例——反过来会让后台线程写进恢复后的库。
+        _drain_bg_tasks(_pipeline_mod._BG_TASKS)
+        _keeper_restore(keeper, saved_keeper)
+        with TURN_REGISTRY._lock:
+            TURN_REGISTRY._active.clear()
+            TURN_REGISTRY._active.update(saved_active)
+        _pipeline_mod._BG_TASKS.clear()
+        _pipeline_mod._BG_TASKS.update(saved_bg)
+
         try:
             if _sqlite_mod._db is not None and _sqlite_mod._db is not saved_db:
                 _sqlite_mod._db.close()

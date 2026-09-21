@@ -21,11 +21,16 @@ from shared.types import InputMessage
 
 
 class FakeLLM:
-    """最小可用的 LLM 替身：chat/astream_chat 都返回固定回复。"""
+    """最小可用的 LLM 替身：chat/astream_chat 都返回固定回复。
 
-    def __init__(self) -> None:
+    R05b：astream_chat 可注入自定义脚本（stream_script），确定成功链路测试
+    用它验证"脚本应答原样出现在正文与存储"；不传时保持旧行为（降级冒烟用）。
+    """
+
+    def __init__(self, stream_script: "list[str] | None" = None) -> None:
         self.chat_calls: list = []
         self.stream_calls: list = []
+        self._stream_script = list(stream_script or ["FakeLLM 流式回复。"])
 
     def chat(self, messages, temperature=None, max_tokens=None) -> str:  # noqa: ARG002
         self.chat_calls.append(list(messages))
@@ -36,7 +41,8 @@ class FakeLLM:
 
     async def astream_chat(self, messages, **kwargs) -> AsyncIterator[str]:  # noqa: ARG002
         self.stream_calls.append(list(messages))
-        yield "FakeLLM 流式回复。"
+        for chunk in self._stream_script:
+            yield chunk
 
 
 class FakeTTS:
@@ -81,12 +87,10 @@ def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, fake_services):
     assert reply is not None, "handle 必须返回 FinalReply"
     assert reply.text != "", f"reply.text 必须非空，实测 {reply.text!r}"
 
-    fake_llm, _ = fake_services
-    # 至少有一处走过（chat 或 astream_chat 都算）—— 这是证明 FakeLLM 被注册的最低证据
-    total_llm_calls = len(fake_llm.chat_calls) + len(fake_llm.stream_calls)
-    # 注意：FakeLLM 可能被注册但 persona_config 缺失会让 pipeline 走 fallback 而不调 LLM。
-    # 这种情况下 `total_llm_calls == 0` 也是合法——只要 handle 不崩且返回非空 reply。
-    assert total_llm_calls >= 0  # 主断言已在上方，本行仅为可读性占位
+    # 降级冒烟到此为止（保留）。R05b：原来这里还有一条
+    # `assert total_llm_calls >= 0`——恒真的死断言，什么都不证明，已删。
+    # "FakeLLM 必须被真正调用、其应答原样出现在正文与存储"的确定成功链路
+    # 由下一条测试负责：那条不允许兜底，reply 必须一字不差等于脚本应答。
 
 
 def test_fake_llm_registers_and_handle_uses_services(monkeypatch, fake_services):
@@ -95,3 +99,54 @@ def test_fake_llm_registers_and_handle_uses_services(monkeypatch, fake_services)
 
     fake_llm, _ = fake_services
     assert services.get("llm") is fake_llm, "FakeLLM 必须注册到全局 services"
+
+
+# ------------------- R05b：确定成功链路（与降级冒烟互补） -------------------
+
+_SCRIPTED_REPLY = "轨道今晚从东南方升起来，记得抬头看看。"
+
+
+def test_fake_llm_scripted_reply_reaches_reply_and_storage(register_services):
+    """脚本化 FakeLLM 的应答必须**原样**出现在接受正文与存储里（R05b）。
+
+    上一条是降级冒烟：兜底也算过。这条不许兜底——
+    - reply.text 一字不差等于脚本应答（不含 error/refuse/兜底痕迹）；
+    - KEEPER 短期记忆与 chat_log（session 表）各有一份同样的 assistant 正文；
+    - 生成阶段（astream_chat）确实被调用恰好一次。
+    会话故意沿用降级冒烟的 session id：R05a 的跨用例隔离一旦失效，
+    上一条测试写进模块单例 KEEPER 的占位回复会串进本条的断言，立刻红。
+    """
+    import asyncio
+
+    from orchestration.pipeline import KEEPER, DialoguePipeline
+    from shared.singletons import services
+    from tools.storage import KVStoreTool
+
+    llm = FakeLLM(stream_script=[_SCRIPTED_REPLY])
+    register_services(kv_store=KVStoreTool(), llm=llm, tts=FakeTTS())
+
+    sid = "b3-e2e-session"  # 故意与降级冒烟同 ID：隔离失效在这条上现形
+    reply = asyncio.run(
+        DialoguePipeline().handle(
+            InputMessage(text="今晚有流星雨吗", session_id=sid)
+        )
+    )
+
+    assert reply.text == _SCRIPTED_REPLY, f"正文必须是脚本应答原样，实测 {reply.text!r}"
+
+    assistant_ctx = [
+        m["content"] for m in KEEPER.get_context(sid) if m.get("role") == "assistant"
+    ]
+    assert assistant_ctx == [_SCRIPTED_REPLY], (
+        f"KEEPER 应恰好含本轮应答一份（多了就是跨用例串味），实测 {assistant_ctx!r}"
+    )
+
+    rows = services.get("kv_store").read("session", sid) or []
+    assistant_rows = [r.get("text") for r in rows if r.get("role") == "assistant"]
+    assert assistant_rows == [_SCRIPTED_REPLY], (
+        f"chat_log 应恰好含本轮应答一份，实测 {assistant_rows!r}"
+    )
+
+    assert len(llm.stream_calls) == 1, (
+        f"生成阶段应恰好调用一次 astream_chat，实测 {len(llm.stream_calls)}"
+    )

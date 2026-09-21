@@ -223,3 +223,65 @@ def test_double_lifespan_assembles_once(monkeypatch) -> None:
         assert main_mod._ASSEMBLY_STATE["watcher"] is None
 
     asyncio.run(_two_servers())
+
+
+# =================== 10. B4 补强（R05b）：取消不写，用行为证明 ===================
+
+def test_cancelled_midstream_turn_writes_nothing(register_services) -> None:
+    """流中途被顶掉的轮：KEEPER / chat_log 都必须零写入（B4 行为级验证）。
+
+    上面第 3 条在源码里数 `_check_cancel` 的个数，只能证明"检查点存在"，
+    不能证明"写入中途取消无副作用"（B4 的已知边界）。这条让替身 LLM 在吐出
+    第二段之前，用 TURN_REGISTRY 按**精确 turn_id** 真实取消当前活跃轮——
+    模拟"新一轮顶掉旧轮"——然后检查两条存储路径的实际状态。
+    Event/Barrier 控制交错的完整提交门竞争属 R15d，这里不越位。
+    """
+    import asyncio
+
+    from orchestration.cancellation import TURN_REGISTRY
+    from orchestration.pipeline import KEEPER, DialoguePipeline
+    from shared.singletons import services
+    from shared.types import InputMessage
+    from tools.storage import KVStoreTool
+
+    sid = "b4-cancel-midstream"
+
+    class _CancelMidStreamLLM:
+        """吐出第一段后取消当前轮，再吐第二段：第二轮次的处理必然撞上取消信号。"""
+
+        def __init__(self, session_id: str) -> None:
+            self._sid = session_id
+            self.stream_calls: list = []
+
+        async def astream_chat(self, messages, **kwargs):  # noqa: ARG002
+            self.stream_calls.append(list(messages))
+            handle = TURN_REGISTRY.get(self._sid)
+            assert handle is not None, "生成阶段必须有登记在案的活跃轮"
+            yield "第一句该出现，"
+            # 精确 turn_id 取消（F4：不带 turn_id 的取消一律被拒，所以必须拿句柄）
+            assert TURN_REGISTRY.cancel(self._sid, turn_id=handle.turn_id) is True
+            yield "这一整轮会被取消，不许落库。"
+
+    llm = _CancelMidStreamLLM(sid)
+    register_services(kv_store=KVStoreTool(), llm=llm, tts=_FakeTTSStub())
+
+    reply = asyncio.run(
+        DialoguePipeline().handle(InputMessage(text="在吗", session_id=sid))
+    )
+
+    # 取消轮的既有契约：无正文（不当异常兜底成 llm 兜底话）
+    assert reply.text == "", f"取消轮不应有正文，实测 {reply.text!r}"
+    # 两条存储路径都是空的：KEEPER 没有本轮问答，chat_log 没有任何行
+    ctx = [m["content"] for m in KEEPER.get_context(sid)]
+    assert not any("第一句" in c or "在吗" in c for c in ctx), (
+        f"KEEPER 不该有被取消轮的内容，实测 {ctx!r}"
+    )
+    rows = services.get("kv_store").read("session", sid) or []
+    assert rows == [], f"chat_log 不该有被取消轮的痕迹，实测 {rows!r}"
+
+
+class _FakeTTSStub:
+    """取消测试里的 TTS 替身：不应被调用到，调了就是取消路径出了岔子。"""
+
+    def synthesize(self, text, **kwargs):  # noqa: ARG002
+        raise AssertionError("被取消的轮不应走到语音合成")

@@ -21,10 +21,15 @@ class _ScriptedLLM:
 
     def __init__(self):
         self.arbitrate_action = "update"
+        # R05b：仲裁故障开关。置 True 时仲裁调用真的抛错，走真实 _arbitrate
+        # 的失败分支——以前那条测试是把被测方法本身换成空函数，测的是替身。
+        self.arbitration_down = False
 
     def chat(self, messages, temperature=None, max_tokens=None):
         system = messages[0]["content"]
         if "档案仲裁员" in system:
+            if self.arbitration_down:
+                raise RuntimeError("llm down")
             return f'{{"action":"{self.arbitrate_action}","reason":"测试"}}'
         if "提取其中她说出口的" in system or "关于她自己的事实" in system:
             return '{"name":"","age":"","city":"","occupation":"","home":""}'
@@ -75,17 +80,17 @@ def test_arbitration_update_replaces_old(kv):
 
 
 def test_arbitration_failure_retries(kv):
-    """LLM 挂 → 仲裁失败 → 不入档不标晋升，下次重试。"""
+    """LLM 挂 → 真实 _arbitrate 吃到故障返回 None → 不入档不标晋升，下次重试。
+
+    R05b：以前这条测试把被测方法本身替换成空函数（`_arbitrate = lambda: None`），
+    断言的其实是替身的行为；现在给替身 LLM 加故障开关，让**真实**仲裁路径
+    （chat 调用抛错 → _arbitrate 捕获 → 返回 None → process 放弃晋升）跑全程。
+    """
     kv.write("profile", "t1", {"city": "上海"})
+    kv.scripted_llm.arbitration_down = True
     g = MemoryGatekeeper()
-
-    def boom(messages, temperature=None, max_tokens=None):
-        raise RuntimeError("llm down")
-
-    g_arb = g
-    g_arb._arbitrate = lambda *a, **k: None
-    g_arb.process("t1", "city", "杭州", confidence=0.9)
-    g_arb.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9)
     assert (kv.read("profile", "t1") or {}).get("city") == "上海"  # 旧值没动
     # 候选仍在池里（下次出现可重试）
     from data.sqlite_store import get_db

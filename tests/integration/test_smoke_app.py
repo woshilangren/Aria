@@ -1,12 +1,18 @@
 """集成冒烟测试：真起 FastAPI 应用，打真实路由。
 
-覆盖三件事：
-1. 健康检查 200 且返回 9 个服务键（带 X-Access-Token）；
+覆盖四件事：
+1. 健康检查 200 且返回全部装配服务键（带 X-Access-Token）；
 2. 不带口令访问 /api/* 被门卫挡下（401）；
-3. OpenAPI 里注册的 /api/* 路由数量 >= 15。
+3. OpenAPI 里注册的 /api/* 路由数量 >= 15；
+4. 免鉴权根路径不 401。
 
-**优雅降级**：环境不满足（应用导不进来 / 起不来）时一律 `pytest.skip`，绝不 fail——
-CI 无网络、无密钥也能跑。
+**失败语义（R05c）**：本地 import、lifespan 装配、路由层的错误一律**让用例红**，
+不再 `except Exception: pytest.skip` 一概跳过——那是把"应用起不来"伪装成
+"环境不满足"，启动异常连白屏都算不上（隔离探针实测：注入 RuntimeError 后
+5 个用例全体 SKIPPED，测试报告一片绿）。外部服务用明确替身：唯一在 lifespan
+里可能触网的是向量集合装配（`ensure_ready`），钉成本地 no-op；LLM/ASR/TTS
+的客户端构造不联网，真调用不在冒烟范围。密钥类缺失由 conftest 的假环境变量
+兜住，本文件不再需要任何 skip。
 """
 
 import pytest
@@ -17,38 +23,19 @@ pytestmark = pytest.mark.integration
 TEST_TOKEN = "test-token"
 
 
-def _import_app():
-    """导入应用；导不进就 skip（而不是 fail）。"""
-    try:
-        from main import app
-    except Exception as exc:  # pragma: no cover - 取决于环境
-        pytest.skip(f"应用无法导入，跳过集成测试：{exc!r}")
-    return app
-
-
 @pytest.fixture
 def client(monkeypatch):
-    """起一个真应用（走 lifespan 装配）。
+    """起一个真应用（走 lifespan 装配）。任何一步失败都让用例红（R05c）。"""
+    # 外部服务替身：ensure_ready 建集合可能触网/等超时，冒烟里钉成 no-op。
+    # raising=True：方法改名/删掉时这里立刻红，而不是静默失去隔离。
+    import tools.storage as storage
 
-    隔离点：`VectorStoreTool.ensure_ready()` 建集合时可能触网，这里置空成 no-op，
-    避免离线环境中白等超时。装配失败的单个服务由 bootstrap 自己记账（不抛出），
-    所以健康检查仍能返回 9 个服务键。
-    """
-    try:
-        import tools.storage as storage
+    monkeypatch.setattr(storage.VectorStoreTool, "ensure_ready", lambda self: None,
+                        raising=True)
 
-        monkeypatch.setattr(
-            storage.VectorStoreTool, "ensure_ready", lambda self: None
-        )
-    except Exception:  # pragma: no cover - 取决于环境
-        pass
-
-    app = _import_app()
-    try:
-        with TestClient(app) as c:
-            yield c
-    except Exception as exc:  # pragma: no cover - 取决于环境
-        pytest.skip(f"应用无法启动，跳过集成测试：{exc!r}")
+    from main import app  # 本地 import 失败 = 缺陷，不 skip
+    with TestClient(app) as c:  # lifespan 装配失败 = 缺陷，不 skip
+        yield c
 
 
 def test_health_ok_with_token(client):
