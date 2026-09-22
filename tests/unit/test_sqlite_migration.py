@@ -152,3 +152,100 @@ def test_add_column_is_idempotent():
     sm._add_column(conn, "chat_log", "verify_col", "TEXT DEFAULT ''")   # 第二次不该炸
     assert after_first == _cols()
     assert "verify_col" in after_first
+
+
+# ------------------- R15a：提交边界与回执的持久结构 -------------------
+
+# R15a 新增的持久对象。追加进"写死清单"：谁删了这里的 CREATE，这条先红。
+_R15A_TABLES = {"turn_requests", "turn_commits", "derived_task_done"}
+_R15A_INDEXES = {"idx_req_session", "idx_commit_request"}
+_CHAT_LOG_NEW_COLS = ("turn_id", "disposition", "source_review_status", "reason_code")
+_LEDGER_NEW_COLS = ("field", "old_value", "new_value", "event_id")
+
+
+def test_r15a_fresh_db_has_new_structures():
+    """全新库：R15a 的三张表、两个索引、chat_log/账本新列一个不少。"""
+    store = sm.get_db()
+    assert _R15A_TABLES <= _objects(store, "table")
+    assert _R15A_INDEXES <= _objects(store, "index")
+    for col in _CHAT_LOG_NEW_COLS:
+        names = {str(r[1]) for r in store._conn.execute("PRAGMA table_info(chat_log)")}
+        assert col in names, f"chat_log 缺新列 {col}"
+    for col in _LEDGER_NEW_COLS:
+        names = {str(r[1]) for r in store._conn.execute("PRAGMA table_info(affection_history)")}
+        assert col in names, f"affection_history 缺新列 {col}"
+
+
+def test_r15a_legacy_v1_db_upgraded_keeping_rows(tmp_path, monkeypatch):
+    """v1 老库（无新表新列）打开即升到 v2：旧行保留、新列回填默认空串。"""
+    import sqlite3 as s3
+
+    db_path = tmp_path / "knowledge.db"  # get_db() 只认这个名字
+    conn = s3.connect(db_path)
+    # 手工搭 v1 schema：只建 chat_log 与账本（老列、无新列），user_version=1
+    conn.execute(
+        "CREATE TABLE chat_log (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
+        " role TEXT NOT NULL, content TEXT NOT NULL, intent TEXT DEFAULT '', emotion TEXT DEFAULT '',"
+        " mode TEXT DEFAULT '', created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE affection_history (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL, old_score REAL NOT NULL, new_score REAL NOT NULL,"
+        " delta REAL NOT NULL, reason TEXT DEFAULT '', source_quote TEXT DEFAULT '',"
+        " created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO chat_log (session_id, role, content, created_at) VALUES ('s1','user','老消息','2026-01-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO affection_history (session_id, old_score, new_score, delta, created_at)"
+        " VALUES ('s1', 20, 21, 1, '2026-01-01T00:00:00')"
+    )
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from config.settings import get_settings
+
+    get_settings.cache_clear()
+    store = sm.get_db()
+    assert _version(store) == sm._SCHEMA_VERSION, "老库必须升到当前版本"
+    assert _R15A_TABLES <= _objects(store, "table")
+    # 旧行保留 + 新列默认空串
+    row = store._conn.execute(
+        "SELECT content, turn_id, disposition FROM chat_log WHERE session_id='s1'"
+    ).fetchone()
+    assert row[0] == "老消息" and row[1] == "" and row[2] == ""
+    led = store._conn.execute(
+        "SELECT old_score, new_score, field FROM affection_history WHERE session_id='s1'"
+    ).fetchone()
+    assert led[0] == 20 and led[1] == 21 and led[2] == "", "旧行的账目字段默认空串"
+    # 新写入走默认 intimacy：旧分数列语义不被污染
+    store.append_ledger("s1", 21.0, 22.0, reason="聊天升温")
+    store.append_ledger("s1", "旧心情", "新心情", reason="心情变化", field="mood",
+                        old_value="旧心情", new_value="新心情", event_id="ev-1")
+    mood_row = store._conn.execute(
+        "SELECT old_score, new_score, delta, field, old_value, new_value, event_id "
+        "FROM affection_history WHERE field='mood'"
+    ).fetchone()
+    assert mood_row[0] == 0.0 and mood_row[1] == 0.0 and mood_row[2] == 0.0, (
+        "非 intimacy 字段不许占用旧分数列"
+    )
+    assert mood_row[4] == '"旧心情"' and mood_row[5] == '"新心情"' and mood_row[6] == "ev-1"
+    intimacy_rows = store._conn.execute(
+        "SELECT old_score, new_score FROM affection_history WHERE field='intimacy' OR field=''"
+    ).fetchall()
+    assert all(r[1] - r[0] == 1 for r in intimacy_rows), "intimacy 行分数语义不变"
+    # 旧读接口兼容：recent_ledger 的旧键仍在、新增键就位
+    entries = store.recent_ledger("s1", n=5)
+    assert {"old", "new", "delta", "reason", "quote", "time"} <= set(entries[0].keys())
+    assert {"field", "old_value", "new_value", "event_id"} <= set(entries[0].keys())
+    get_settings.cache_clear()
+
+
+def test_new_turn_id_never_collides():
+    """轮 ID 生成器：跨调用不碰撞（持久唯一键的前提）。"""
+    ids = {sm.new_turn_id() for _ in range(1000)}
+    assert len(ids) == 1000
+    assert all(isinstance(i, str) and len(i) == 32 for i in ids)

@@ -18,6 +18,7 @@ import json
 import re
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timedelta
 from typing import Callable, List, Optional
 
@@ -122,10 +123,74 @@ _MIGRATIONS: tuple = (
         )
         """,
     ),
+    (
+    # ---------------- R15a：提交边界与回执的持久结构（8.11.3） ----------------
+    # 技术请求登记：(session_id, request_id) 的持久唯一依据——重试去重、
+    # "同 request 不同内容"冲突裁决都查这张表。只登记技术字段，**不存草稿**。
+    """
+    CREATE TABLE IF NOT EXISTS turn_requests (
+        request_id     TEXT PRIMARY KEY,
+        session_id     TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        turn_id        TEXT DEFAULT '',
+        lifecycle      TEXT NOT NULL DEFAULT 'running',
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_req_session ON turn_requests(session_id, request_id)",
+    # 已提交轮回执（CommitReceipt 最小字段）：同 request 重试返回同一回执的
+    # 依据；committed_at 处理中不许伪造。turn_id 是跨重启不碰撞的持久键。
+    """
+    CREATE TABLE IF NOT EXISTS turn_commits (
+        turn_id      TEXT PRIMARY KEY,
+        session_id   TEXT NOT NULL,
+        request_id   TEXT NOT NULL,
+        disposition  TEXT NOT NULL DEFAULT 'normal',
+        status       TEXT NOT NULL DEFAULT 'committed',
+        committed_at TEXT NOT NULL,
+        message_ids  TEXT DEFAULT '[]',
+        reason_code  TEXT DEFAULT ''
+    )
+    """,
+    # 同一 request 只许有一张回执：重试必须返回原回执，不能生成第二份
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commit_request ON turn_commits(session_id, request_id)",
+    # 派生任务完成标记（R18b 前置结构）：task_key = 源轮+种类+目标版本的
+    # 组合唯一键——重复执行/重启重放最多应用一次
+    """
+    CREATE TABLE IF NOT EXISTS derived_task_done (
+        task_key TEXT PRIMARY KEY,
+        done_at  TEXT NOT NULL
+    )
+    """,
+    # chat_log 加列：稳定 turn_id、轮分类（normal/degraded/crisis；旧行留空
+    # 读作 legacy）、来源审核结果与原因码。旧行保留，旧读接口不受影响。
+    lambda c: _add_column(c, "chat_log", "turn_id", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "chat_log", "disposition", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "chat_log", "source_review_status", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "chat_log", "reason_code", "TEXT DEFAULT ''"),
+    # 关系账本加列：field 区分账目种类（intimacy 之外的字段**不许**混进
+    # old_score/new_score 旧分数列——旧列语义只属于亲密度）；old_value/
+    # new_value 是 JSON 序列化的通用值；event_id 供幂等去重。
+    lambda c: _add_column(c, "affection_history", "field", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "affection_history", "old_value", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "affection_history", "new_value", "TEXT DEFAULT ''"),
+    lambda c: _add_column(c, "affection_history", "event_id", "TEXT DEFAULT ''"),
+    ),
 )
 
 # 当前代码期望的 schema 版本 = 迁移批次数（每批把版本 +1）
 _SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+def new_turn_id() -> str:
+    """生成跨重启不碰撞的轮 ID（R15a）。
+
+    TurnRegistry 的进程内递增数**不许**当持久唯一键：进程重启后从 1 重数，
+    与历史 chat_log/回执撞键。uuid4 全串无时序含义但绝对不撞；持久表里的
+    turn_id 一律出自这里。
+    """
+    return uuid.uuid4().hex
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -409,35 +474,65 @@ class SQLiteStorage:
     # ---------- 关系数值账本（S3）：追加写 + 近 N 条读 ----------
 
     def append_ledger(self, session_id: str, old: float, new: float,
-                      reason: str = "", source_quote: str = "") -> None:
-        """记一笔数值变动。账本是审计面不是数据面：写失败只告警，不回滚数值。"""
-        delta = round(float(new) - float(old), 4)
+                      reason: str = "", source_quote: str = "",
+                      field: str = "intimacy",
+                      old_value=None, new_value=None, event_id: str = "") -> None:
+        """记一笔数值变动。账本是审计面不是数据面：写失败只告警，不回滚数值。
+
+        R15a 扩展：field 区分账目种类（默认 intimacy 兼容旧调用）——**非
+        intimacy 字段的行不许占用 old_score/new_score 旧分数列**（旧列语义
+        只属于亲密度，旧读方按数值列聚合会被污染），真实值以 JSON 记入
+        old_value/new_value；event_id 供派生幂等去重（R18b 接线）。
+        """
+        # R15a：旧分数列只属于 intimacy——非 intimacy 字段的 old/new 可能根本
+        # 不是数字（心情串、JSON 对象），不许也不需要 float 转换
+        is_intimacy = field == "intimacy"
+        if is_intimacy:
+            delta = round(float(new) - float(old), 4)
+            score_old, score_new, score_delta = float(old), float(new), delta
+        else:
+            score_old = score_new = score_delta = 0.0
+        ov = json.dumps(old_value if old_value is not None else old, ensure_ascii=False)
+        nv = json.dumps(new_value if new_value is not None else new, ensure_ascii=False)
         try:
             with self._lock, self._conn:
                 self._conn.execute(
                     "INSERT INTO affection_history "
-                    "(session_id, old_score, new_score, delta, reason, source_quote, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (session_id, float(old), float(new), delta,
+                    "(session_id, old_score, new_score, delta, reason, source_quote, created_at, "
+                    "field, old_value, new_value, event_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (session_id, score_old, score_new, score_delta,
                      reason[:150], (source_quote or "")[:150],
-                     datetime.now().isoformat(timespec="seconds")),
+                     datetime.now().isoformat(timespec="seconds"),
+                     field, ov[:500], nv[:500], event_id),
                 )
         except sqlite3.Error as exc:
             print(f"[ledger] 账本写入失败（数值本身已生效）: {exc}")
 
     def recent_ledger(self, session_id: str, n: int = 8) -> List[dict]:
-        """最近 n 条账本，旧 -> 新。S10 氛围线从这里聚合趋势。"""
+        """最近 n 条账本，旧 -> 新。S10 氛围线从这里聚合趋势。
+
+        R15a：新增 field/old_value/new_value/event_id 键（additive）；旧键
+        语义不变——field 非 intimacy 的行，old/new/delta 旧键恒为 0，消费方
+        需按 field 过滤（现有消费方只读 intimacy 语义，不受影响）。
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT old_score, new_score, delta, reason, source_quote, created_at "
+                "SELECT old_score, new_score, delta, reason, source_quote, created_at, "
+                "field, old_value, new_value, event_id "
                 "FROM affection_history WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, n),
             ).fetchall()
-        return [
-            {"old": r[0], "new": r[1], "delta": r[2], "reason": r[3],
-             "quote": r[4], "time": r[5]}
-            for r in reversed(rows)
-        ]
+        result = []
+        for r in reversed(rows):
+            entry = {
+                "old": r[0], "new": r[1], "delta": r[2], "reason": r[3],
+                "quote": r[4], "time": r[5],
+                "field": r[6] or "intimacy",
+                "old_value": r[7], "new_value": r[8], "event_id": r[9] or "",
+            }
+            result.append(entry)
+        return result
 
     # ---------- 记忆候选池（S4）：入池计数 / 晋升标记 / 过期清理 ----------
 
