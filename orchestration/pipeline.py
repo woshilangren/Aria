@@ -759,7 +759,9 @@ class DialoguePipeline:
             # 而是把闭包列表带回来由这里（持有 loop 的一方）调度——I11
             deferred = await asyncio.to_thread(self._writeback, state, handle)
             self._check_cancel(handle)
-            _schedule_bg_writeback(deferred)
+            # R18a 旧适配器：协调器现返回 DeferredTask 载荷，legacy 路径解包
+            # fn（新入口 schedule_commit_tasks 由 R17b 接线后取代此适配器）
+            _schedule_bg_writeback([t.fn for t in deferred])
 
             # ⑤ _wants_voice 兜底：用户点名要语音但整轮没出 <voice>，用简短正文补一条
             if want_voice and not voice_emitted:
@@ -802,7 +804,9 @@ class DialoguePipeline:
                 state.final_reply = state.canonical_text
             deferred = await asyncio.to_thread(self._writeback, state, handle)
             self._check_cancel(handle)
-            _schedule_bg_writeback(deferred)
+            # R18a 旧适配器：协调器现返回 DeferredTask 载荷，legacy 路径解包
+            # fn（新入口 schedule_commit_tasks 由 R17b 接线后取代此适配器）
+            _schedule_bg_writeback([t.fn for t in deferred])
             yield {"type": "refuse", "text": r.text, "replace": True,
                    "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}

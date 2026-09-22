@@ -4,7 +4,20 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+
+@dataclass
+class DeferredTask:
+    """后台待办载荷（R18a）：绑定任务种类与可调用体。
+
+    kind ∈ portrait / identity_freeze / summary——调度入口以
+    (turn_id, kind) 造幂等键；fn 是无参闭包（后台线程执行）。
+    只属于**已拿到 committed 回执的轮**：未提交/取消/降级轮不产生载荷。
+    """
+
+    kind: str
+    fn: Callable
 
 
 @dataclass

@@ -26,7 +26,48 @@ from capability.memory import (
 from capability import self_identity
 from config.settings import load_app_config
 from shared.singletons import services
+from shared.types import DeferredTask
 from tools.speech import split_emotion, strip_emotion_marks
+
+# R18a：后台待办的任务种类。载荷绑定 (turn_id, kind) 幂等键——同一轮的
+# 同类任务重启/重试最多登记一次。
+TASK_PORTRAIT = "portrait"
+TASK_IDENTITY_FREEZE = "identity_freeze"
+TASK_SUMMARY = "summary"
+
+# 内存调度登记：task_key -> {"turn_id", "kind"}。R18a 明确**只做内存调度**，
+# 进程退出即丢（持久化与恢复是 R19 的活）——这里绝不谎称已可靠投递。
+_COMMIT_TASK_REGISTRY: dict = {}
+
+
+def make_task_key(turn_id: str, kind: str, target: str = "") -> str:
+    """派生任务的幂等键：源轮 + 种类 + 目标（R18b 会加目标版本/来源范围）。"""
+    return f"{turn_id}:{kind}:{target}" if target else f"{turn_id}:{kind}"
+
+
+def schedule_commit_tasks(receipt: dict, tasks: list) -> list:
+    """R18a 新调度入口：**只认 committed 回执**——未提交/取消/失败/降级轮
+    的待办一律不调度。返回本次实际要执行的 fn 列表（去重后）。
+
+    不能继续把"旧 handle 被新轮取消"当作丢弃旧已提交任务的理由：
+    调度资格只看回执，不看 handle 状态（取消语义归 CommitGate）。
+    """
+    if receipt.get("status") != "committed":
+        return []
+    turn_id = receipt.get("turn_id") or ""
+    runnable = []
+    for task in tasks:
+        key = make_task_key(turn_id, task.kind)
+        if key in _COMMIT_TASK_REGISTRY:
+            continue  # 幂等：同轮同类任务只登记一次
+        _COMMIT_TASK_REGISTRY[key] = {"turn_id": turn_id, "kind": task.kind}
+        runnable.append(task.fn)
+    return runnable
+
+
+def pending_commit_tasks() -> dict:
+    """内存登记表只读视图（测试/观测用）。"""
+    return dict(_COMMIT_TASK_REGISTRY)
 
 
 def _expression_cfg() -> dict:
@@ -64,10 +105,6 @@ def _check_cancel(handle) -> None:
 
     if handle is not None and handle.is_cancelled():
         raise TurnCancelled(f"turn {handle.turn_id} cancelled")
-
-
-def _schedule_ready(deferred) -> list:
-    return deferred
 
 
 class WritebackCoordinator:
@@ -230,7 +267,7 @@ class WritebackCoordinator:
         # 你还要等她做完笔记。这里**只把待办闭包打包返回**，由 astream（持有
         # running loop 的一方）create_task 调度——写回自己跑在工作线程里，
         # 线程内没有事件循环，在这里调度会退化成同步执行（I11，实测踩中）。
-        deferred = []
+        deferred: list = []  # DeferredTask 载荷（R18a）：绑定 (turn_id, kind) 幂等键
         interval = _portrait_interval()
         if rel.get("interaction_count", 0) % interval == 0:
             context_snapshot = self._keeper.get_context(session_id)[-6:]
@@ -240,7 +277,7 @@ class WritebackCoordinator:
                     return  # 迟到的取消：什么都不写
                 PortraitBuilder().refresh(sid, ctx)
 
-            deferred.append(_bg_portrait)
+            deferred.append(DeferredTask(kind=TASK_PORTRAIT, fn=_bg_portrait))
 
         # 她自己的身份冻结（批次0"种子+涌现"）：从她刚说的话里定下名字/年龄/
         # 城市/职业/住处（只收她亲口说的、只填空不改口），第 3 轮后提炼一次
@@ -262,7 +299,7 @@ class WritebackCoordinator:
             self_identity.maybe_freeze(sid, text, recent_her_lines=lines,
                                        interaction_count=count, user_text=asked)
 
-        deferred.append(_bg_freeze)
+        deferred.append(DeferredTask(kind=TASK_IDENTITY_FREEZE, fn=_bg_freeze))
 
         # J12：短期记忆的摘要不再内联在 append_turn 里（那是一次秒级 LLM 调用，
         # 阻塞在写回路径上）。append_turn 只登记待办，这里打包成后台闭包，
@@ -273,5 +310,5 @@ class WritebackCoordinator:
                     return  # 迟到的取消：什么都不写
                 self._keeper.run_pending_summary(sid)
 
-            deferred.append(_bg_summary)
+            deferred.append(DeferredTask(kind=TASK_SUMMARY, fn=_bg_summary))
         return deferred

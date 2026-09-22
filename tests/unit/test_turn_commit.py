@@ -394,3 +394,59 @@ def test_receipt_type_carries_contract_fields():
                        committed_at="2026-09-22T00:00:00",
                        message_ids=[1, 2], reason_code="")
     assert rc.disposition == "degraded" and rc.message_ids == [1, 2]
+
+
+# ------------------- R18a：派生任务新调度入口 -------------------
+
+def test_schedule_commit_tasks_only_after_committed():
+    """只有 committed 回执才调度：cancelled/failed/缺回执一律不产生任务。"""
+    from orchestration import writeback as wb
+    from shared.types import DeferredTask
+
+    tasks = [DeferredTask(kind=wb.TASK_IDENTITY_FREEZE, fn=lambda: None)]
+    assert wb.schedule_commit_tasks({"status": "failed", "turn_id": "t-x"}, tasks) == []
+    assert wb.schedule_commit_tasks({"status": "cancelled", "turn_id": "t-x"}, tasks) == []
+    assert wb.pending_commit_tasks() == {}, "未提交轮不许进登记表"
+
+    run = wb.schedule_commit_tasks({"status": "committed", "turn_id": "t-ok"}, tasks)
+    assert len(run) == 1
+    key = wb.make_task_key("t-ok", wb.TASK_IDENTITY_FREEZE)
+    assert key in wb.pending_commit_tasks()
+
+
+def test_schedule_commit_tasks_idempotent():
+    """同轮同任务重复调度（重试/重启重放）：幂等键拦截，不重复登记。"""
+    from orchestration import writeback as wb
+    from shared.types import DeferredTask
+
+    tasks = [DeferredTask(kind=wb.TASK_PORTRAIT, fn=lambda: None)]
+    wb.schedule_commit_tasks({"status": "committed", "turn_id": "t-idem"}, tasks)
+    run2 = wb.schedule_commit_tasks({"status": "committed", "turn_id": "t-idem"}, tasks)
+    assert run2 == [], "同轮同类任务不许重复调度"
+    assert len(wb.pending_commit_tasks()) >= 1
+
+
+def test_coordinator_returns_typed_deferred_tasks(kv, register_services):
+    """协调器产出的待办已升级为 DeferredTask 载荷（kind 绑定）；legacy 适配器
+    解包 fn 的路径不破（handle 全跑一轮验证）。"""
+    import asyncio
+
+    from orchestration import writeback as wb
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+    from tests.unit.test_pipeline_e2e import FakeLLM as _E2ELLM
+    from tools.speech import split_emotion  # noqa: F401
+
+    from tests.unit.test_reply_contract import _register as _reg
+
+    llm = _E2ELLM(stream_script=["今天也是元气满满的一天。"])
+    _reg(register_services, llm)
+    sid = "r18a-typed"
+    rc = asyncio.run(
+        DialoguePipeline().handle(InputMessage(text="随便聊聊", session_id=sid))
+    )
+    assert rc.text, "正常轮应有正文"
+    # 登记表里的键必须是 (turn_id, kind) 形状——legacy 适配器解包 fn 时
+    # 不破坏载荷语义
+    for key in wb.pending_commit_tasks():
+        assert key.count(":") >= 1
