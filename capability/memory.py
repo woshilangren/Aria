@@ -76,12 +76,22 @@ def remember_note(session_id: str, content: str, kind: str = "event",
         peak_moment=ClockTool().now() if feeling else "",
     )
     try:
-        services.get("vector_store").upsert_memory(item)
+        ok = services.get("vector_store").upsert_memory(item)
     except Exception as exc:
         # J12：向量库挂了聊天照常，但这正是"静默遗忘"——调用方那边状态可能
         # 已经改了、长期记忆却没落，两边不一致且以前无任何痕迹。现在落一条
         # 待重试标记进补偿队列（队列没落地时至少日志留痕），不许无声蒸发。
         logger.warning(f"[memory] 长期记忆写入向量库失败（kind={kind}）: {exc}")
+        _enqueue_retry("vector_memory", dict(getattr(item, "__dict__", {}) or {}))
+        return
+    # R04：只有明确 True 才算成功。upsert_memory 的 False（集合未装配、内部
+    # 写失败）以前被无声丢弃——异常走了补偿挂点、False 却蒸发，正是
+    # "False 返回未消费"的缺口。现在 False 与异常走同一个可观测失败入口：
+    # 一次失败最多登记一次（upsert_memory 内部只告警不登记，登记权在本层）。
+    # 现阶段只接现有告警/补偿挂点，持久队列与重试消费是 R19 的活。
+    if ok is not True:
+        logger.warning(f"[memory] 长期记忆写入向量库未成功（kind={kind}，"
+                       f"返回 {ok!r}），落待重试标记")
         _enqueue_retry("vector_memory", dict(getattr(item, "__dict__", {}) or {}))
 
 

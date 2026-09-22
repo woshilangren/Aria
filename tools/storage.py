@@ -338,6 +338,10 @@ class VectorStoreTool:
                 pass
 
     def upsert_memory(self, item: MemoryItem) -> bool:
+        """写一条长期记忆。契约（R04）：**明确 True 才算成功**；False 表示
+        失败（集合未装配 / 内部写失败，内部已告警），调用方必须消费这个
+        False——走它自己的失败入口，不许当成功吞掉。异常向上抛（同样必须
+        被调用方消费），本方法不自作主张吞异常。"""
         col = self._col_of(_DISTILLED_COLLECTION)
         if col is None:
             return False

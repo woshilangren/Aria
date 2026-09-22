@@ -207,3 +207,54 @@ def test_self_identity_unaffected_by_life(kv):
     rec = kv.read("self", "t1")
     assert not rec.get("name")
     assert char_life.get("t1").get("shape")
+
+
+# ------------------- R04：向量写入失败结果必须被消费 -------------------
+
+class _VectorStub:
+    """向量库替身：可脚本化返回值/异常。"""
+
+    def __init__(self, result=True, exc=None):
+        self.result = result
+        self.exc = exc
+        self.calls = 0
+
+    def upsert_memory(self, item):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+def _remember_with(monkeypatch, vector):
+    """注册替身向量库并拦截 _enqueue_retry，返回 (记录列表, 记录器调用数)。"""
+    from capability import memory as mem_mod
+    from shared.singletons import services
+
+    registered = []
+    monkeypatch.setattr(mem_mod, "_enqueue_retry", lambda kind, payload: registered.append((kind, payload)))
+    services.register("vector_store", vector)
+    mem_mod.remember_note("r04-session", "一条值得记住的事", kind="event")
+    return registered, vector
+
+
+def test_remember_note_false_is_consumed(monkeypatch):
+    """upsert 返回 False（集合未装配/内部失败）→ 走失败入口登记一次。"""
+    registered, vector = _remember_with(monkeypatch, _VectorStub(result=False))
+    assert vector.calls == 1
+    assert len(registered) == 1, f"False 必须消费且只登记一次，实测 {registered}"
+    assert registered[0][0] == "vector_memory"
+    assert "一条值得记住的事" in registered[0][1].get("content", "")
+
+
+def test_remember_note_exception_is_consumed(monkeypatch):
+    """upsert 抛异常 → 同一个失败入口登记一次（不许无声蒸发）。"""
+    registered, vector = _remember_with(monkeypatch, _VectorStub(exc=RuntimeError("chroma down")))
+    assert vector.calls == 1
+    assert len(registered) == 1
+
+
+def test_remember_note_true_enqueues_nothing(monkeypatch):
+    """明确 True 才算成功：成功路径零补偿登记。"""
+    registered, _v = _remember_with(monkeypatch, _VectorStub(result=True))
+    assert registered == [], "成功不许排重试"
