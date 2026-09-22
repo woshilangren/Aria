@@ -73,12 +73,14 @@ def fake_services(register_services):
     return fake_llm, fake_tts
 
 
-def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, fake_services):
-    """handle() 主路径能跑完 + 返回非空 reply。
+def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, register_services):
+    """降级冒烟（B3，R27b 语义更新）：主备 LLM 全挂（窄载体）→ handle 萰兜底话。
 
-    容忍 FallbackController 路径：FakeLLM 注册了但 pipeline 仍可能因为
-    其他子系统（persona_config 缺失、memory 召回失败等）走 fallback。
-    只要 handle 不崩 + reply 非空，就证明主链路串联通过——这正是 B3 想要的保证。
+    以前这条"容忍任何原因的非空 reply"——R27b 之后不允许那么含糊：
+    - 外部服务失败（ExternalServiceError）→ 允许的降级，handle 返回 llm 兜底话；
+    - 本地缺陷（内部错误）→ handle 抛 PipelineInternalError（见
+      test_failure_contract.py），**不**算降级成功。
+    这条钉住前一半：LLM 抛窄载体，handle 仍返回非空兜底、不崩、不冒泡。
     """
     # 重置 Settings cache 让 DATA_DIR 改动生效
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
@@ -89,8 +91,27 @@ def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, fake_services):
 
     # 重置 KEEPER 防止跨用例串味
     from orchestration.pipeline import KEEPER, DialoguePipeline
+    from shared.singletons import services
+    from shared.types import ExternalServiceError
+    from tools.storage import KVStoreTool
 
     KEEPER.restore("b3-e2e-session")
+
+    class _AllProvidersDownLLM:
+        """主备全挂（窄载体）：astream/chat 全部抛 ExternalServiceError。"""
+
+        async def astream_chat(self, messages, **kwargs):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+            yield  # pragma: no cover —— 仅为成为 async 生成器
+
+        def chat(self, messages, temperature=None, max_tokens=None):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+
+        def chat_with_tools(self, messages, tools_catalog):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+
+    register_services(kv_store=KVStoreTool(), llm=_AllProvidersDownLLM(),
+                      tts=FakeTTS())
 
     import asyncio
 
@@ -99,7 +120,7 @@ def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, fake_services):
     reply = asyncio.run(pipeline.handle(msg))
 
     assert reply is not None, "handle 必须返回 FinalReply"
-    assert reply.text != "", f"reply.text 必须非空，实测 {reply.text!r}"
+    assert reply.text != "", f"降级后 reply 必须非空（llm 兜底话），实测 {reply.text!r}"
 
     # 降级冒烟到此为止（保留）。R05b：原来这里还有一条
     # `assert total_llm_calls >= 0`——恒真的死断言，什么都不证明，已删。
@@ -373,17 +394,18 @@ def test_tool_reject_refuse_reason_no_draft(register_services, monkeypatch):
 
 
 def test_pipeline_error_event_whitelisted(register_services, monkeypatch):
-    """服务失败：error 事件只给固定安全文案 + 有限错误码，不回 str(exc)。
-    原因码区分：审核拒绝=refuse.review_output_blocked，服务失败=error.pipeline_error。"""
+    """外部服务失败：error 事件只给固定安全文案 + 有限错误码，不回 str(exc)。
+    原因码区分：审核拒绝=refuse.review_output_blocked，外部失败=external_degraded，
+    程序错误=internal_error（详见 test_failure_contract.py）。"""
     from orchestration.pipeline import DialoguePipeline
-    from shared.types import InputMessage
+    from shared.types import ExternalServiceError, InputMessage
     from tools.storage import KVStoreTool
 
     register_services(kv_store=KVStoreTool(), llm=FakeLLM(stream_script=["正常一句话。"]),
                       tts=FakeTTS())
 
     def boom(self, state):  # noqa: ARG001
-        raise RuntimeError("内部装配细节SECRET-ERR")
+        raise ExternalServiceError("llm", "timeout", detail="内部细节SECRET-ERR")
 
     monkeypatch.setattr(DialoguePipeline, "_compose", boom)
     evs = _collect_stream(
@@ -392,6 +414,6 @@ def test_pipeline_error_event_whitelisted(register_services, monkeypatch):
     )
     _assert_no_leak(evs, "SECRET-ERR")
     errs = [e for e in evs if e.get("type") == "error"]
-    assert errs, f"装配错误必须出 error 事件，实测 {[(e.get('type')) for e in evs]}"
-    assert errs[0]["code"] == "pipeline_error"
+    assert errs, f"外部失败必须出 error 事件，实测 {[(e.get('type')) for e in evs]}"
+    assert errs[0]["code"] == "external_degraded"
     assert errs[0]["message"] == "这轮没接上，稍后再试试"

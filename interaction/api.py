@@ -12,11 +12,11 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from shared.types import InputMessage
+from shared.types import InputMessage, PipelineInternalError
 
 # 上传文件大小上限（20MB）；一次从上传流里读多少字节做累加校验。
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -262,7 +262,17 @@ async def send_message(payload: dict) -> dict:
     # 只认 /uploads/ 开头的相对图片地址；模型在云端拉不到本地，直接读文件转 base64 内嵌
     image_url = _sanitize_attachment(payload.get("attachment") or payload.get("image_url") or "")
     message = gateway["receiver"].receive(text, payload.get("session_id", "default"), image_url=image_url)
-    reply = await _get_orchestrator().handle(message)
+    try:
+        reply = await _get_orchestrator().handle(message)
+    except PipelineInternalError as exc:
+        # R27b：程序错误冒泡到请求边界——对外只给安全的 internal_error，生命周期
+        # 失败（不重跑模型/工具、不作为学习轮保存）。细节已在管道侧落日志。
+        logging.getLogger("aria").error("[chat] 内部错误（internal_error）: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "internal_error",
+                     "message": "这轮没接上，稍后再试试"},
+        )
     # render 内部有秒级同步网络调用，扔线程池，别堵住事件循环（否则并发语音通话一起僵死）
     data = await asyncio.to_thread(gateway["renderer"].render, reply, message.session_id)
     # 兜底：AI 这轮没给自己标语音、但用户明确点名要语音时，把简短正文也合一条语音；

@@ -11,7 +11,10 @@ import threading
 import time
 from typing import AsyncIterator
 
+import openai
 from openai import AsyncOpenAI, OpenAI
+
+from shared.types import ExternalServiceError
 
 from config.settings import get_settings, load_app_config
 
@@ -266,6 +269,10 @@ class LLMClient:
             # （这里曾真炸过一次：_probe_fail_streak 无上限时 2**n 会 OverflowError。
             # 现在指数由 _PROBE_BACKOFF_MAX_POW 封顶，但 try 的位置不许挪出去——
             # 下一个人再加一个会抛的计算时，靠的就是它。）
+            #
+            # R27b：只把 **openai SDK 的异常**当供应商失败计数并转 ExternalServiceError；
+            # TypeError/NameError 这类本地装配缺陷原样向上抛——它们不计入熔断、
+            # 不许伪装成"模型挂了"（参数分发/结果装配是本地计算，不是外部故障）。
             try:
                 self._apply_family_params(kwargs, self._family, thinking)
                 if is_probe:
@@ -277,7 +284,7 @@ class LLMClient:
                     self._opened_at = None
                     self._probe_fail_streak = 0
                 return resp
-            except Exception as exc:
+            except openai.OpenAIError as exc:
                 with self._cb_lock:
                     self._error_count += 1
                     last_error = exc
@@ -307,12 +314,17 @@ class LLMClient:
                 with self._cb_lock:
                     self._error_count = max(0, self._error_count - 1)
                 return resp
-            except Exception as exc:
+            except openai.OpenAIError as exc:
                 main_why = self._main_failure_text(last_error, cooling, probe_blocked)
-                raise RuntimeError(f"主模型和备用模型都挂了：主={main_why}，备={exc}") from exc
+                raise ExternalServiceError(
+                    "llm", "all_providers_failed", retryable=True,
+                    detail=f"主={main_why}，备={exc}",
+                ) from exc
 
         main_why = self._main_failure_text(last_error, cooling, probe_blocked)
-        raise RuntimeError(f"LLM 调用失败，也没配备用模型：{main_why}")
+        raise ExternalServiceError(
+            "llm", "no_provider_available", retryable=True, detail=main_why,
+        )
 
     # ---------- 对外：两个能力，签名永远不许变 ----------
     def chat(self, messages: list, temperature: float = None, max_tokens: int = None) -> str:
@@ -425,7 +437,8 @@ class LLMClient:
                     kwargs["timeout"] = self._probe_timeout_now()
                 try:
                     stream = await self._aclient.chat.completions.create(**kwargs)
-                except Exception as exc:
+                except openai.OpenAIError as exc:
+                    # R27b：只把 SDK 异常当供应商失败；本地装配缺陷原样上抛不计数
                     with self._cb_lock:
                         self._error_count += 1
                         last_error = exc
@@ -448,14 +461,19 @@ class LLMClient:
                             self._opened_at = None
                             self._probe_fail_streak = 0
                         return
-                    except Exception as exc:
+                    except openai.OpenAIError as exc:
                         with self._cb_lock:
                             self._error_count += 1
                             last_error = exc
                             if self._error_count >= self._max_errors:
                                 self._opened_at = time.monotonic()
                         if emitted:
-                            raise  # 已经吐过 token，换备用也接不上，交给上层收尾
+                            # R27b：吐过 token 换备用也接不上——统一转窄载体交给上层
+                            # 收尾（管道按"外部服务失败"走允许的降级，不计内部错误）
+                            raise ExternalServiceError(
+                                "llm", "stream_interrupted", retryable=False,
+                                detail=str(exc),
+                            ) from exc
                         # 一个 token 都没吐：落到下面走备用
             finally:
                 # J5：主模型的流必须在**每一条**退出路径上都关掉。三个漏点：
@@ -478,23 +496,37 @@ class LLMClient:
             kwargs["model"] = self._fallback_model
             try:
                 stream = await self._afallback.chat.completions.create(**kwargs)
-            except Exception as exc:
+            except openai.OpenAIError as exc:
                 main_why = self._main_failure_text(last_error, cooling, probe_blocked)
-                raise RuntimeError(f"主模型和备用模型都挂了（流式）：主={main_why}，备={exc}") from exc
+                raise ExternalServiceError(
+                    "llm", "all_providers_failed", retryable=True,
+                    detail=f"主={main_why}，备={exc}",
+                ) from exc
+            emitted = False
             try:
                 async for chunk in stream:
                     delta = self._delta_of(chunk)
                     if delta:
+                        emitted = True
                         yield delta
                 with self._cb_lock:
                     self._error_count = max(0, self._error_count - 1)  # 备用成功，错误计数衰减（同同步路径）
+            except openai.OpenAIError as exc:
+                # R27b：备用流中途断流同样转窄载体——以前这里裸抛 SDK 异常，
+                # 管道会把它误分成 internal_error（程序错误），污染错误语义
+                raise ExternalServiceError(
+                    "llm", "stream_interrupted", retryable=False,
+                    detail=f"备用流中断（已出 {emitted}）：{exc}",
+                ) from exc
             finally:
                 # 备用的流也一样要关：断连/中途抛同样会把它丢在半路（与主模型同一类漏）
                 await _aclose_quietly(stream)
             return
 
         main_why = self._main_failure_text(last_error, cooling, probe_blocked)
-        raise RuntimeError(f"LLM 流式调用失败，也没配备用模型：{main_why}")
+        raise ExternalServiceError(
+            "llm", "no_provider_available", retryable=True, detail=main_why,
+        )
 
     @staticmethod
     def _delta_of(chunk) -> str:

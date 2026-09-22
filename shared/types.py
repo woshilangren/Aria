@@ -7,6 +7,36 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+class ExternalServiceError(RuntimeError):
+    """外部服务失败（R27b 窄错误载体），由各适配器在**最窄的边界**转换而来。
+
+    - source：哪个服务（llm / asr / tts / vector …）；reason_code：有限原因码；
+    - retryable：是否值得自动重试；detail 只进日志，**不进任何对外字段**。
+
+    下游只对这一类异常进入备用/模板降级（兜底哲学：兜底只适用外部服务失败）。
+    NameError / TypeError / AttributeError 等本地缺陷**绝不许**包装成它——
+    那类错误走 PipelineInternalError 的路：向上冒泡、生命周期失败。
+    """
+
+    def __init__(self, source: str, reason_code: str,
+                 retryable: bool = True, detail: str = ""):
+        super().__init__(f"[{source}/{reason_code}]")
+        self.source = source
+        self.reason_code = reason_code
+        self.retryable = retryable
+        self.detail = detail
+
+
+class PipelineInternalError(RuntimeError):
+    """本地编程缺陷冒泡到请求边界的载体（R27b）。
+
+    对用户只返回安全的 internal_error；生命周期失败：不重跑模型/付费工具、
+    不作为 normal/degraded 学习轮保存。`handle()` 的 error 消费分支必须
+    保留它——不能重新包成一个看似成功的 FinalReply 兜底（那会把 bug 变成
+    "她说了句奇怪的话"，和 A2 事故是同一类病）。
+    """
+
+
 @dataclass
 class MemoryBundle:
     """一次回忆打捞上来的所有东西。"""

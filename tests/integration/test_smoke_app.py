@@ -98,6 +98,27 @@ def test_relationship_endpoint_exposes_mood(client):
     assert "mood_baseline" not in body
 
 
+def test_internal_error_returns_safe_500(client, monkeypatch):
+    """接口层：程序错误（NameError）→ 500 + internal_error 安全响应，
+    不被二次兜底成 200 成功回复（R27b 验收：astream/handle/接口层三层验证）。"""
+    from orchestration.pipeline import DialoguePipeline
+
+    def boom(self, state):  # noqa: ARG001
+        raise NameError("接口层注入的本地缺陷XYZ")
+
+    monkeypatch.setattr(DialoguePipeline, "_compose", boom)
+    resp = client.post(
+        "/api/chat/send",
+        json={"text": "随便聊聊", "session_id": "r27b-api"},
+        headers={"X-Access-Token": TEST_TOKEN},
+    )
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body.get("error") == "internal_error"
+    # 本地缺陷细节不外泄
+    assert "XYZ" not in resp.text
+
+
 def test_voice_control_failure_sends_fixed_text(client, monkeypatch):
     """WS 换音色控制失败：对外只发固定安全文案，str(exc) 细节不外泄（R27a）。
 

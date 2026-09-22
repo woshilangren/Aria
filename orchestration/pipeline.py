@@ -39,10 +39,12 @@ from typing import AsyncIterator, Optional
 
 from shared.types import (
     EmotionResult,
+    ExternalServiceError,
     FinalReply,
     InputMessage,
     IntentResult,
     MemoryBundle,
+    PipelineInternalError,
     PerceptionExtras,
     PromptPackage,
 )
@@ -599,6 +601,7 @@ class DialoguePipeline:
         output_mode = "text"
         image_path = ""
         cancelled = False
+        error_code = ""  # R27b：error 事件的有限错误码，循环后统一裁决
 
         # astream 内部 finally 会调 TURN_REGISTRY.finish（详见 CLAUDE.md 关键单例）；
         # 显式 try/finally 保证 error 分支提前 return 时也立即收尾，
@@ -627,13 +630,25 @@ class DialoguePipeline:
                 elif t == "cancelled":
                     cancelled = True
                 elif t == "error":
-                    return FinalReply(text=FallbackController().fallback_reply("llm"))
+                    # R27b：internal_error 必须保留身份冒泡，绝不许在这里重新包成
+                    # "看似成功"的 FinalReply 兜底；外部降级才允许落 llm 兜底话
+                    error_code = ev.get("code") or "pipeline_error"
         finally:
             await _astream.aclose()
 
         if cancelled:
             # 取消不当异常兜底成 llm 兜底话：这轮当没发生过，给个空回复
             return FinalReply(text="")
+
+        if error_code == "internal_error":
+            # R27b：本地缺陷冒泡到请求边界——接口层映射成安全的 internal_error
+            # 响应。绝不重新包成"看似成功"的 FinalReply 兜底（bug 会变成
+            # "她说了句奇怪的话"还被写进记忆，A2 事故的复发路径）。
+            raise PipelineInternalError("internal_error")
+        if error_code:
+            # 外部服务失败（external_degraded / 兼容旧 pipeline_error）：允许的
+            # 降级——llm 兜底话，聊天不断
+            return FinalReply(text=FallbackController().fallback_reply("llm"))
 
         frags.sort(key=lambda x: x[0])
         body = "".join(
@@ -762,13 +777,21 @@ class DialoguePipeline:
             yield {"type": "refuse", "text": r.text, "replace": True,
                    "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}
+        except ExternalServiceError as exc:
+            # R27b：外部服务失败——允许的降级路径。细节（来源/原因码）进日志，
+            # 对外只给固定文案 + 有限错误码（R27a 的输出边界规则继续适用）。
+            _log_exc(f"astream 外部服务失败（{exc.source}/{exc.reason_code}）")
+            yield {"type": "error", "code": "external_degraded",
+                   "message": "这轮没接上，稍后再试试"}
         except Exception:
-            # R27a：对外只给固定安全文案 + 有限错误码。以前 message=str(exc) 直接
-            # 推给前端（前端原样上屏），等于把内部异常细节/供应商响应当回复发出去。
-            # 内部细节走 _log_exc 进日志排查；原因码区分服务失败（pipeline_error）
-            # 与审核拒绝（refuse 事件的 review_output_blocked）。
-            _log_exc("astream 本轮失败")
-            yield {"type": "error", "code": "pipeline_error",
+            # R27b：本地缺陷（NameError/TypeError/装配错误…）——生命周期失败：
+            # 记录 traceback 与关联 ID，对外只给安全的 internal_error。
+            # 不重跑模型/付费工具、不作为学习轮保存：写回只发生在 try 路径与
+            # _RefuseTurn 分支，走到这里说明本轮什么业务提交都没发生。
+            # CancelledError/TurnCancelled/GeneratorExit 继承 BaseException 或已在
+            # 上方单独捕获，控制流不会被这条盖掉。
+            _log_exc("astream 内部错误（internal_error）")
+            yield {"type": "error", "code": "internal_error",
                    "message": "这轮没接上，稍后再试试"}
         finally:
             self._turns.finish(message.session_id, handle.turn_id)
@@ -894,20 +917,23 @@ class DialoguePipeline:
             # 一个 token 都没推、重写额度也用尽 → 整轮降级
             state.was_poor = True
             raise _RefuseTurn(fallback_line("review", state.session_id, default=FallbackController().fallback_reply("review")))
-        except Exception:
-            # 主/备模型都挂了，或中途断流。
+        except ExternalServiceError as exc:
+            # 主/备模型都挂了，或中途断流（R27b：只有窄载体才配走降级——
+            # llm_client 的 SDK 边界已把网络/超时/协议故障统一转成这个类型）。
             # J2：**这条路径以前完全静默**——A2 的 5 处裸 `session_id` NameError 就是被它
             # 吞掉的：任何编程错误都会被转成一次兜底重发，看起来像"模型挂了"，
             # 而兜底文本还会被写回记忆，污染"她说过什么"。降级行为本身是对的
-            # （兜底哲学：聊天不能断），但**不能哑**——至少要留下 traceback。
-            _log_exc("_astream_chat 降级")
+            # （兜底哲学：聊天不能断），但**不能哑**——至少要留下来源与 traceback。
+            _log_exc(f"_astream_chat 外部服务失败降级（{exc.source}/{exc.reason_code}）")
             if streamer.emitted_content:
                 # 已经推过内容：接不上，按现有内容收尾
                 async for ev in self._emit_frags(streamer.finish(), state, handle, synthesize_voice, seq):
                     yield ev
                 state.final_reply = "".join(raw_parts)
                 return
-            # 一个 token 都没推：退回 generate() 的兜底话（含人设覆盖），当成整段重发
+            # 一个 token 都没推：退回 generate() 的兜底话（含人设覆盖），当成整段重发。
+            # generate() 若也抛 ExternalServiceError（备用全挂），向上交给 astream 分流；
+            # 它若抛本地缺陷，同 upward——两者都不许在这里被吞。
             fallback = await asyncio.to_thread(
                 generate, state.prompt, _enrich_telegraph(user_text), extra, state.user_image
             )
