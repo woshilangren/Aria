@@ -32,6 +32,21 @@ _DISTILLED_COLLECTION = "distilled_memory"
 _DIARY_COLLECTION = "diary"
 
 
+def _norm_embeddings(value):
+    """把 Chroma 返回的 embeddings 归一成可切片的列表；空/None 归一成 []。
+
+    为什么不能用 `or []`：Chroma（1.x）`get(include=["embeddings"])` 返回的是
+    **ndarray**，对它做真值判断直接抛 "truth value of an array is ambiguous"。
+    崩点还偏偏在**旧集合已删之后**（迁移的复制阶段）——抛了就留下"主集合空、
+    `__migrating` 里还有全量数据"的半迁移现场，下次启动因 metadata 匹配直接
+    接受空集合（R01a 隔离探针复现过）。所以这里只用 None 判断 + len()：
+    list 和 ndarray 都安全，真值判断一个都不做。
+    """
+    if value is None:
+        return []
+    return value if len(value) > 0 else []
+
+
 class VectorStoreTool:
     """长期记忆的存取：写入按向量存，查询按语义搜。
 
@@ -118,7 +133,7 @@ class VectorStoreTool:
         final = self._chroma.get_collection(collection_name, metadata=metadata)
         copied = tmp.get(include=["embeddings", "documents", "metadatas"])
         c_ids = copied.get("ids") or []
-        c_vecs = copied.get("embeddings") or []
+        c_vecs = _norm_embeddings(copied.get("embeddings"))
         c_docs = copied.get("documents") or []
         c_metas = copied.get("metadatas") or []
         for i in range(0, len(c_ids), EMBED_BATCH_SIZE):
