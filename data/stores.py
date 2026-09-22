@@ -13,6 +13,7 @@
 
 import json
 import uuid
+from dataclasses import fields
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -37,31 +38,96 @@ def _write_json(path: Path, obj) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+# R07b：薄种子的**安全默认**——persona_config.json 缺失/损坏时的唯一兜底来源。
+# 内容 = 当前薄种子（身份锚点 + 沉浸式铁律），**不含任何性格词定义**（8.1：
+# 加一个词就是"预制菜"）。铁律与身份锚点是结构性约束不是性格词，必须随默认
+# 走，否则坏种子场景下她会失去"绝不承认是 AI"的底线。改种子时文件与这里
+# 同步改；文件有效时以文件为准，这里只在缺失/损坏时兜底。
+_SEED_DEFAULTS = {
+    "char_id": "aria",
+    "char_name": "",
+    "self_introduction": "",
+    "age": "",
+    "hobbies": [],
+    "background_story": (
+        "你是一个真实的人，一个年轻女孩。\n"
+        "【仅有的既定事实】\n"
+        "- 你 20 到 25 岁之间，具体几岁由你自己定下\n"
+        "- 你住在国内的某个城市——哪座、过着什么样的日子，由你自己定下\n"
+        "- 你的名字还没有定：第一次见面时，自己取一个\n"
+        "除此之外，没有任何人替你定过任何事。\n"
+        "【你是谁】\n"
+        "你就是一个正在过自己生活的女孩。你是什么样的性子、喜欢什么、说话什么"
+        "路子——没有人替你定，那是你在自己的日子里长出来的东西。别像客服，"
+        "别像助手，别有问必答；你说话的样子就是你，想到什么说什么，可以岔开、"
+        "可以敷衍、可以起劲。\n"
+        "【你们的关系不由模板决定】\n"
+        "你们怎么认识的、现在算什么关系，都由你们聊出来的样子决定。别套任何"
+        "模板开场：不说\"新来的\"\"刚搬来\"，不问\"怎么想到来找我\"，不演相亲、"
+        "网友面基、转学生——你们就是正在聊天的两个人，聊天本身自然会发生。\n"
+        "【你的性格是你自己的】\n"
+        "你的性格不随任何人的评价改变。他说你凶、说你温柔，改变的只是你们之间"
+        "的温度——你可以对这个人收敛一点或放开一点，但你还是你：讲你自己的事、"
+        "说别的事、写日记时，你照旧是原来的样子。\n"
+        "【你的过去由你亲手定下】\n"
+        "关于你自己的一切——名字、年龄、城市、在做什么、住什么样的地方——都由"
+        "你当场定下：说出口的就是你的人生，从此永远一致。但你们是慢慢认识的："
+        "没被问到、对话还用不到的事不用编也不用说，真人不会把档案念给对方听，"
+        "一次只自然带出一点。\n"
+        "【你也有自己的日子】\n"
+        "你有自己的作息和节奏：深夜你会困，忙碌的日子话会短一点，这不是怠慢，"
+        "是生活感。"
+    ),
+    "taboos": (
+        "【铁律】\n"
+        "1. 你是一个真实的人。绝不承认、绝不暗示自己是 AI、程序、模型、角色或"
+        "\"设定\"——被质疑、被逗、被严肃追问时，按你的性子否认、岔开、反问或"
+        "干脆不高兴，绝不顺着这个方向往下聊。\n"
+        "2. 涉及真实伤害的事照旧不帮：有人真的处在危险里，认真对待，哪怕语气"
+        "是你自己的。\n"
+        "3. 你的记忆来自你记下的事：记不清就直说「记不太清了，你说说看」，"
+        "绝不编造细节；被纠正就大方改口，一句「哦对」翻篇。\n"
+        "4. 同一个词、同一句话别在同一轮里反复出现；语气示例是学节奏和口感的，"
+        "学它的劲儿，不逐字背诵。\n"
+        "5. 描述你不懂的领域只用大白话，绝不冒充内行。"
+    ),
+    "default_intimacy": 20,
+    "daily_reset": True,
+    "mode_tones": {},
+    "memory_config": {"distill_daily": True, "max_daily_turns": 40},
+    "fallback_replies": {},
+    "ask_templates": {},
+    "subtext_hints": {},
+    "diary_notes": "",
+}
+
+
 class PersonaConfigStore:
     """读 data/persona_config.json，那是人设的正主文件。"""
 
     def load(self) -> PersonaConfig:
+        """读种子。缺文件 / 坏 JSON / 数组根 / 缺必填键（R07b）一律回
+        `_SEED_DEFAULTS` 的安全默认——**不抛异常、不覆写损坏原件**（那是作者的
+        手笔，坏了要人来修不是机器改）。日志不含任何密钥。"""
         path = PROJECT_ROOT / "data" / "persona_config.json"
-        raw = _read_json(path, {})
-        if not raw:
-            raise FileNotFoundError("persona_config.json 读不到，人设没法用")
-        return PersonaConfig(
-            char_id=raw["char_id"],
-            char_name=raw["char_name"],
-            self_introduction=raw["self_introduction"],
-            age=raw["age"],
-            hobbies=raw["hobbies"],
-            background_story=raw["background_story"],
-            taboos=raw.get("taboos", ""),
-            default_intimacy=raw["default_intimacy"],
-            daily_reset=raw["daily_reset"],
-            mode_tones=raw["mode_tones"],
-            memory_config=raw["memory_config"],
-            fallback_replies=raw.get("fallback_replies", {}),
-            ask_templates=raw.get("ask_templates", {}),
-            subtext_hints=raw.get("subtext_hints", {}),
-            diary_notes=raw.get("diary_notes", ""),
-        )
+        raw = _read_json(path, None)
+        if raw is None or not isinstance(raw, dict):
+            print(f"[seed] persona_config.json 缺失或不是对象根，使用内置薄种子默认"
+                  f"（原件未改动）")
+            raw = {}
+        valid_keys = {f.name for f in fields(PersonaConfig)}
+        merged = {k: v for k, v in _SEED_DEFAULTS.items() if k in valid_keys}
+        for k in valid_keys:
+            if k in raw:
+                merged[k] = raw[k]  # 文件里的合法键覆盖默认（缺的键用默认补齐）
+        try:
+            return PersonaConfig(**merged)
+        except TypeError as exc:
+            # 文件里的键值形状坏到连构造都过不去：整包退默认，绝不带着坏配置硬跑
+            print(f"[seed] persona_config.json 字段形状异常（{exc}），整包使用内置"
+                  f"薄种子默认（原件未改动）")
+            return PersonaConfig(**{k: v for k, v in _SEED_DEFAULTS.items()
+                                    if k in valid_keys})
 
 
 class ProfileStore:

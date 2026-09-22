@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -111,9 +112,74 @@ def get_settings() -> Settings:
     )
 
 
+# R07a：已知 section 的关键字段类型表——config.json 是用户可改的，坏值不校验
+# 就会流到深处炸（"asr_seconds": "60s" 这类）。坏字段**单独**回默认并告警，
+# 同 section 的好字段照常生效（不整包丢掉）。
+_CFG_FIELD_KINDS = {
+    "llm": {
+        "temperature": "number", "max_tokens": "number",
+        # R12c 的旧键与新键并存期：enable_thinking 是旧键（读取侧迁移到
+        # thinking.enabled），fallback 是熔断配置段（llm_client 读取）
+        "enable_thinking": "bool", "fallback": "dict",
+    },
+    "memory": {
+        "max_turns_short_term": "number", "recall_top_k": "number",
+        "portrait_tag_limit": "number", "max_sessions": "number",
+        "profile_confidence_threshold": "number", "persona_decay_days": "number",
+        "diary_max_entries": "number", "session_update_interval": "number",
+    },
+    "proactive": {
+        "idle_minutes": "number", "enabled": "bool",
+        "daily_max": "number", "min_intimacy": "number",
+    },
+    "tools": {"max_retry": "number", "max_tool_loop_rounds": "number"},
+    "personality": {"quirk_rate": "number"},
+    "thinking": {
+        "enabled": "bool", "char_threshold": "number",
+        "never_on_comfort": "bool", "never_on_emotions": "list",
+        "force_if_last_poor": "bool",
+    },
+    "expression": {
+        "minimal_input_chars": "number", "minimal_allowlist": "list",
+        "reaction_tag": "str", "long_input_chars": "number",
+        "long_input_require_split": "bool", "force_cut_chars": "number",
+    },
+    "timeouts": {
+        "asr_seconds": "timeout", "tts_seconds": "timeout",
+        "image_seconds": "timeout",
+    },
+    "log": {"level": "str"},
+}
+
+
+def _cfg_value_ok(value, kind: str) -> bool:
+    """按字段种类校验值。number 拒绝 bool 与 NaN/Infinity（bool 是 int 的子类，
+    不显式挡掉的话 "enabled": true 会顺手把 quirk_rate 顶成 1.0）。"""
+    if kind == "number":
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value))
+    if kind == "timeout":
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value > 0)
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "str":
+        return isinstance(value, str)
+    if kind == "list":
+        return isinstance(value, list)
+    if kind == "dict":
+        return isinstance(value, dict)
+    return False
+
+
 @lru_cache(maxsize=1)
 def load_app_config() -> dict:
-    """读 config.json 的业务参数。文件不存在或字段缺失就用默认值，不报错。"""
+    """读 config.json 的业务参数。文件不存在或字段缺失就用默认值，不报错。
+
+    R07a：JSON 根必须是对象；已知字段按类型校验，坏字段**单独**回默认并
+    告警（同 section 的好字段照常生效）；未知 section/键保留但告警——
+    不让一个拼写错误静默失效，也不让一个坏值炸掉整包配置。
+    """
     defaults = {
         "llm": {"temperature": 0.7, "max_tokens": 1024},
         "memory": {
@@ -180,12 +246,34 @@ def load_app_config() -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 user_cfg = json.load(f)
-            for section, values in user_cfg.items():
-                if section in defaults and isinstance(values, dict):
-                    defaults[section].update(values)
-        except (json.JSONDecodeError, OSError):
-            # 配置文件写坏了也别让程序起不来，用默认值凑合
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            # 配置文件写坏了也别让程序起不来，整包用默认值凑合，但必须喊一声
+            print(f"[config] config.json 解析失败，整包回默认值（原件未改动）: {exc}")
+            user_cfg = None
+        if user_cfg is not None:
+            if not isinstance(user_cfg, dict):
+                print(f"[config] config.json 根必须是对象（实测 {type(user_cfg).__name__}），"
+                      f"整包回默认值（原件未改动）")
+            else:
+                for section, values in user_cfg.items():
+                    if section not in defaults:
+                        print(f"[config] config.json 里出现未知 section「{section}」，已忽略")
+                        continue
+                    if not isinstance(values, dict):
+                        print(f"[config] config.json 的「{section}」段必须是对象"
+                              f"（实测 {type(values).__name__}），该段整段回默认")
+                        continue
+                    kinds = _CFG_FIELD_KINDS.get(section, {})
+                    for key, val in values.items():
+                        kind = kinds.get(key)
+                        if kind is None:
+                            print(f"[config] config.json 里出现未知键「{section}.{key}」，已忽略")
+                            continue
+                        if _cfg_value_ok(val, kind):
+                            defaults[section][key] = val
+                        else:
+                            print(f"[config] 「{section}.{key}」类型/取值不合法"
+                                  f"（实测 {val!r}），该字段回默认值")
     return defaults
 
 
@@ -196,9 +284,16 @@ def timeout_seconds(name: str, default: float) -> float:
     可改的，写成 `"asr_seconds": "60s"` 或直接删掉整段都有可能——直接下标会抛
     KeyError 把语音链路整个炸掉，把字符串透传给 SDK 则会在更深的地方炸。
     兜底哲学要求"读不到返回默认值而不是抛异常"，这个口子就是那条纪律的落点。
+    R07a：显式拒绝 bool（True 会 float 成 1.0 蒙混过关）与 NaN/Infinity——
+    NaN 的 `> 0` 判定为 False 挡得住，Infinity 却能溜过去，必须用 isfinite。
     """
     try:
-        val = float(load_app_config().get("timeouts", {}).get(name, default))
+        raw = load_app_config().get("timeouts", {}).get(name, default)
+        if isinstance(raw, bool):
+            return float(default)
+        val = float(raw)
     except (TypeError, ValueError, AttributeError):
         return float(default)
-    return val if val > 0 else float(default)
+    if not math.isfinite(val) or val <= 0:
+        return float(default)
+    return val
