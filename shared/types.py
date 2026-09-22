@@ -7,6 +7,26 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+@dataclass
+class CommitReceipt:
+    """一轮提交的回执（R15d，8.11.3 的正式类型）。
+
+    status ∈ committed / already_committed / cancelled / conflict /
+    processing / failed。处理中（committing）不许伪造 committed_at；
+    already_committed 必须指向原回执的 message_ids 与 committed_at。
+    取消与提交通过**同一原子门**裁决后产生本类型（CommitGate）。
+    """
+
+    status: str
+    session_id: str
+    request_id: str
+    turn_id: str
+    disposition: str = "normal"
+    committed_at: Optional[str] = None
+    message_ids: list = field(default_factory=list)
+    reason_code: str = ""
+
+
 class ExternalServiceError(RuntimeError):
     """外部服务失败（R27b 窄错误载体），由各适配器在**最窄的边界**转换而来。
 

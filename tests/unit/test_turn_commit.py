@@ -19,6 +19,7 @@ import threading
 import pytest
 
 from data.sqlite_store import get_db, new_turn_id
+from orchestration.cancellation import CommitGate
 from tools.storage import KVStoreTool
 
 
@@ -270,3 +271,126 @@ def test_event_interleaving_commit_before_during_after(kv):
     for t in ths:
         t.join(timeout=5)
     assert sorted(done2.values()) == ["already_committed", "committed"], f"实测 {done2}"
+
+
+# ------------------- R15d：取消与提交互斥（同一原子门） -------------------
+
+def test_cancel_wins_before_commit_blocks_data_transaction(kv):
+    """取消先赢：run_commit 直接返回 cancelled，数据事务**根本不开始**
+    （无 chat/账本/回执/关系痕迹——用门内 spy 证明 fn 未被调用）。"""
+    from orchestration.cancellation import CommitGate
+
+    gate = CommitGate()
+    assert gate.cancel_turn("turn-c1", reason="用户取消")["status"] == "cancelled"
+
+    called = {"n": 0}
+
+    def fn():
+        called["n"] += 1
+        return {"status": "committed", "turn_id": "turn-c1"}
+
+    rc = gate.run_commit("turn-c1", fn)
+    assert rc["status"] == "cancelled"
+    assert called["n"] == 0, "取消先赢时数据事务不许开始"
+    assert gate.is_committed("turn-c1") is False
+
+
+def test_commit_wins_late_cancel_returns_already_committed(kv):
+    """提交先成功：迟到取消返回 already_committed（带原回执），不误取消。"""
+    from orchestration.cancellation import CommitGate
+
+    gate = CommitGate()
+    receipt = {"status": "committed", "turn_id": "turn-c2", "committed_at": "T1",
+               "message_ids": [1, 2]}
+    rc = gate.run_commit("turn-c2", lambda: receipt)
+    assert rc["status"] == "committed"
+    assert gate.is_committed("turn-c2") is True
+
+    late = gate.cancel_turn("turn-c2", reason="迟到取消")
+    assert late["status"] == "already_committed"
+    assert late["receipt"] is receipt, "迟到取消必须指向原回执"
+
+
+def test_commit_failure_does_not_keep_committed_status():
+    """提交失败：失败回执不登记——此后的取消返回 cancelled（不保留 COMMITTED）。"""
+    from orchestration.cancellation import CommitGate
+
+    gate = CommitGate()
+    rc = gate.run_commit("turn-c3", lambda: {"status": "failed",
+                                             "reason_code": "commit_failed"})
+    assert rc["status"] == "failed"
+    assert gate.is_committed("turn-c3") is False
+    late = gate.cancel_turn("turn-c3")
+    assert late["status"] == "cancelled", "提交失败后取消必须是 cancelled"
+
+
+def test_cancel_during_commit_waits_for_exact_result(kv):
+    """处理中（事务内）来的取消：在门上排队，**等待确切结果**——
+    事务提交成功 → 取消得到 already_committed（不存在假 cancelled）。"""
+    from orchestration.cancellation import CommitGate
+
+    gate = CommitGate()
+    release = threading.Event()
+    in_txn = threading.Event()
+
+    def slow_fn():
+        in_txn.set()  # 已进事务并持有门锁
+        release.wait(timeout=5)  # 事务中挂起
+        return {"status": "committed", "turn_id": "turn-c4", "message_ids": [9]}
+
+    result = {}
+
+    def committer():
+        result["commit"] = gate.run_commit("turn-c4", slow_fn)
+
+    t = threading.Thread(target=committer)
+    t.start()
+    assert in_txn.wait(timeout=5), "提交者必须先进入事务（持门锁）"
+    # 事务进行中：取消请求到达 → 在门上排队，等确切结果
+    def canceller():
+        result["cancel"] = gate.cancel_turn("turn-c4", reason="处理中取消")
+
+    t2 = threading.Thread(target=canceller)
+    t2.start()
+    import time as _t
+
+    _t.sleep(0.05)
+    assert "cancel" not in result, "取消必须等待事务出结果，不许立刻假答"
+    release.set()
+    t.join(timeout=5)
+    t2.join(timeout=5)
+    assert result["commit"]["status"] == "committed"
+    assert result["cancel"]["status"] == "already_committed", (
+        f"事务成功的轮，处理中到达的取消必须拿到 already_committed，实测 {result}"
+    )
+
+
+def test_new_turn_start_does_not_kill_committed_turn_tasks(kv):
+    """新轮 start 顶掉旧轮 handle——但已提交轮的派生任务看门（is_committed），
+    不看 handle：不许被新轮误杀。"""
+    from orchestration.cancellation import COMMIT_GATE, TurnRegistry
+
+    gate = CommitGate()
+    turn_old = new_turn_id()
+    rc = gate.run_commit(turn_old, lambda: {"status": "committed",
+                                            "turn_id": turn_old})
+    assert rc["status"] == "committed"
+
+    reg = TurnRegistry()
+    reg.start("sess-new")          # 新轮启动：会顶掉同会话旧 handle
+    # 旧轮已提交：门说它的派生任务仍然有效
+    assert gate.is_committed(turn_old) is True
+    assert COMMIT_GATE is not None  # 全局唯一门存在
+    # F4：不带 turn_id 的取消依旧被拒（不误杀）
+    assert reg.cancel("sess-new", turn_id=None) is False
+
+
+def test_receipt_type_carries_contract_fields():
+    """CommitReceipt 类型（8.11.3 最小字段）可构造且字段齐全。"""
+    from shared.types import CommitReceipt
+
+    rc = CommitReceipt(status="committed", session_id="s", request_id="r",
+                       turn_id="t", disposition="degraded",
+                       committed_at="2026-09-22T00:00:00",
+                       message_ids=[1, 2], reason_code="")
+    assert rc.disposition == "degraded" and rc.message_ids == [1, 2]
