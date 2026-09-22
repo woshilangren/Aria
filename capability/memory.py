@@ -923,6 +923,140 @@ _SOOTHE_WORDS = ("抱抱", "不生气", "别生气", "我错了", "是我不好"
 _NEG_MOODS = ("别扭", "低落", "慵懒", "心烦")
 
 
+def compute_relationship_update(rel: dict, *, emotion: str = "neutral",
+                                comfort_mode: bool = False, was_poor: bool = False,
+                                intensity: float = 0.5, extras=None,
+                                utterance_text: str = "", mood_engine=None,
+                                default_intimacy: int = 0) -> tuple:
+    """R15b 纯计算：读现态 rel，算新态与变更集。**不碰 services / kv / 日志**。
+
+    返回 (new_rel, changes)：
+    - new_rel：入参深拷贝后演进——入参不被改动，调用方在原子闭包里拿它写库；
+    - changes = {"first_init": 是否首次初始化, "old_intimacy": 旧亲密度,
+      "mood_recal": (旧心情, 命中安抚词) 或 None}——账本在闭包外记（锁不可重入）。
+
+    算法与拆出前逐行等价（R15b 纪律：正常轮算法不变）；首次初始化用调用方
+    传入的 default_intimacy（门面在闭包外读人设），绝不预创建空 relationship。
+    """
+    import copy
+    import uuid
+
+    from tools.misc import ClockTool
+
+    new_rel = copy.deepcopy(rel) if rel else {}
+    changes = {"first_init": not new_rel, "old_intimacy": None, "mood_recal": None}
+    if not new_rel:
+        new_rel = {
+            "intimacy": default_intimacy, "affection": 0, "trust": 0,
+            "interaction_count": 0, "stage": "初识", "last_interaction": "",
+        }
+    changes["old_intimacy"] = new_rel.get("intimacy", 0)
+
+    delta = RelationshipTracker._EMOTION_DELTA.get(
+        emotion, {"intimacy": 1, "affection": 1, "trust": 0}
+    )
+    new_rel["intimacy"] = max(0, min(100, new_rel.get("intimacy", 0) + delta["intimacy"]))
+    new_rel["affection"] = max(0, min(100, new_rel.get("affection", 0) + delta["affection"]))
+    new_rel["trust"] = max(0, min(100, new_rel.get("trust", 0) + delta["trust"]))
+    new_rel["interaction_count"] = new_rel.get("interaction_count", 0) + 1
+    new_rel["last_interaction"] = ClockTool().now()
+    new_stage = RelationshipTracker._stage_of(new_rel["intimacy"])
+    old_stage = new_rel.get("stage", "初识")
+    if new_stage != old_stage:
+        new_rel["stage"] = new_stage
+        if RelationshipTracker._stage_rank(new_stage) > RelationshipTracker._stage_rank(old_stage):
+            # 升档留个一次性标记（N8）：下一轮 compose 让她自然意识到"更熟了"，
+            # 下一轮写回时会被清掉，只提一次
+            new_rel["stage_upgraded"] = f"从「{old_stage}」走进了「{new_stage}」"
+        else:
+            new_rel["stage_upgraded"] = ""
+    else:
+        # 不是本轮升的档：把上一轮可能残留的标记消费掉（置空）
+        new_rel["stage_upgraded"] = ""
+    # 心情状态机（N2 惯性版）：数值之外，角色此刻的情绪也往前走一格。
+    # MoodEngine 会在 new_rel 上就地写惯性字段——深拷贝把它圈在纯计算里
+    new_rel["mood"] = mood_engine.update(
+        new_rel, emotion, comfort_mode=comfort_mode, intensity=intensity
+    )
+    # C6 反向标定：她的话说出口之后，反过来校正状态。话语命中显式安抚词、
+    # 心情却还挂在负面 → 状态错了，归"平常"、清惯性。硬边界（取舍 #11）：
+    # 只动 mood/mood_left/mood_from 这些数值，当轮推出去的话一个字不碰——
+    # 做成"发现不一致就重写回复"= 流式下事后撒谎。翻盘走账本，可审计。
+    if utterance_text and new_rel.get("mood") in _NEG_MOODS:
+        hit = next((w for w in _SOOTHE_WORDS if w in utterance_text), "")
+        if hit:
+            changes["mood_recal"] = (new_rel.get("mood"), hit)  # 账本锁外记
+            new_rel["mood"] = "平常"
+            new_rel["mood_left"] = 0
+            new_rel["mood_from"] = ""
+    # 心事（S2/C7）：concern 是实体 {id,text,created_at,intensity}。
+    # 旧病：强度有惯性而文本每轮整句覆盖——同一个强度值每轮挂到不同念头上，
+    # 状态被劈成两个不同步的对象（"每轮重掷骰子"）。现在由感知在**同一次
+    # 调用**里判 same_concern/resolved：延续=实体不变强度惯性；翻篇=关旧开新。
+    concern = dict(new_rel.get("concern") or {})
+    if extras is not None and getattr(extras, "resolved", False):
+        concern = {"text": "", "intensity": 0.0}  # 他化解了这个念头：直接归零翻篇
+    elif extras is not None and getattr(extras, "concern_text", ""):
+        text = extras.concern_text
+        try:
+            delta_c = float(extras.concern_delta or 0)
+        except (TypeError, ValueError):
+            delta_c = 0.0
+        if extras.same_concern and concern.get("text"):
+            # 同一个念头的延续：实体不变（id/created_at 保留），文本允许换
+            # 措辞，强度走惯性
+            concern["text"] = text
+            old_i = float(concern.get("intensity") or 0)
+            concern["intensity"] = round(max(0.0, min(1.0, old_i + delta_c)), 3)
+        else:
+            # 新念头（same=false 关旧开新；或 same=true 但旧念头已衰减殆尽）。
+            # 起点 0.5+delta 而不是 0+delta：0+delta 起点在 delta<0.35 时
+            # 永远压在 persona_engine 的表达门槛之下——文本入了库、强度在
+            # 衰减、她却从不把它说出口（隐藏 bug）
+            concern = {
+                "id": uuid.uuid4().hex,
+                "text": text,
+                "created_at": ClockTool().now(),
+                "intensity": round(max(0.0, min(1.0, 0.5 + delta_c)), 3),
+            }
+    if comfort_mode:
+        # 哄/道歉：心事强度减半（化解），不立刻翻篇
+        concern["intensity"] = round(float(concern.get("intensity") or 0) * 0.5, 3)
+    ci = float(concern.get("intensity") or 0) * 0.9
+    if ci <= 0.05:
+        concern = {"text": "", "intensity": 0.0}  # 归零即翻篇（实体 id 一起清）
+    else:
+        concern["intensity"] = round(ci, 3)
+        concern.setdefault("text", "")
+    new_rel["concern"] = concern
+    # 关系收敛层（N2 宪法）：他在抱怨她的态度/语气时，对这个人的温度收敛
+    # 一格——只动"对他"的刻度，绝不碰性格内核。"收敛不是改变。"
+    calm = float(new_rel.get("calm") or 0)
+    if extras is not None and getattr(extras, "feedback", "") == "tone_down":
+        calm = min(0.6, calm + 0.15)
+    if comfort_mode:
+        calm = max(0.0, calm * 0.6)
+    new_rel["calm"] = round(calm, 3)
+    # last_poor（F8）在闭包内落账：下一轮 _needs_thinking 读到就强制认真想。
+    # 与数值同一把锁写，天然只生效一轮，也不会被并发的整包写覆盖
+    new_rel["last_poor"] = bool(was_poor)
+    return new_rel, changes
+
+
+def apply_degraded_bookkeeping(rel: dict, was_poor: bool = False) -> dict:
+    """R15b：降级轮**只**更新质量/回应 bookkeeping（last_poor），其余一律不动。
+
+    空 rel **原样返回**——降级轮不许预创建 relationship：预创建空包再被
+    首次初始化分支当成"已有现态"，会把 default_intimacy 吞成 0（实测踩中）。
+    普通关系增长、心情、心事、收敛一概不归降级轮（副作用表归 R17b 接线）。
+    """
+    if not rel:
+        return rel
+    new_rel = dict(rel)
+    new_rel["last_poor"] = bool(was_poor)
+    return new_rel
+
+
 class RelationshipTracker:
     """关系数值：每次聊完按情绪微调，数值攒着决定关系阶段。
 
@@ -968,110 +1102,26 @@ class RelationshipTracker:
         全部收进同一把锁。
         """
         kv = services.get("kv_store")
-        before = {"intimacy": None}  # 闭包里带出来，账本在锁外记（锁不可重入）
+        # 首次初始化的 default_intimacy 在**闭包外**读人设（R15b：纯计算不碰
+        # services；读人设文件不经库锁，无死锁风险——原注释语义保留）
+        default_intimacy = 0
+        try:
+            default_intimacy = kv.read("persona_config", "").default_intimacy
+        except Exception as exc:
+            logger.warning(f"[memory] 读初始亲密度失败（按 0 起）: {exc}")
+        changes = {"old_intimacy": None, "mood_recal": None}
 
         def _bump(rel: dict) -> dict:
-            if not rel:
-                # 第一次聊天，从人设配置里拿初始亲密度（读人设文件不经库锁，无死锁风险）
-                try:
-                    default = kv.read("persona_config", "").default_intimacy
-                except Exception as exc:
-                    logger.warning(f"[memory] 读初始亲密度失败（按 0 起）: {exc}")
-                    default = 0
-                rel = {
-                    "intimacy": default, "affection": 0, "trust": 0,
-                    "interaction_count": 0, "stage": "初识", "last_interaction": "",
-                }
-            before["intimacy"] = rel.get("intimacy", 0)
-
-            delta = self._EMOTION_DELTA.get(
-                emotion, {"intimacy": 1, "affection": 1, "trust": 0}
+            # R15b：算法本体在模块级纯函数 compute_relationship_update——
+            # 这里只做"闭包取现态 → 纯计算 → 返回新态"，账本在闭包外记
+            nonlocal changes
+            new_rel, changes = compute_relationship_update(
+                rel, emotion=emotion, comfort_mode=comfort_mode,
+                was_poor=was_poor, intensity=intensity, extras=extras,
+                utterance_text=utterance_text, mood_engine=self._mood_engine,
+                default_intimacy=default_intimacy,
             )
-            rel["intimacy"] = max(0, min(100, rel.get("intimacy", 0) + delta["intimacy"]))
-            rel["affection"] = max(0, min(100, rel.get("affection", 0) + delta["affection"]))
-            rel["trust"] = max(0, min(100, rel.get("trust", 0) + delta["trust"]))
-            rel["interaction_count"] = rel.get("interaction_count", 0) + 1
-            rel["last_interaction"] = ClockTool().now()
-            new_stage = self._stage_of(rel["intimacy"])
-            old_stage = rel.get("stage", "初识")
-            if new_stage != old_stage:
-                rel["stage"] = new_stage
-                if self._stage_rank(new_stage) > self._stage_rank(old_stage):
-                    # 升档留个一次性标记（N8）：下一轮 compose 让她自然意识到"更熟了"，
-                    # 下一轮写回时会被清掉，只提一次
-                    rel["stage_upgraded"] = f"从「{old_stage}」走进了「{new_stage}」"
-                else:
-                    rel["stage_upgraded"] = ""
-            else:
-                # 不是本轮升的档：把上一轮可能残留的标记消费掉（置空）
-                rel["stage_upgraded"] = ""
-            # 心情状态机（N2 惯性版）：数值之外，角色此刻的情绪也往前走一格
-            rel["mood"] = self._mood_engine.update(
-                rel, emotion, comfort_mode=comfort_mode, intensity=intensity
-            )
-            # C6 反向标定：她的话说出口之后，反过来校正状态。话语命中显式安抚词、
-            # 心情却还挂在负面 → 状态错了，归"平常"、清惯性。硬边界（取舍 #11）：
-            # 只动 mood/mood_left/mood_from 这些数值，当轮推出去的话一个字不碰——
-            # 做成"发现不一致就重写回复"= 流式下事后撒谎。翻盘走账本，可审计。
-            if utterance_text and rel.get("mood") in _NEG_MOODS:
-                hit = next((w for w in _SOOTHE_WORDS if w in utterance_text), "")
-                if hit:
-                    before["mood_recal"] = (rel.get("mood"), hit)  # 账本锁外记，与亲密度账本同一纪律
-                    rel["mood"] = "平常"
-                    rel["mood_left"] = 0
-                    rel["mood_from"] = ""
-            # 心事（S2/C7）：concern 是实体 {id,text,created_at,intensity}。
-            # 旧病：强度有惯性而文本每轮整句覆盖——同一个强度值每轮挂到不同念头上，
-            # 状态被劈成两个不同步的对象（"每轮重掷骰子"）。现在由感知在**同一次
-            # 调用**里判 same_concern/resolved：延续=实体不变强度惯性；翻篇=关旧开新。
-            concern = dict(rel.get("concern") or {})
-            if extras is not None and getattr(extras, "resolved", False):
-                concern = {"text": "", "intensity": 0.0}  # 他化解了这个念头：直接归零翻篇
-            elif extras is not None and getattr(extras, "concern_text", ""):
-                text = extras.concern_text
-                try:
-                    delta_c = float(extras.concern_delta or 0)
-                except (TypeError, ValueError):
-                    delta_c = 0.0
-                if extras.same_concern and concern.get("text"):
-                    # 同一个念头的延续：实体不变（id/created_at 保留），文本允许换
-                    # 措辞，强度走惯性
-                    concern["text"] = text
-                    old_i = float(concern.get("intensity") or 0)
-                    concern["intensity"] = round(max(0.0, min(1.0, old_i + delta_c)), 3)
-                else:
-                    # 新念头（same=false 关旧开新；或 same=true 但旧念头已衰减殆尽）。
-                    # 起点 0.5+delta 而不是 0+delta：0+delta 起点在 delta<0.35 时
-                    # 永远压在 persona_engine 的表达门槛之下——文本入了库、强度在
-                    # 衰减、她却从不把它说出口（隐藏 bug）
-                    concern = {
-                        "id": uuid.uuid4().hex,
-                        "text": text,
-                        "created_at": ClockTool().now(),
-                        "intensity": round(max(0.0, min(1.0, 0.5 + delta_c)), 3),
-                    }
-            if comfort_mode:
-                # 哄/道歉：心事强度减半（化解），不立刻翻篇
-                concern["intensity"] = round(float(concern.get("intensity") or 0) * 0.5, 3)
-            ci = float(concern.get("intensity") or 0) * 0.9
-            if ci <= 0.05:
-                concern = {"text": "", "intensity": 0.0}  # 归零即翻篇（实体 id 一起清）
-            else:
-                concern["intensity"] = round(ci, 3)
-                concern.setdefault("text", "")
-            rel["concern"] = concern
-            # 关系收敛层（N2 宪法）：他在抱怨她的态度/语气时，对这个人的温度收敛
-            # 一格——只动"对他"的刻度，绝不碰性格内核。"收敛不是改变。"
-            calm = float(rel.get("calm") or 0)
-            if extras is not None and getattr(extras, "feedback", "") == "tone_down":
-                calm = min(0.6, calm + 0.15)
-            if comfort_mode:
-                calm = max(0.0, calm * 0.6)
-            rel["calm"] = round(calm, 3)
-            # last_poor（F8）在闭包内落账：下一轮 _needs_thinking 读到就强制认真想。
-            # 与数值同一把锁写，天然只生效一轮，也不会被并发的整包写覆盖
-            rel["last_poor"] = bool(was_poor)
-            return rel
+            return new_rel
 
         try:
             rel = kv.update("relationship", session_id, _bump)
@@ -1082,7 +1132,7 @@ class RelationshipTracker:
         # 闭包内再取不会自锁，但"可重入"只保证不死锁、不保证语义——嵌套写库会
         # 把外面这次原子更新拆开，所以账本仍坚持在闭包外、update 返回后再记。
         try:
-            old_v = before.get("intimacy")
+            old_v = changes.get("old_intimacy")
             if old_v is not None and rel:
                 # reason 用人话写：账本不只给审计看，S10 氛围线会把它直接拼进提示词
                 reason = {
@@ -1097,7 +1147,7 @@ class RelationshipTracker:
             logger.warning(f"[memory] 关系账本写入失败（数值本身已生效）: {exc}")
         # C6 反向标定的翻盘也走账本（delta=0 的纯审计行）：状态被"她实际说的话"
         # 校正过必须可追溯，不然哪天心情对不上注入值，查无对证
-        recal = before.get("mood_recal")
+        recal = changes.get("mood_recal")
         if recal and rel:
             old_mood, hit = recal
             try:
@@ -1115,6 +1165,24 @@ class RelationshipTracker:
     def _stage_rank(stage: str) -> int:
         ranks = {"初识": 0, "熟悉": 1, "亲近": 2, "挚友": 3}
         return ranks.get(stage, 0)
+
+    def update_bookkeeping_only(self, session_id: str, was_poor: bool = False) -> dict:
+        """R15b：降级轮的 bookkeeping 入口（副作用表由 R17b 接线到调用方）。
+
+        只动 last_poor（质量/回应 bookkeeping），普通关系增长/心情/心事/
+        收敛一概不归降级轮；空 relationship **不预创建**（否则首次初始化
+        被架空、default_intimacy 被吞成 0——实测踩中过）。
+        """
+        kv = services.get("kv_store")
+
+        def _bump(rel: dict) -> dict:
+            return apply_degraded_bookkeeping(rel, was_poor)
+
+        try:
+            return kv.update("relationship", session_id, _bump)
+        except Exception as exc:
+            logger.warning(f"[memory] 降级轮 bookkeeping 更新失败（本轮不落账）: {exc}")
+            return {}
 
     def get_stage(self, session_id: str) -> str:
         try:

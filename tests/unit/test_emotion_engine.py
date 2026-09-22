@@ -140,3 +140,76 @@ def test_extras_missing_is_safe(kv):
     rel = RelationshipTracker().update("s4", "happy")
     assert rel["concern"]["intensity"] == 0.0
     assert rel["calm"] == 0.0
+
+
+# ------------------- R15b：关系纯计算与降级 bookkeeping -------------------
+
+def test_compute_relationship_update_first_init_keeps_default():
+    """首次初始化：从传入的 default_intimacy 起步（不许吞成 0），再走情绪增量。"""
+    from capability.memory import compute_relationship_update
+
+    new_rel, changes = compute_relationship_update(
+        {}, emotion="happy", default_intimacy=20, mood_engine=MoodEngine())
+    assert changes["first_init"] is True
+    # 种子默认 20 + happy 的 intimacy 增量 2
+    assert new_rel["intimacy"] == 22
+    assert new_rel["interaction_count"] == 1
+    assert new_rel["stage"] in {"初识", "熟悉"}
+
+
+def test_compute_relationship_update_is_pure():
+    """纯计算：入参 rel 深拷贝演进，调用后原字典一个字段都不许变。"""
+    import copy
+
+    from capability.memory import compute_relationship_update
+
+    rel = {"intimacy": 30, "affection": 10, "trust": 2, "interaction_count": 5,
+           "stage": "熟悉", "mood": "平常", "concern": {"text": "心事", "intensity": 0.4}}
+    snapshot = copy.deepcopy(rel)
+    new_rel, changes = compute_relationship_update(
+        rel, emotion="happy", mood_engine=MoodEngine(), default_intimacy=20)
+    assert rel == snapshot, "纯计算不得改动入参现态"
+    assert new_rel is not rel
+    assert changes["old_intimacy"] == 30
+    assert changes["first_init"] is False
+
+
+def test_degraded_bookkeeping_only_touches_last_poor():
+    """降级轮 bookkeeping：只动 last_poor，其余字段（含数值/心情/心事）不动。"""
+    from capability.memory import apply_degraded_bookkeeping
+
+    rel = {"intimacy": 30, "mood": "低落", "interaction_count": 7,
+           "concern": {"text": "心事", "intensity": 0.4}, "last_poor": False}
+    new_rel = apply_degraded_bookkeeping(rel, was_poor=True)
+    assert new_rel["last_poor"] is True
+    assert new_rel["intimacy"] == 30 and new_rel["mood"] == "低落"
+    assert new_rel["interaction_count"] == 7 and new_rel["concern"] == rel["concern"]
+
+
+def test_degraded_bookkeeping_empty_rel_no_precreate():
+    """空现态 + 降级轮：原样返回，**不许预创建 relationship**——
+    预创建会把首次初始化的 default_intimacy 吞成 0（实测踩中）。"""
+    from capability.memory import apply_degraded_bookkeeping
+
+    assert apply_degraded_bookkeeping({}, was_poor=True) == {}
+
+
+def test_facade_update_bookkeeping_only_never_precreates(kv):
+    """门面级：全新会话跑 bookkeeping，relationship 表**不得被创建**。"""
+    from shared.singletons import services
+
+    from capability.memory import RelationshipTracker
+
+    RelationshipTracker().update_bookkeeping_only("r15b-bookkeep", was_poor=True)
+    assert services.get("kv_store").read("relationship", "r15b-bookkeep") in (None, {}, [])
+
+
+def test_facade_update_first_init_uses_seed_default_intimacy(kv):
+    """门面级首次初始化：default_intimacy 来自种子（20），不许被吞成 0。"""
+    from shared.singletons import services
+
+    from capability.memory import RelationshipTracker
+
+    rel = RelationshipTracker().update("r15b-first", emotion="happy")
+    assert rel["intimacy"] >= 20, f"首次初始化必须保留种子默认亲密度，实测 {rel!r}"
+    assert services.get("kv_store").read("relationship", "r15b-first")["intimacy"] == rel["intimacy"]
