@@ -5,6 +5,7 @@
 """
 
 from shared.singletons import services
+from shared.timeutils import safe_delta_seconds
 from shared.types import MemoryBundle, PromptPackage
 from tools.misc import ClockTool
 
@@ -254,11 +255,11 @@ class PersonaEngine:
             lines = []
             for item in distilled[:8]:
                 label = ""
-                try:
-                    d = (now_dt - datetime.fromisoformat(item.get("timestamp") or "")).days
+                # R09b：统一解析（Z / naive 本地语义 / 坏值降级收口在 timeutils）
+                d = safe_delta_seconds(now_dt, item.get("timestamp") or "")
+                if d is not None:
+                    d = int(d // 86400)
                     label = {0: "今天", 1: "昨天", 2: "前天"}.get(d, f"{d}天前")
-                except (ValueError, TypeError):
-                    label = ""
                 line = f"- （{label}）{item['content']}" if label else f"- {item['content']}"
                 if item.get("feeling"):
                     line += f"（当时的感觉：{item['feeling']}）"

@@ -199,3 +199,46 @@ def test_recent_arc_cross_day_keeps_date_labels():
     assert arc.count("前天") == 1
     assert "这几天" in arc
     assert "最近这几轮" not in arc
+
+
+# ------------------- R09a：时间解析统一（Z / 偏移等价） -------------------
+
+def test_gap_perception_offset_equivalence():
+    """Z / +08:00 / -05:00 / naive 表示同一时刻 → 分档必须一致（R09a 验收）。
+
+    naive 按"历史本地时间"语义解释（不假装 UTC）；四种写法都从同一个
+    aware 时刻派生，所以在任何机器时区下都应算出同一档。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    tool = ClockTool()
+    now = datetime.now().astimezone()
+    base = now - timedelta(minutes=100)
+    variants = [
+        base.astimezone(timezone.utc).isoformat(),          # ...+00:00（或 Z 风格）
+        base.isoformat(),                                    # 本地偏移
+        base.astimezone(timezone(timedelta(hours=-5))).isoformat(),  # -05:00
+        base.replace(tzinfo=None).isoformat(),               # 历史本地串（naive）
+    ]
+    outs = {tool.gap_perception(s, now=now) for s in variants}
+    assert len(outs) == 1, f"同一时刻不同写法必须同档，实测 {outs}"
+
+
+def test_gap_perception_garbage_never_crashes():
+    """空串 / None / 坏串 / Z 后缀（3.10 fromisoformat 不认）都必须安全降级。"""
+    tool = ClockTool()
+    assert tool.gap_perception("") == ""
+    assert tool.gap_perception(None) == ""
+    assert tool.gap_perception("不是时间") == ""
+    out = tool.gap_perception("2026-09-22T19:00:00Z")
+    assert isinstance(out, str)  # Z 后缀能解析，不抛异常
+
+
+def test_gap_perception_future_clamped():
+    """未来时间戳（时钟被拨回）→ 负间隔钳制成"刚聊完"（R09a：按用途钳制）。"""
+    from datetime import datetime, timedelta
+
+    tool = ClockTool()
+    now = datetime.now().astimezone()
+    future = (now + timedelta(hours=3)).isoformat()
+    assert "刚聊完" in tool.gap_perception(future, now=now)

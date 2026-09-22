@@ -141,12 +141,14 @@ class ClockTool:
             return ""
         from datetime import datetime
 
-        try:
-            last = datetime.fromisoformat(last_iso)
-        except (ValueError, TypeError):
+        from shared.timeutils import parse_to_aware, safe_delta_seconds
+
+        # R09a：统一解析（Z 后缀 / naive 本地语义 / 坏值降级都收口在 timeutils）
+        last = parse_to_aware(last_iso)
+        if last is None:
             return ""
-        now = now or datetime.now()
-        gap = (now - last).total_seconds()
+        now = parse_to_aware(now) if now is not None else datetime.now().astimezone()
+        gap = safe_delta_seconds(now, last) or 0.0
         if gap < 0:  # 时钟被拨回去之类的脏数据，当"刚聊完"处理最安全
             gap = 0
         for threshold, phrase, hint in self._GAP_TIERS:

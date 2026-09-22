@@ -1,5 +1,7 @@
 """批次7 单测：S4 记忆闸门（候选晋升+仲裁）、C2 第一刀/N4 生活面（char_life）。"""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from capability import char_life, self_identity
@@ -258,3 +260,108 @@ def test_remember_note_true_enqueues_nothing(monkeypatch):
     """明确 True 才算成功：成功路径零补偿登记。"""
     registered, _v = _remember_with(monkeypatch, _VectorStub(result=True))
     assert registered == [], "成功不许排重试"
+
+
+def test_search_timestamp_offset_equivalence(monkeypatch):
+    """R09b：同一条记忆的 timestamp 写成 naive / Z / +08:00 → 衰减天数一致、
+    分数相同（任何机器时区下都成立）。"""
+    now = datetime.now().astimezone()
+    ts_base = (now - timedelta(days=3)).replace(microsecond=0)
+    rows = [
+        ("a_naive", "甲", 0.3, ts_base.replace(tzinfo=None).isoformat()),
+        ("b_z", "乙", 0.3, ts_base.astimezone(timezone.utc).isoformat()),
+        ("c_off", "丙", 0.3, ts_base.isoformat()),
+        ("d_future", "丁", 0.3, (now + timedelta(days=2)).isoformat()),  # 未来：钳制成刚发生
+    ]
+    tool = _make_search_tool(monkeypatch, rows)
+    got = {g["id"]: g for g in tool.search_memory("随便搜搜", top_k=5)}
+    assert got["a_naive"]["score"] == pytest.approx(got["b_z"]["score"])
+    assert got["a_naive"]["score"] == pytest.approx(got["c_off"]["score"])
+    # 未来时间戳：负间隔钳制成 0 天 → 衰减=1（当作刚发生，旧行为）
+    assert got["d_future"]["score"] >= got["a_naive"]["score"]
+
+
+# ------------------- R08：召回负分反转（语义置信分/排序分分离） -------------------
+# 补记（附二十七）：上一批的追加命令被工具层错误打断后未重试，这 4 条测试
+# 当时没有落盘（R08 提交信息声称有它们）——本文件补齐，教训写进日志。
+
+def _make_search_tool(monkeypatch, rows):
+    """搭 search_memory 的替身环境：rows = [(id, doc, dist, timestamp)]。
+
+    query 返回固定形状；embedding 替身；热度统计走真 tmp 库（conftest 隔离）。
+    """
+    from tools.storage import VectorStoreTool
+
+    ids = [r[0] for r in rows]
+    docs = [r[1] for r in rows]
+    dists = [r[2] for r in rows]
+    metas = [{"timestamp": r[3], "valence": 0.0, "arousal": 0.0} for r in rows]
+
+    class _FakeCol:
+        def query(self, **kwargs):
+            return {"ids": [ids], "documents": [docs],
+                    "metadatas": [metas], "distances": [dists]}
+
+    tool = VectorStoreTool()
+    tool._cols = {"distilled_memory": _FakeCol()}
+
+    class _FakeEmbedder:
+        def embed_query(self, q):
+            return [0.0]
+
+    tool._embedder = _FakeEmbedder()
+    return tool
+
+
+def test_search_distance_over_one_stays_positive(monkeypatch):
+    """d>1：旧 1-d 为负、负分乘衰减/热度会让旧记忆排前——新公式必须非负。"""
+    now = datetime.now()
+    ts_now = now.isoformat(timespec="seconds")
+    ts_old = (now - timedelta(days=40)).isoformat(timespec="seconds")
+    tool = _make_search_tool(monkeypatch, [
+        ("m1", "近的那条", 1.5, ts_now),
+        ("m2", "远的那条", 1.5, ts_old),
+    ])
+    got = tool.search_memory("随便搜搜", top_k=5)
+    assert got, "d>1 的结果不该被丢光"
+    sims = {g["id"]: g["similarity"] for g in got}
+    assert sims["m1"] == pytest.approx(1.0 / 2.5)
+    scores = {g["id"]: g["score"] for g in got}
+    assert scores["m1"] > scores["m2"] > 0, f"分数必须非负且新的更靠前: {scores}"
+
+
+def test_search_bad_distances_never_rank_first(monkeypatch):
+    """NaN / Infinity / 负距离：异常数据跳过，绝不进榜首冒充最相关。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    tool = _make_search_tool(monkeypatch, [
+        ("bad_nan", "nan 文档", "nan", now),
+        ("bad_inf", "inf 文档", float("inf"), now),
+        ("bad_neg", "neg 文档", -0.5, now),
+        ("good", "正常的那条", 0.5, now),
+    ])
+    got = tool.search_memory("随便搜搜", top_k=5)
+    ids = [g["id"] for g in got]
+    assert ids == ["good"], f"异常距离必须全部跳过，实测 {ids}"
+
+
+def test_search_similarity_and_score_are_separate(monkeypatch):
+    """语义置信分（similarity）与排序分（score）必须分开：后者=前者×衰减×热度。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    tool = _make_search_tool(monkeypatch, [("m1", "一条记忆", 0.5, now)])
+    got = tool.search_memory("随便搜搜", top_k=5)
+    g = got[0]
+    assert g["similarity"] == pytest.approx(1.0 / 1.5)
+    assert g["score"] < g["similarity"], "排序分乘了衰减（<1），必须低于语义置信分"
+    assert g["score"] > 0
+
+
+def test_s7_uncertain_hedge_fixed_samples():
+    """S7 低置信边界的固定样本：校准语义分 <0.6 含糊；legacy 排序分 <0.35 兼容。"""
+    from capability.persona_engine import _needs_uncertain_hedge
+
+    assert _needs_uncertain_hedge({"similarity": 0.59}) is True
+    assert _needs_uncertain_hedge({"similarity": 0.61}) is False
+    assert _needs_uncertain_hedge({"similarity": float("nan")}) is False
+    assert _needs_uncertain_hedge({"score": 0.3}) is True     # legacy 兼容
+    assert _needs_uncertain_hedge({"score": 0.4}) is False
+    assert _needs_uncertain_hedge({}) is False                # 双缺：宁少勿滥

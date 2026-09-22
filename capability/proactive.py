@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from config.settings import load_app_config
 from shared.singletons import services
+from shared.timeutils import safe_delta_seconds
 
 from tools.misc import ClockTool
 
@@ -86,7 +87,9 @@ class ProactiveSpeaker:
         try:
             rel = services.get("kv_store").read("relationship", session_id) or {}
             last = rel.get("last_interaction") or ""
-            return max(0.0, (datetime.now() - datetime.fromisoformat(last)).total_seconds() / 86400)
+            # R09a：统一解析（Z / naive 本地语义 / 坏值降级都收口在 timeutils）
+            gap = safe_delta_seconds(datetime.now(), last)
+            return max(0.0, (gap or 0.0) / 86400)
         except Exception:
             return 0.0
 
@@ -241,9 +244,9 @@ def _awaiting_too_long(rel: dict) -> bool:
     if not rel.get("proactive_awaiting"):
         return False
     at = rel.get("proactive_at") or ""
-    try:
-        elapsed = (datetime.now() - datetime.fromisoformat(at)).total_seconds()
-    except (TypeError, ValueError):
+    # R09a：统一解析；解析失败（没记录过/坏值）按"没在收手期"处理
+    elapsed = safe_delta_seconds(datetime.now(), at)
+    if elapsed is None:
         return False
     return elapsed >= _IGNORE_AFTER_SEC
 
@@ -354,18 +357,18 @@ class IdleDiaryWatcher:
         # K5：.get 兜住段缺失——load_app_config() 有内置默认值，但 config.json
         # 被写坏走降级时整个 "proactive" 段可能不存在，直接索引会 KeyError 停摆巡检
         idle_minutes = load_app_config().get("proactive", {}).get("idle_minutes", 30)
-        threshold = datetime.now() - timedelta(minutes=idle_minutes)
         kv = services.get("kv_store")
 
         self._prune_candidates_once(kv)
 
         for entry in kv.last_chat_per_session():
-            last_time = (entry.get("last_time") or "")[:19]
+            last_time = entry.get("last_time") or ""
             if not last_time:
                 continue
-            try:
-                last_dt = datetime.fromisoformat(last_time)
-            except ValueError:
+            # R09a：统一解析；**不得 [:19] 截断**——那会把 "+08:00" 偏移切掉，
+            # 同一时刻两种写法算出两个答案。比较改用受保护的秒差
+            idle_seconds = safe_delta_seconds(datetime.now(), last_time)
+            if idle_seconds is None:
                 continue  # 时间戳格式不对就跳过，别为一条脏数据惊动整个巡检
 
             session_id = entry["session_id"]
@@ -381,7 +384,7 @@ class IdleDiaryWatcher:
             except Exception:
                 pass
 
-            if last_dt >= threshold:
+            if idle_seconds < idle_minutes * 60:
                 continue  # 还没闲够，下轮再看
 
             self._write_idle_diary(session_id, last_time)

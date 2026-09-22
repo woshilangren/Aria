@@ -13,6 +13,7 @@ from pathlib import Path
 
 from config.settings import get_settings, load_app_config
 from data.chroma_client import ChromaClient
+from shared.timeutils import safe_delta_seconds
 from data.embedding_client import EMBED_BATCH_SIZE, QwenEmbedding
 from data.schemas import DialogueRecord, MemoryItem
 from data.stores import (
@@ -432,10 +433,9 @@ class VectorStoreTool:
             half_life = 12.0 if valence < -0.2 else 30.0   # 负面褪得快
             half_life *= (1.0 + 0.5 * arousal)              # 唤醒高的更耐忘
             ts = meta.get("timestamp", "") or ""
-            try:
-                days = max(0.0, (now - datetime.fromisoformat(ts)).total_seconds() / 86400)
-            except (ValueError, TypeError):
-                days = 0.0
+            # R09b：统一解析——坏值/未来时间戳降级为 0（= 当作刚发生，旧行为）
+            age_seconds = safe_delta_seconds(now, ts)
+            days = max(0.0, (age_seconds or 0.0) / 86400)
             decay = 0.5 ** (days / max(half_life, 1.0))
             # 访问加成（S5）：常想起的更牢固，log 压缩防热记忆垄断
             hot = stats.get(doc_id) or {}

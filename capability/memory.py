@@ -20,6 +20,7 @@ from config.settings import load_app_config
 from capability.quirks import MoodEngine
 from data.schemas import MemoryItem
 from shared.singletons import services
+from shared.timeutils import safe_delta_seconds
 from shared.types import MemoryBundle
 from tools.misc import ClockTool, parse_llm_json
 
@@ -667,21 +668,16 @@ class PortraitBuilder:
             tag_updated[str(t)] = now
         merged = list(dict.fromkeys(list(old.get("portrait_tags") or []) + list(new_tags or [])))
         decay_days = float(load_app_config()["memory"].get("persona_decay_days", 14) or 14)
-        try:
-            now_dt = datetime.fromisoformat(now)
-        except ValueError:
-            now_dt = None
         kept = []
         for tag in merged:
             ts = tag_updated.get(tag, "")
-            if now_dt and ts:
-                try:
-                    age_days = (now_dt - datetime.fromisoformat(ts)).total_seconds() / 86400
-                    if age_days > decay_days:
-                        tag_updated.pop(tag, None)
-                        continue  # 太久没再出现的印象，过期清掉
-                except ValueError:
-                    pass  # 时间戳坏了就当没记过，标签保留
+            if ts:
+                # R09b：统一解析（Z / naive 本地语义 / 坏值降级收口在 timeutils）
+                age_days = safe_delta_seconds(now, ts)
+                if age_days is not None and age_days / 86400 > decay_days:
+                    tag_updated.pop(tag, None)
+                    continue  # 太久没再出现的印象，过期清掉
+                # 时间戳坏了就当没记过，标签保留（旧行为不变）
             kept.append(tag)
         return kept[:limit], tag_updated
 
@@ -863,11 +859,12 @@ def _arc_from_entries(entries: list, limit: int = 3, now=None) -> str:
     order = []  # label 首次出现的顺序，保证输出稳定
     for entry in entries[-limit:]:
         label = ""
-        try:
-            diff = (now - datetime.fromisoformat(entry.get("time", ""))).days
+        # R09b：统一解析——days 语义与 timedelta.days 一致（负值=未来时间戳，
+        # 交给下面的 fallback 标签，与旧行为相同）
+        diff = safe_delta_seconds(now, entry.get("time", ""))
+        if diff is not None:
+            diff = int(diff // 86400)
             label = {0: "今天", 1: "昨天", 2: "前天"}.get(diff, f"{diff}天前")
-        except (ValueError, TypeError):
-            label = ""
         reason = (entry.get("reason") or "").strip()
         if not reason:
             continue
