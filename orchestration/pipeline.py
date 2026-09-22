@@ -951,6 +951,16 @@ class DialoguePipeline:
                 async for ev in self._emit_frag(frag, state, handle, synthesize_voice, seq):
                     yield ev
         except _ReviewReject:
+            # R02 止损：工具链审核拒绝 = 原稿彻底失去写回资格。final_reply /
+            # draft_reply 在这里清空，_writeback 才会走 refuse-only 分支
+            # （只记质量标记，不写 KEEPER / chat_log / 蒸馏 / 画像 / 身份）。
+            # 以前靠"final_reply 非空"决定可保存，而 _respond 早在审核**之前**
+            # 就把转述稿塞进了 final_reply——被拒原稿就这么混进了她的记忆
+            # （隔离用例实测：KEEPER 与 chat_log 各混入一份被拒标记）。
+            # 副作用工具不重跑：本分支本就不再执行任何工具（I3 幂等账本也在
+            # 工具层拦着重跑）；被拒草稿不进日志——异常本身不外抛、不带原文。
+            state.final_reply = ""
+            state.draft_reply = ""
             # 整轮降级：不重写、不重跑工具，换成一句人设化的兜底话。
             # 已经推出去的句子撤不回（前端按 refuse 的 replace 语义整轮替换）。
             raise _RefuseTurn(fallback_line(
