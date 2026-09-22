@@ -1,0 +1,272 @@
+"""R15c：一轮提交的事务门面测试（8.11.3 提交契约的低层能力）。
+
+验收（《计划与设计.md》R15c）：
+- 一次短事务写 user/assistant、关系（事务内读最新 + 注入纯计算）、账本、回执；
+- 第二条 chat INSERT / 账本 INSERT 失败 → 整体回滚，无半轮、无回执；
+- 同 request_id 重试返回**同一回执**（不重复计数）；同 ID 不同 digest → conflict；
+- Event 控制三种交错：提交前（并发竞争）/ 事务中（另一入口必须等待）/
+  提交后（重试拿原回执）。
+- 边界：取消与提交的原子门竞争（取消错序不误杀）属 R15d。
+
+relation_fn 由测试注入（R15b 纯函数偏应用）——data 层不 import capability。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+
+import pytest
+
+from data.sqlite_store import get_db, new_turn_id
+from tools.storage import KVStoreTool
+
+
+@pytest.fixture()
+def kv():
+    return KVStoreTool()
+
+
+def _relation_fn(delta=1):
+    """注入的"纯计算"：读现态加 delta（模拟 R15b 的偏应用）。"""
+    from capability.memory import compute_relationship_update
+    from capability.quirks import MoodEngine
+
+    def _apply(rel):
+        new_rel, _ = compute_relationship_update(
+            rel, emotion="happy", mood_engine=MoodEngine(), default_intimacy=20
+        )
+        return new_rel
+
+    return _apply
+
+
+def _commit(kv, sid, req, turn=None, digest="d1", assistant="她的回答。",
+            user="你好", disposition="normal", relation_fn=None, ledger=None):
+    return kv.commit_turn(
+        session_id=sid, turn_id=turn or new_turn_id(), request_id=req,
+        request_digest=digest, disposition=disposition,
+        source_review_status="accepted",
+        user_text=user, assistant_text=assistant,
+        intent="chat", emotion="happy", mode="text",
+        relation_fn=relation_fn if relation_fn is not None else _relation_fn(),
+        ledger=ledger,
+    )
+
+
+def test_commit_happy_path_writes_all_in_one_transaction(kv):
+    """正常提交：chat 双行带 turn_id/disposition、关系更新、账本、回执齐全。"""
+    turn = new_turn_id()
+    rc = _commit(kv, "s-tc1", "req-1", turn=turn, ledger={
+        "field": "intimacy", "old": 20, "new": 22,
+        "reason": "聊得开心", "quote": "你好", "event_id": "ev-1",
+    })
+    assert rc["status"] == "committed"
+    assert rc["message_ids"] and len(rc["message_ids"]) == 2
+
+    rows = kv.read("session", "s-tc1") or []
+    assert [r.get("role") for r in rows] == ["user", "assistant"]
+    # chat_log 新列经 store 读不到（store 只暴露老列）——直查库验证 R15a 列
+    from data.sqlite_store import get_db as _gdb
+
+    raw = _gdb()._conn.execute(
+        "SELECT role, turn_id, disposition, source_review_status FROM chat_log "
+        "WHERE session_id='s-tc1' ORDER BY id"
+    ).fetchall()
+    assert all(r[1] == turn for r in raw)
+    assert all(r[2] == "normal" and r[3] == "accepted" for r in raw)
+
+    rel = kv.read("relationship", "s-tc1") or {}
+    assert rel.get("intimacy", 0) >= 20, "事务内的关系纯计算必须生效"
+    led = kv.recent_ledger("s-tc1")
+    assert led and led[-1]["field"] == "intimacy" and led[-1]["event_id"] == "ev-1"
+
+    receipt = kv.get_commit_receipt("s-tc1", "req-1")
+    assert receipt and receipt["status"] == "committed"
+    assert receipt["message_ids"] == rc["message_ids"]
+
+
+def test_retry_same_request_returns_same_receipt_no_double_count(kv):
+    """同 request 重试：返回**原回执**（同 committed_at/同 message_ids），
+    chat/账本/关系**不重复计数**。"""
+    turn = new_turn_id()
+    first = _commit(kv, "s-tc2", "req-x", turn=turn)
+    assert first["status"] == "committed"
+    n_chat = len(kv.read("session", "s-tc2") or [])
+    n_led = len(kv.recent_ledger("s-tc2", n=50))
+
+    second = _commit(kv, "s-tc2", "req-x", turn=turn)
+    assert second["status"] == "already_committed"
+    assert second["committed_at"] == first["committed_at"]
+    assert second["message_ids"] == first["message_ids"]
+    assert len(kv.read("session", "s-tc2") or []) == n_chat, "重试不许再写 chat"
+    assert len(kv.recent_ledger("s-tc2", n=50)) == n_led, "重试不许再记账本"
+
+
+def test_same_request_different_digest_is_conflict(kv):
+    """同 request 不同内容（digest 不同）→ 明确 conflict，不默默当旧轮。"""
+    turn = new_turn_id()
+    assert _commit(kv, "s-tc3", "req-y", turn=turn, digest="d1")["status"] == "committed"
+    rc = _commit(kv, "s-tc3", "req-y", turn=new_turn_id(), digest="d2-不同内容",
+                 assistant="另一条回答。")
+    assert rc["status"] == "conflict"
+    rows = kv.read("session", "s-tc3") or []
+    assert len(rows) == 2, "冲突重试不许写入新内容"
+
+
+def test_chat_insert_failure_rolls_back_everything(kv, monkeypatch):
+    """第二条 chat INSERT 失败：整体回滚——无半轮、无回执、无请求登记、关系不动。"""
+    from data.sqlite_store import get_db as _gdb
+
+    store = _gdb()
+    real_conn = store._conn
+
+    class _FailSecondChatInsert:
+        """代理连接：第二条 chat_log INSERT 时抛错（确定性注入）。"""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self._n = 0
+
+        def execute(self, sql, *args):
+            if "INSERT INTO chat_log" in sql:
+                self._n += 1
+                if self._n == 2:
+                    raise sqlite3.OperationalError("注入：第二条 chat INSERT 失败")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(store, "_conn", _FailSecondChatInsert(real_conn))
+    rc = _commit(kv, "s-tc4", "req-f")
+    assert rc["status"] == "failed"
+
+    monkeypatch.setattr(store, "_conn", real_conn)
+    # 四类痕迹全部为零：无半轮
+    assert kv.read("session", "s-tc4") in (None, [], {})
+    assert kv.read("relationship", "s-tc4") in (None, {}, [])
+    assert kv.recent_ledger("s-tc4") == []
+    assert kv.get_commit_receipt("s-tc4", "req-f") is None
+    raw = store._conn.execute(
+        "SELECT COUNT(*) FROM turn_requests WHERE request_id='req-f'"
+    ).fetchone()[0]
+    assert raw == 0, "失败事务连请求登记也一并回滚"
+
+
+def test_ledger_insert_failure_rolls_back_everything(kv, monkeypatch):
+    """账本 INSERT 失败：整体回滚——**无账的关系变化也不许存在**。"""
+    from data.sqlite_store import get_db as _gdb
+
+    store = _gdb()
+    real_conn = store._conn
+
+    class _FailLedger:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if "INSERT INTO affection_history" in sql:
+                raise sqlite3.OperationalError("注入：账本 INSERT 失败")
+            return self._conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(store, "_conn", _FailLedger(real_conn))
+    rc = _commit(kv, "s-tc5", "req-g", ledger={
+        "field": "intimacy", "old": 20, "new": 25, "reason": "x",
+    })
+    assert rc["status"] == "failed"
+
+    monkeypatch.setattr(store, "_conn", real_conn)
+    assert kv.read("session", "s-tc5") in (None, [], {}), "无半轮"
+    assert kv.read("relationship", "s-tc5") in (None, {}, []), "账本失败不许留下关系变化"
+    assert kv.recent_ledger("s-tc5") == []
+    assert kv.get_commit_receipt("s-tc5", "req-g") is None
+
+
+def test_relation_fn_failure_rolls_back(kv, monkeypatch):
+    """注入的纯计算炸了（本地缺陷）：整体回滚，不留任何痕迹。"""
+    from data.sqlite_store import get_db as _gdb
+
+    def boom(rel):
+        raise NameError("注入：纯计算本地缺陷")
+
+    store = _gdb()
+    real_conn = store._conn
+    rc = _commit(kv, "s-tc6", "req-h", relation_fn=boom)
+    assert rc["status"] == "failed"
+    monkeypatch.setattr(store, "_conn", real_conn)
+    assert kv.read("session", "s-tc6") in (None, [], {})
+    assert kv.get_commit_receipt("s-tc6", "req-h") is None
+
+
+def test_event_interleaving_commit_before_during_after(kv):
+    """Event 控制三种交错：
+    - 事务中：入口 A 在事务内被 Event 挡住时，入口 B 必须等它出结果；
+    - 提交后：B 拿到 already_committed 原回执；
+    - 提交前（并发竞争）：两线程同 request 同时提交 → 恰好一个 committed。
+    """
+    store = get_db()
+    sid = "s-tc7"
+    turn = new_turn_id()
+    release = threading.Event()
+
+    def blocking_relation(rel):
+        release.wait(timeout=5)  # 事务中挂起：放大交错窗口
+        return _relation_fn()(rel)
+
+    done = {}
+
+    def _worker(req, tag, rel_fn=None):
+        rc = kv.commit_turn(
+            session_id=sid, turn_id=turn or new_turn_id(), request_id=req,
+            request_digest="d1", disposition="normal",
+            user_text="你好", assistant_text="回答。", mode="text",
+            relation_fn=rel_fn or _relation_fn(), ledger={
+                "field": "intimacy", "old": 20, "new": 21, "reason": "r",
+            },
+        )
+        done[tag] = rc["status"]
+
+    # 事务中：A 挂在事务内，B 等待（BEGIN IMMEDIATE 串行化）
+    t_a = threading.Thread(target=_worker, args=("req-i", "A", blocking_relation))
+    t_a.start()
+    import time as _t
+
+    deadline = _t.monotonic() + 5
+    while "A" not in done and _t.monotonic() < deadline:
+        _t.sleep(0.01)
+    # A 还没出结果（被 Event 挡住）——此时 B 提交同 request 必须排队而不是并行写
+    t_b = threading.Thread(target=_worker, args=("req-i", "B"))
+    t_b.start()
+    release.set()
+    t_a.join(timeout=5)
+    t_b.join(timeout=5)
+    assert sorted(done.values()) == ["already_committed", "committed"], f"实测 {done}"
+    assert len(kv.read("session", sid) or []) == 2, "两线程交错也不许双写"
+
+    # 提交后：再次重试拿原回执
+    _worker("req-i", "C")
+    assert done["C"] == "already_committed"
+
+    # 提交前（并发竞争）：全新 request，两线程同时冲 → 恰好一个 committed
+    done2 = {}
+    barrier = threading.Barrier(2)
+
+    def _race(tag):
+        barrier.wait()
+        rc = kv.commit_turn(
+            session_id=sid, turn_id=new_turn_id(), request_id="req-race",
+            request_digest="d1", user_text="你好", assistant_text="答。",
+            mode="text", relation_fn=_relation_fn(),
+        )
+        done2[tag] = rc["status"]
+
+    ths = [threading.Thread(target=_race, args=(t,)) for t in ("R1", "R2")]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=5)
+    assert sorted(done2.values()) == ["already_committed", "committed"], f"实测 {done2}"

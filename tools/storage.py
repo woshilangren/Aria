@@ -16,6 +16,7 @@ from data.chroma_client import ChromaClient
 from shared.timeutils import safe_delta_seconds
 from data.embedding_client import EMBED_BATCH_SIZE, QwenEmbedding
 from data.schemas import DialogueRecord, MemoryItem
+from data.sqlite_store import get_db
 from data.stores import (
     ImageAssetStore,
     LogStore,
@@ -754,6 +755,18 @@ class KVStoreTool:
     def recent_ledger(self, session_id: str, n: int = 8) -> list:
         """最近 n 条关系账本（旧 -> 新），氛围线聚合趋势用。"""
         return self._relationship.recent_ledger(session_id, n)
+
+    def commit_turn(self, **kwargs) -> dict:
+        """R15c：一轮提交的事务门面（参数见 sqlite_store.commit_turn）。
+
+        调用方注入 relation_fn（R15b 纯计算）——本门面只透传，人格计算
+        不进 data 层。返回回执 dict（committed/already_committed/conflict/
+        processing/failed）。"""
+        return get_db().commit_turn(**kwargs)
+
+    def get_commit_receipt(self, session_id: str, request_id: str):
+        """按 (session, request) 查已提交回执；没有返回 None。"""
+        return get_db().get_commit_receipt(session_id, request_id)
 
     def chats_between(self, session_id: str, start_iso: str, end_iso: str) -> list:
         """按时间段捞聊天记录（含头不含尾），写日记要用某一天的完整对话就靠它。"""

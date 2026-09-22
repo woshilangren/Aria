@@ -471,6 +471,166 @@ class SQLiteStorage:
             )
         return updated
 
+    # ---------- R15c：一轮提交的事务门面（8.11.3） ----------
+
+    def commit_turn(self, *, session_id: str, turn_id: str, request_id: str,
+                    request_digest: str, disposition: str = "normal",
+                    source_review_status: str = "accepted", reason_code: str = "",
+                    user_text: str = "", assistant_text: str = "",
+                    intent: str = "", emotion: str = "", mode: str = "text",
+                    relation_fn: Optional[Callable] = None,
+                    ledger: Optional[dict] = None,
+                    created_at: Optional[str] = None) -> dict:
+        """一轮提交 = **一个短事务**：请求登记 → user/assistant 正式记录 →
+        关系原子更新 → 账本 → 提交回执。任何一步失败整体回滚——无半轮、
+        无无账的关系变化、无回执；同 request 重试返回同一回执（不重复计数）；
+        同 request 不同 digest 明确 conflict。
+
+        - relation_fn：**调用方注入的纯计算**（R15b 的
+          compute_relationship_update 偏应用）——本层不做人格计算，也不
+          import capability；事务内从 relationship 表读**最新**现态传入，
+          禁止先读快照再覆盖；
+        - ledger：{field, old, new, reason, quote, event_id, old_value,
+          new_value}，field != intimacy 的行不占旧分数列（R15a 结构）；
+        - 关系/账本可选： Crisis 轮等无普通增长的轮次传 None 即可；
+        - 用户转写为空不造假 user 行，助手正文为空不造假 assistant 行。
+
+        返回回执 dict：status ∈ committed / already_committed / conflict /
+        processing / failed。本方法只提供**低层能力**——路由接入与生命周期
+        推进是 R17 的事，接入前不能宣传所有路由已遵守契约。
+        """
+        now = created_at or datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            if self._conn.in_transaction:
+                # 防御：提交不允许在悬挂事务里跑（同 _run_migration 的处理）
+                self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                # ① 请求登记去重：同 request 已登记过 → 查回执/冲突/在途
+                row = self._conn.execute(
+                    "SELECT request_digest FROM turn_requests "
+                    "WHERE request_id = ? AND session_id = ?",
+                    (request_id, session_id),
+                ).fetchone()
+                if row is not None:
+                    if row[0] != request_digest:
+                        self._conn.rollback()
+                        return {"status": "conflict", "turn_id": turn_id,
+                                "session_id": session_id, "request_id": request_id,
+                                "reason_code": "request_digest_mismatch"}
+                    rc = self._conn.execute(
+                        "SELECT turn_id, committed_at, disposition, message_ids "
+                        "FROM turn_commits WHERE session_id = ? AND request_id = ?",
+                        (session_id, request_id),
+                    ).fetchone()
+                    self._conn.rollback()
+                    if rc is not None:
+                        # 同 request 重试：返回**原回执**，不重复计数
+                        import json as _json
+                        return {"status": "already_committed", "turn_id": rc[0],
+                                "session_id": session_id, "request_id": request_id,
+                                "disposition": rc[2], "committed_at": rc[1],
+                                "message_ids": _json.loads(rc[3] or "[]")}
+                    return {"status": "processing", "turn_id": turn_id,
+                            "session_id": session_id, "request_id": request_id}
+
+                # ② 请求登记（lifecycle=committing；随本事务一起落定）
+                self._conn.execute(
+                    "INSERT INTO turn_requests "
+                    "(request_id, session_id, request_digest, turn_id, lifecycle, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'committing', ?, ?)",
+                    (request_id, session_id, request_digest, turn_id, now, now),
+                )
+                # ③ 正式记录：user / assistant（空转写不造假行）
+                message_ids = []
+                if user_text:
+                    cur = self._conn.execute(
+                        "INSERT INTO chat_log (session_id, role, content, intent, emotion, "
+                        "mode, created_at, turn_id, disposition, source_review_status, reason_code) "
+                        "VALUES (?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (session_id, user_text, intent, emotion, "text", now,
+                         turn_id, disposition, source_review_status, reason_code),
+                    )
+                    message_ids.append(cur.lastrowid)
+                if assistant_text:
+                    cur = self._conn.execute(
+                        "INSERT INTO chat_log (session_id, role, content, intent, emotion, "
+                        "mode, created_at, turn_id, disposition, source_review_status, reason_code) "
+                        "VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (session_id, assistant_text, intent, emotion, mode, now,
+                         turn_id, disposition, source_review_status, reason_code),
+                    )
+                    message_ids.append(cur.lastrowid)
+                # ④ 关系：事务内读**最新**现态 → 调用方注入的纯计算 → 写回
+                if relation_fn is not None:
+                    rel_row = self._conn.execute(
+                        "SELECT value FROM relationship WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    rel = json.loads(rel_row[0]) if rel_row else {}
+                    new_rel = relation_fn(rel)
+                    self._conn.execute(
+                        "INSERT INTO relationship (session_id, value) VALUES (?, ?) "
+                        "ON CONFLICT(session_id) DO UPDATE SET value = excluded.value",
+                        (session_id, json.dumps(new_rel, ensure_ascii=False)),
+                    )
+                # ⑤ 账本（可选；field != intimacy 不占旧分数列，R15a 结构）
+                if ledger:
+                    fld = ledger.get("field", "intimacy")
+                    is_intimacy = fld == "intimacy"
+                    try:
+                        old_s = float(ledger["old"]) if is_intimacy else 0.0
+                        new_s = float(ledger["new"]) if is_intimacy else 0.0
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError(f"账本参数不合法（field={fld}）: {exc}") from exc
+                    self._conn.execute(
+                        "INSERT INTO affection_history "
+                        "(session_id, old_score, new_score, delta, reason, source_quote, "
+                        "created_at, field, old_value, new_value, event_id) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (session_id, old_s, new_s, round(new_s - old_s, 4),
+                         (ledger.get("reason") or "")[:150],
+                         (ledger.get("quote") or "")[:150], now, fld,
+                         json.dumps(ledger.get("old_value"), ensure_ascii=False)[:500],
+                         json.dumps(ledger.get("new_value"), ensure_ascii=False)[:500],
+                         ledger.get("event_id", "")),
+                    )
+                # ⑥ 回执：COMMIT 成功才算正式历史（8.11.3 原子边界 3）
+                self._conn.execute(
+                    "INSERT INTO turn_commits "
+                    "(turn_id, session_id, request_id, disposition, status, committed_at, "
+                    "message_ids, reason_code) VALUES (?, ?, ?, ?, 'committed', ?, ?, ?)",
+                    (turn_id, session_id, request_id, disposition, now,
+                     json.dumps(message_ids), reason_code),
+                )
+                self._conn.execute("COMMIT")
+            except Exception as exc:
+                # 任何一步失败整体回滚：无半轮、无无账的关系变化、无回执
+                self._conn.rollback()
+                print(f"[commit] 一轮提交失败，已整体回滚: {type(exc).__name__}: {exc}")
+                return {"status": "failed", "turn_id": turn_id,
+                        "session_id": session_id, "request_id": request_id,
+                        "reason_code": "commit_failed", "detail": str(exc)}
+            return {"status": "committed", "turn_id": turn_id,
+                    "session_id": session_id, "request_id": request_id,
+                    "disposition": disposition, "committed_at": now,
+                    "message_ids": message_ids}
+
+    def get_commit_receipt(self, session_id: str, request_id: str) -> Optional[dict]:
+        """按 (session, request) 查已提交回执；没有返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT turn_id, disposition, status, committed_at, message_ids, reason_code "
+                "FROM turn_commits WHERE session_id = ? AND request_id = ?",
+                (session_id, request_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"status": row[2], "turn_id": row[0], "session_id": session_id,
+                "request_id": request_id, "disposition": row[1],
+                "committed_at": row[3], "message_ids": json.loads(row[4] or "[]"),
+                "reason_code": row[5] or ""}
+
     # ---------- 关系数值账本（S3）：追加写 + 近 N 条读 ----------
 
     def append_ledger(self, session_id: str, old: float, new: float,
