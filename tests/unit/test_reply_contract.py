@@ -118,3 +118,92 @@ def test_refuse_carries_rejected_review_status(register_services):
     assert reply.review_status == "rejected"
     assert reply.reason_code == "review_output_blocked"
     assert "QW7X" not in reply.text
+
+
+# ------------------- R14b：发布内容汇总 -------------------
+
+def test_refuse_after_published_prefix_composes_degraded_canonical(register_services):
+    """已发布合格前缀后再拒绝：存储 = 前缀 + 兜底（R14b 核心），不是完整原稿
+    也不是空。前端仍收到整轮替换的兜底文案（既有语义不变）。"""
+    from orchestration.pipeline import KEEPER, DialoguePipeline
+
+    llm = FakeLLM(stream_scripts=[
+        # 同一次生成内：第一句已发布（推给前端），第二句被审核拒绝 → 已推过
+        # 内容 → 整轮降级（_MAX_REWRITE 的重写只在"没推过"时发生）
+        ["这句先说给你听了。后半句冒出作为一个AI的QW7X。"],
+    ])
+    _register(register_services, llm)
+    sid = "r14b-degraded"
+
+    reply = asyncio.run(
+        DialoguePipeline().handle(InputMessage(text="随便聊聊天", session_id=sid))
+    )
+    # 前端：整轮替换成安全兜底
+    assert reply.review_status == "rejected"
+    assert "QW7X" not in reply.text
+    # 存储：降级 canonical = 已发布前缀 + 兜底（不是完整原稿、不是空）
+    expected_prefix = "这句先说给你听了。"
+    rows = services.get("kv_store").read("session", sid) or []
+    assistant_rows = [r.get("text", "") for r in rows if r.get("role") == "assistant"]
+    assert assistant_rows, "降级轮必须落库（前缀+兜底）"
+    stored = assistant_rows[-1]
+    assert stored.startswith(expected_prefix), f"降级正文必须以已发布前缀开头，实测 {stored!r}"
+    assert "QW7X" not in stored and "作为一个AI" not in stored
+    assert stored != expected_prefix, "前缀之后应接兜底话"
+    # KEEPER 同步
+    ctx = [m["content"] for m in KEEPER.get_context(sid) if m.get("role") == "assistant"]
+    assert expected_prefix in ctx[-1]
+
+
+def test_refuse_without_published_prefix_stores_nothing(register_services):
+    """没推出任何内容就拒绝：维持 refuse-only（什么都没说过），不造假正文。"""
+    from orchestration.pipeline import KEEPER, DialoguePipeline
+    from shared.singletons import services
+
+    llm = FakeLLM(stream_scripts=[
+        ["作为一个AI不该说QW7X。"],
+        ["重写后还是带QW7X，作为一个AI。"],
+        ["第三次仍有QW7X，作为一个AI。"],
+    ])
+    _register(register_services, llm)
+    sid = "r14b-noprefix"
+
+    reply = asyncio.run(
+        DialoguePipeline().handle(InputMessage(text="随便聊聊天", session_id=sid))
+    )
+    assert reply.review_status == "rejected"
+    rows = services.get("kv_store").read("session", sid) or []
+    assert not any(r.get("role") == "assistant" for r in rows), "零发布前缀的拒绝轮不许有正文"
+    ctx = [m for m in KEEPER.get_context(sid) if m.get("role") == "assistant"]
+    assert ctx == []
+
+
+def test_gateway_tts_source_is_canonical(register_services, monkeypatch):
+    """R14b：voice_text 同义性不可核验 → TTS 源 = canonical 正文，不是语音版。"""
+    from interaction.gateway import OutputRenderer
+
+    spoken_inputs = []
+
+    class _RecordingTTS:
+        def synthesize(self, text, **kwargs):
+            spoken_inputs.append(text)
+            return b"fake-audio"
+
+    monkeypatch.setitem(services._services, "tts", _RecordingTTS())
+    from shared.types import FinalReply
+
+    renderer = OutputRenderer()
+    data = renderer.render(
+        FinalReply(text="正文内容。", voice_text="口语版内容。"), "r14b-tts"
+    )
+    assert spoken_inputs == ["正文内容。"], f"TTS 源必须是 canonical，实测 {spoken_inputs}"
+    assert data["voice_audio"]
+    assert data["voice_text"] == "正文内容。", "语音条标注必须与实际合成内容一致"
+
+
+def test_finalreply_delivery_defaults_unknown():
+    """发布确认（8.11.1 规则 6）：handle 攒出的 FinalReply 不算发布——
+    delivery 默认 unknown，只有交互适配器才能置 sent。"""
+    from shared.types import FinalReply
+
+    assert FinalReply(text="x").delivery == "unknown"

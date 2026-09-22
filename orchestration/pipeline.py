@@ -811,6 +811,15 @@ class DialoguePipeline:
             # force_if_last_poor 在降级后的下一轮永远不触发。_writeback 内部
             # 检测 final_reply/draft_reply 都空时走 refuse-only 分支（只写关系层），
             # 不写 KEEPER / chat_log / 蒸馏 / 画像——refuse 没说过话。
+            #
+            # R14b：**已发布合格前缀后再拒绝**——降级 canonical = 已发布的合格
+            # 前缀 + 实际采用的兜底（8.11.1 发布规则 2）。已说的话不能装没说、
+            # 也不能把完整原稿存回去：只存"推出去过的 + 兜底"。没有任何已发布
+            # 前缀时维持 refuse-only（什么都没说过）。
+            published = "".join(canonical_parts)
+            if published:
+                state.canonical_text = published + r.text
+                state.final_reply = state.canonical_text
             deferred = await asyncio.to_thread(self._writeback, state, handle)
             self._check_cancel(handle)
             _schedule_bg_writeback(deferred)

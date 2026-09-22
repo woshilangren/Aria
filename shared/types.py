@@ -130,6 +130,10 @@ class FinalReply:
     voice_text: str = ""          # 语音派生正文；空 = 无独立语音表达
     review_status: str = "accepted"
     reason_code: str = ""
+    # R14b 发布确认（8.11.1 规则 6）：发送与接收是不同事实。sent = 交互适配器
+    # 已把回复交给发送层；partial/failed/unknown 由适配器按实际填写。
+    # handle() 在内存里攒出 FinalReply 不算发布——这个字段只能由适配器写。
+    delivery: str = "unknown"
 
 
 @dataclass

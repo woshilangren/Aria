@@ -275,6 +275,9 @@ async def send_message(payload: dict) -> dict:
         )
     # render 内部有秒级同步网络调用，扔线程池，别堵住事件循环（否则并发语音通话一起僵死）
     data = await asyncio.to_thread(gateway["renderer"].render, reply, message.session_id)
+    # R14b 发布确认：JSON 已成功组装并交给发送层 = sent；handle() 在内存攒出
+    # FinalReply 不算发布（8.11.1 规则 6：发送与接收是不同事实）
+    reply.delivery = "sent"
     # 兜底：AI 这轮没给自己标语音、但用户明确点名要语音时，把简短正文也合一条语音；
     # 已主动带语音就不重复。TTS 失败只是少声音，文字照常回。
     if _wants_voice(text) and not data.get("voice_audio"):

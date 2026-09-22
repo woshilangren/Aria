@@ -126,10 +126,15 @@ class OutputRenderer:
         }
         if voice_text:
             try:
-                audio = self.render_voice(voice_text, session_id)
-                save_cached_voice(voice_text, audio)  # 落盘，历史语音条免重复合成
+                # R14b：voice_text 的同义性无法可靠核验（它由模型自标，可能
+                # 混入正文没有的事实/承诺）——TTS 源直接用 canonical 正文
+                # （8.11.1 契约明文允许），不靠 prompt 承诺。voice_text 降级为
+                # "存在语音表达"的信号，不再作为合成源。
+                spoken = clean_text or reply.text
+                audio = self.render_voice(spoken, session_id)
+                save_cached_voice(spoken, audio)  # 落盘，历史语音条免重复合成
                 data["voice_audio"] = base64.b64encode(audio).decode()
-                data["voice_text"] = voice_text
+                data["voice_text"] = spoken
             except Exception:
                 # 语音合成只是锦上添花，失败就退回纯文字，别影响聊天
                 pass
