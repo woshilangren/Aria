@@ -1122,8 +1122,12 @@ class DialoguePipeline:
                     )
             except Exception:
                 pass  # 深度确认是补网，挂了就按词表与感知结果走
-        # 危机信号或用户明说要安慰，都切安抚模式
-        state.comfort_mode = bool(emotion.is_crisis) or intent.intent == "comfort"
+        # 危机信号或用户明说要安慰，都切安抚模式。
+        # R03：必须读 state.emotion（深度确认可能已把它替换成危机），不能读
+        # 旧局部 emotion——否则"初判 sad、二次确认危机"的轮次里，is_crisis
+        # 已经生效（下游 writeback 的危机不沉淀边界能看到），comfort_mode
+        # 却还是 False，安抚语气没跟上——同一个结果两个字不说一类话。
+        state.comfort_mode = bool(state.emotion.is_crisis) or intent.intent == "comfort"
 
     def _compose(self, state: TurnState) -> None:
         """人设组装。安抚模式换 comfort 语气，正常轮先掷一次"小动作骰子"。"""

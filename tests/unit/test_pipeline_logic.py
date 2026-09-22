@@ -256,3 +256,107 @@ def test_voice_inner_email_not_touched():
     frags, _s = _frags("好的。<voice>发到 a@r.com</voice>", voice_mode=True)
     voices = [f for f in frags if f[0] == "voice"]
     assert voices[0][1] == "发到 a@r.com"
+
+
+# ------------------- R03：危机深度确认结果接线 -------------------
+
+from shared.types import IntentResult, MemoryBundle, PerceptionExtras  # noqa: E402
+
+
+class _FixedPerception:
+    """固定返回初判结果的感知替身（不调 LLM）。"""
+
+    def __init__(self, intent, emotion):
+        self._intent = intent
+        self._emotion = emotion
+
+    def run(self, text, recent_context=None, session_id=""):  # noqa: ARG002
+        return self._intent, self._emotion, "", PerceptionExtras()
+
+
+class _EmptyRecall:
+    def recall(self, query, session_id):  # noqa: ARG002
+        return MemoryBundle()
+
+
+class _CountingLLM:
+    """深度确认调用的替身：记录调用次数并返回固定应答或抛错。"""
+
+    def __init__(self, reply=None, exc=None):
+        self.reply = reply
+        self.exc = exc
+        self.calls = 0
+
+    def chat(self, messages, temperature=None, max_tokens=None):  # noqa: ARG002
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.reply
+
+
+def _run_perceive(monkeypatch, llm):
+    """搭好替身并真跑 _perceive：初判 = sad 强情绪（非危机，满足二次确认条件）。"""
+    from shared.singletons import services
+
+    emo = EmotionResult(emotion="sad", intensity=0.9)
+    intent = IntentResult(intent="chat")
+    from orchestration import pipeline as pl
+
+    monkeypatch.setattr(pl, "PerceptionPipeline",
+                        lambda: _FixedPerception(intent, emo))
+    monkeypatch.setattr(pl, "MemoryRecaller", _EmptyRecall)
+    monkeypatch.setattr(pl.KEEPER, "get_context", lambda sid: [])
+    services.register("llm", llm)
+    state = TurnState(user_text="我最近撑得很辛苦", session_id="r03")
+    pl.DialoguePipeline()._perceive(state)
+    return state, llm
+
+
+def test_deep_confirm_crisis_sets_comfort_mode(monkeypatch):
+    """初判非危机、二次确认危机 → is_crisis 与 comfort_mode 必须同时生效。
+
+    缺陷（R03）：确认分支写的是 state.emotion，comfort_mode 却读旧局部
+    emotion.is_crisis——确认结果被下游（compose 的 comfort 语气、writeback 的
+    危机不沉淀边界）看到，安抚模式却没跟上。
+    """
+    state, llm = _run_perceive(monkeypatch, _CountingLLM(reply="yes"))
+    assert state.emotion.is_crisis is True, "二次确认 yes 必须置危机"
+    assert state.comfort_mode is True, "comfort_mode 必须读取确认后的最终结果"
+    assert llm.calls == 1
+
+
+def test_deep_confirm_failure_keeps_original_judgement(monkeypatch):
+    """确认 LLM 挂 → 保留现有降级：不凭空变危机、不切安抚模式。"""
+    state, llm = _run_perceive(monkeypatch, _CountingLLM(exc=RuntimeError("llm down")))
+    assert state.emotion.is_crisis is False
+    assert state.comfort_mode is False
+    assert llm.calls == 1
+
+
+def test_deep_confirm_no_keeps_original_judgement(monkeypatch):
+    """确认回答 no → 保留原判定（sad，非危机）。"""
+    state, _llm = _run_perceive(monkeypatch, _CountingLLM(reply="no"))
+    assert state.emotion.is_crisis is False
+    assert state.emotion.emotion == "sad"
+    assert state.comfort_mode is False
+
+
+def test_preconfirmed_crisis_skips_deep_confirm(monkeypatch):
+    """初判已是危机（词表直判）→ 不烧确认调用，comfort_mode 直接生效。"""
+    from shared.singletons import services
+
+    emo = EmotionResult(emotion="crisis", intensity=1.0, is_crisis=True)
+    intent = IntentResult(intent="comfort")
+    from orchestration import pipeline as pl
+
+    monkeypatch.setattr(pl, "PerceptionPipeline",
+                        lambda: _FixedPerception(intent, emo))
+    monkeypatch.setattr(pl, "MemoryRecaller", _EmptyRecall)
+    monkeypatch.setattr(pl.KEEPER, "get_context", lambda sid: [])
+    llm = _CountingLLM(reply="yes")
+    services.register("llm", llm)
+    state = TurnState(user_text="不想活了", session_id="r03b")
+    pl.DialoguePipeline()._perceive(state)
+    assert state.emotion.is_crisis is True
+    assert state.comfort_mode is True
+    assert llm.calls == 0, "初判危机走词表直判，不需要二次确认调用"
