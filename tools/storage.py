@@ -47,6 +47,34 @@ def _norm_embeddings(value):
     return value if len(value) > 0 else []
 
 
+# R01b：迁移状态文件放 DATA_DIR（跟 chroma 数据同区，绝不放仓库根）。
+# 记录"哪个集合迁移到哪一步"——进程在迁移中途死掉后，下次启动靠它续命；
+# 文件缺失/损坏按"无记录"处理，恢复逻辑另有遗留事故探测兜底，绝不能因为
+# 状态读不出来就把唯一副本当垃圾清掉。
+_MIGRATION_STATE_FILE = "vector_migration_state.json"
+
+
+def _load_migration_state(path: Path) -> dict:
+    """读迁移状态。缺失返回 {}；损坏也返回 {} 但大声告警——宁可退化成
+    "无状态文件的遗留现场"（靠探测恢复），不许静默。"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[memory] 迁移状态文件损坏，按无记录处理（不得据此删任何数据）: {exc}")
+        return {}
+
+
+def _save_migration_state(path: Path, state: dict) -> None:
+    """写迁移状态。写失败不致命：最坏退化为"无状态文件的遗留现场"，
+    恢复逻辑照样能靠'主集合空 + __migrating 有货'探测兜底，所以只告警不抛。"""
+    try:
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:
+        print(f"[memory] 迁移状态写入失败（恢复将退化为遗留现场探测）: {exc}")
+
+
 class VectorStoreTool:
     """长期记忆的存取：写入按向量存，查询按语义搜。
 
@@ -61,6 +89,9 @@ class VectorStoreTool:
         self._chroma = ChromaClient()
         self._embedder = QwenEmbedding()
         self._cols = {}  # 集合名 -> Collection，用的时候现取
+        # R01b：迁移状态随实例加载（"重启"= 新实例从磁盘重新读到上次现场）
+        self._state_file = get_settings().data_dir / _MIGRATION_STATE_FILE
+        self._migration_state = _load_migration_state(self._state_file)
 
     def ensure_ready(self) -> None:
         """建好两个集合（含维度守护），由组合根在装配时显式调用一次。
@@ -77,7 +108,9 @@ class VectorStoreTool:
             try:
                 self._cols[name] = self._ensure_collection(name, cfg)
             except Exception as exc:
-                print(f"[memory] 集合 {name} 初始化失败，暂时不可用: {exc}")
+                # R01b：走到这里的失败含"唯一副本不可恢复"——明确停用该集合并大声
+                # 告警，绝不许把"空主集合 + metadata 正确"当成健康继续用
+                print(f"[memory] 集合 {name} 初始化失败，该集合停用（聊天不受影响，此集合记忆检索不可用）: {exc}")
 
     def _col_of(self, collection_name: str):
         """拿某个集合，没建出来（初始化失败/降级中）就返回 None。"""
@@ -95,14 +128,28 @@ class VectorStoreTool:
         现在改成：先把新向量灌进 `原名__migrating` 临时集合 → 全部成功后才删旧集合 →
         把临时集合的数据（连同算好的向量，零 API 调用）拷进正式集合 → 删临时。
         任何一步失败，旧集合原样健在，下次启动重试——最坏结果只是"还在用旧模型"，绝不丢数据。
+
+        R01b 追加的可恢复性：
+        - **先恢复、再判 metadata**：入口先查未完成的迁移（状态文件 + 无状态文件的
+          遗留现场），处理完才轮到 metadata 匹配判断——否则"主集合空 + metadata
+          正确"会被当成健康集合直接返回，伪装成数据丢了。
+        - **状态文件**：迁移各阶段落 DATA_DIR/vector_migration_state.json，崩在
+          任何一步，下次启动都能从现场恢复。
+        - **删除前的验证门**：删旧集合之前必须逐 ID 验证临时集合完整；删临时
+          集合之前必须逐 ID 验证正式集合完整。验证不过就抛错，一个集合都不许删。
         """
         metadata = {"embedding_model": cfg.embedding_model, "dimension": cfg.embedding_dimension}
+        # ① 未完成迁移优先处理（恢复 / 清场 / 明确停用），之后才轮到 metadata 匹配
+        self._recover_incomplete(collection_name, cfg, metadata)
         col = self._chroma.get_collection(collection_name, metadata=metadata)
         meta = col.metadata or {}
         if (
             meta.get("embedding_model") == cfg.embedding_model
             and meta.get("dimension") == cfg.embedding_dimension
         ):
+            # metadata 匹配 = 迁移已收尾：状态记录一并清掉（可能有收尾前崩的残留）
+            if self._migration_state.pop(collection_name, None) is not None:
+                self._save_state()
             return col
         # 走到这说明换过模型/维度：旧向量不作数了
         old = col.get(include=["documents", "metadatas"])
@@ -120,6 +167,15 @@ class VectorStoreTool:
         except Exception:
             pass  # 临时集合不存在是常态，上次迁移正常收尾就不会留下它
         tmp = self._chroma.get_collection(tmp_name, metadata=metadata)
+        # 登记迁移状态（嵌入阶段）。崩在这段=旧主集合完好，恢复路径会清场重走。
+        self._migration_state[collection_name] = {
+            "phase": "embedding",
+            "tmp_name": tmp_name,
+            "target": dict(metadata),
+            "expected_ids": list(ids),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_state()
         for i in range(0, len(ids), EMBED_BATCH_SIZE):
             batch_docs = docs[i : i + EMBED_BATCH_SIZE]
             tmp.upsert(
@@ -128,23 +184,158 @@ class VectorStoreTool:
                 documents=batch_docs,
                 metadatas=metas[i : i + EMBED_BATCH_SIZE],
             )
-        # 临时集合灌满了才动旧集合：从这里往后只做本地拷贝，不可能再失败
+        # 删除旧集合之前必须逐 ID 验证临时集合完整——这是"删除旧集合"的唯一门票
+        self._verify_complete(tmp, set(ids), f"临时集合 {tmp_name}")
+        self._migration_state[collection_name]["phase"] = "copying"
+        self._save_state()
+        # 从这里往后只做本地拷贝；任何一步崩了，恢复逻辑从 tmp 整包拷回
         self._chroma.delete_collection(collection_name)
         final = self._chroma.get_collection(collection_name, metadata=metadata)
-        copied = tmp.get(include=["embeddings", "documents", "metadatas"])
-        c_ids = copied.get("ids") or []
-        c_vecs = _norm_embeddings(copied.get("embeddings"))
-        c_docs = copied.get("documents") or []
-        c_metas = copied.get("metadatas") or []
-        for i in range(0, len(c_ids), EMBED_BATCH_SIZE):
-            final.upsert(
-                ids=c_ids[i : i + EMBED_BATCH_SIZE],
-                embeddings=c_vecs[i : i + EMBED_BATCH_SIZE],
-                documents=c_docs[i : i + EMBED_BATCH_SIZE],
-                metadatas=c_metas[i : i + EMBED_BATCH_SIZE],
-            )
+        self._copy_rows(tmp, final)
+        # 删临时集合之前必须逐 ID 验证正式集合完整——唯一副本此时才允许换手
+        self._verify_complete(final, set(ids), f"正式集合 {collection_name}")
         self._chroma.delete_collection(tmp_name)
+        self._migration_state.pop(collection_name, None)
+        self._save_state()
         return final
+
+    # ---------------- R01b：迁移状态与恢复 ----------------
+
+    def _save_state(self) -> None:
+        _save_migration_state(self._state_file, self._migration_state)
+
+    def _col_ids(self, col) -> list:
+        """集合里现存的全部 ID（只取 ids，不搬数据）。集合不可读返回空。"""
+        try:
+            return list(col.get()["ids"] or [])
+        except Exception:
+            return []
+
+    def _verify_complete(self, col, expected_ids: set, label: str) -> None:
+        """逐 ID 校验集合与预期完全一致；不过就抛错。任何删除动作前必须先过这道门：
+        宁可迁移重来（数据都在），不可在副本不完整时删掉另一份。"""
+        got = self._col_ids(col)
+        missing = expected_ids - set(got)
+        extra = set(got) - expected_ids
+        if missing or extra or len(got) != len(expected_ids):
+            raise RuntimeError(
+                f"[memory] {label} 校验失败：预期 {len(expected_ids)} 条，实际 {len(got)} 条"
+                f"（缺 {len(missing)}，多 {len(extra)}）——该状态下禁止删除任何集合"
+            )
+
+    def _copy_rows(self, src, dst) -> None:
+        """把 src 的全部数据（连同向量，零 API 调用）整包拷进 dst。"""
+        data = src.get(include=["embeddings", "documents", "metadatas"])
+        ids = data.get("ids") or []
+        vecs = _norm_embeddings(data.get("embeddings"))
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        for i in range(0, len(ids), EMBED_BATCH_SIZE):
+            dst.upsert(
+                ids=ids[i : i + EMBED_BATCH_SIZE],
+                embeddings=vecs[i : i + EMBED_BATCH_SIZE],
+                documents=docs[i : i + EMBED_BATCH_SIZE],
+                metadatas=metas[i : i + EMBED_BATCH_SIZE],
+            )
+
+    def _recover_incomplete(self, collection_name: str, cfg, metadata: dict) -> None:
+        """处理未完成的迁移。三种结局：
+        ① `__migrating` 有完整副本 → 不管主集合是旧数据/空/半拷/不存在，整包拷回收尾；
+        ② 嵌入阶段中断（临时集合不完整）且旧主集合健在 → 清掉半截临时集合，重走迁移；
+        ③ 主集合缺失/为空且临时集合不完整 → 唯一副本已不可恢复，抛错让 ensure_ready
+           明确停用该集合并告警——绝不许"空主集合 + metadata 正确"伪装健康。
+        无状态文件的遗留事故（升级前留下的现场）也在这里兜住：主集合 metadata 已是
+        目标值但空、`__migrating` 有货 → 恢复。
+        """
+        raw = self._chroma.client
+        state = self._migration_state
+        rec = state.get(collection_name)
+        tmp_name = f"{collection_name}__migrating"
+
+        def _try_get(name):
+            # 只查不建：get_collection（chroma 裸客户端）对不存在的名字抛错
+            try:
+                return raw.get_collection(name)
+            except Exception:
+                return None
+
+        tmp = _try_get(tmp_name)
+        tmp_ids = self._col_ids(tmp) if tmp is not None else []
+
+        if rec and rec.get("phase") in ("embedding", "copying") and rec.get("expected_ids"):
+            expected = set(rec["expected_ids"])
+            tmp_full = tmp is not None and set(tmp_ids) == expected and len(tmp_ids) == len(expected)
+            if tmp_full:
+                # ① 完整副本在场：主集合无论什么状态，整包拷回即收尾
+                main = _try_get(collection_name)
+                if main is None:
+                    main = self._chroma.get_collection(collection_name, metadata=metadata)
+                self._copy_rows(tmp, main)
+                self._verify_complete(main, expected, f"恢复后的主集合 {collection_name}")
+                try:
+                    # 主集合可能还挂着旧模型的 metadata，拷完后对齐目标值，
+                    # 否则下次启动会把这些新向量当旧向量再迁一遍（浪费但不出错）
+                    main.modify(metadata=metadata)
+                except Exception:
+                    pass  # 对齐失败最坏是重迁一遍，不影响正确性
+                self._chroma.delete_collection(tmp_name)
+                state.pop(collection_name, None)
+                self._save_state()
+                print(f"[memory] 集合 {collection_name} 从 __migrating 恢复 {len(expected)} 条（上次迁移中断）")
+                return
+            # ② 临时集合不完整：旧主集合健在就清场，重走完整迁移
+            main = _try_get(collection_name)
+            if main is not None and main.count() > 0:
+                try:
+                    self._chroma.delete_collection(tmp_name)
+                except Exception:
+                    pass
+                state.pop(collection_name, None)
+                self._save_state()
+                print(f"[memory] 集合 {collection_name} 上次迁移中断于嵌入阶段，旧数据完好，重新迁移")
+                return
+            # ③ 唯一副本已丢：明确停用，绝不能伪装成健康空集合
+            raise RuntimeError(
+                f"[memory] 向量迁移不可恢复：{collection_name} 主集合缺失或为空，"
+                f"且 __migrating 不完整（预期 {len(expected)} 条，临时集合 {len(tmp_ids)} 条）"
+                f"——该集合停用，需要从备份恢复"
+            )
+
+        # 遗留事故（无状态文件）：主集合已是目标元数据但空、__migrating 有货 → 恢复
+        if tmp is not None and tmp_ids:
+            main = _try_get(collection_name)
+            if main is None:
+                # 主集合整个没了但副本在场：按目标元数据重建后恢复
+                main = self._chroma.get_collection(collection_name, metadata=metadata)
+            if main.count() == 0:
+                if (main.metadata or {}).get("embedding_model") != cfg.embedding_model:
+                    # metadata 还没切到目标值：这不是"删了主集合后崩"的现场，
+                    # 交给正常迁移流程处理（旧数据健在时 tmp 会被清掉重来）
+                    return
+                self._copy_rows(tmp, main)
+                got = set(self._col_ids(main))
+                if got and got == set(tmp_ids):
+                    self._chroma.delete_collection(tmp_name)
+                    print(
+                        f"[memory] 集合 {collection_name} 检测到历史遗留的半迁移现场，"
+                        f"已从 __migrating 恢复 {len(got)} 条"
+                    )
+            elif set(self._col_ids(main)) == set(tmp_ids):
+                # 收尾前崩的另一种形态：主集合已完整、只差删临时。ID 集合一致才删，
+                # 不一致就留着并告警——禁止盲删 __migrating（它可能是唯一完整副本）
+                self._chroma.delete_collection(tmp_name)
+                print(f"[memory] 集合 {collection_name} 清理了上次迁移残留的临时集合（主集合已完整）")
+            else:
+                print(
+                    f"[memory] 集合 {collection_name} 存在与主集合不一致的 __migrating 残留"
+                    f"（主 {main.count()} 条 / 临 {len(tmp_ids)} 条），保守保留待人工检查"
+                )
+        elif tmp is not None and not tmp_ids:
+            # 空临时集合残留：没有任何数据价值，清掉
+            try:
+                self._chroma.delete_collection(tmp_name)
+            except Exception:
+                pass
 
     def upsert_memory(self, item: MemoryItem) -> bool:
         col = self._col_of(_DISTILLED_COLLECTION)

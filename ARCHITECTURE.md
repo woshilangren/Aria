@@ -296,7 +296,7 @@ done 事件（full_text / output_mode / image_path）
 ## 十、存储设计
 
 - **KVStoreTool 是 JSON 存储的统一门面**：上层当 JSON 读写，底层全部进 SQLite（WAL 模式、单连接 + 锁）。早期版本是散落的 JSON 文件，后统一迁移
-- **Chroma 只放两个集合**（长期记忆、日记），集合 metadata 记录向量模型和维度；换向量模型等于换坐标系，会触发"导出原文重新嵌入"的重建流程，`EMBEDDING_DIMENSION` 不能随便改
+- **Chroma 只放两个集合**（长期记忆、日记），集合 metadata 记录向量模型和维度；换向量模型等于换坐标系，会触发"导出原文重新嵌入"的重建流程，`EMBEDDING_DIMENSION` 不能随便改。重建是**两阶段可恢复迁移**（R01a/R01b，2026-09-22）：新向量先进 `原名__migrating` 临时集合、逐 ID 验证完整后才删主集合，拷回并再验证后才删临时；迁移状态落 `DATA_DIR/vector_migration_state.json`，启动时先恢复未完成迁移（含"主集合空 + 临时集合有货"的历史遗留现场），唯一副本不可恢复时明确停用该集合并告警
 - **全部运行时数据在 `storage/` 一个目录**：SQLite、Chroma、证书、上传文件、语音缓存、头像。备份 = 打包这个目录；清空 = 删掉重启
 
 ## 十一、已知权衡与有意的不对称
