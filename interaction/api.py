@@ -443,7 +443,9 @@ async def chat_voice_replay(payload: dict) -> dict:
             save_cached_voice(text, audio)
         return {"ok": True, "voice_audio": base64.b64encode(audio).decode()}
     except Exception as e:  # TTS 失败只影响这一条语音，文字还在
-        return {"ok": False, "error": str(e)}
+        # R27a：error 字段对外白名单——str(e) 可能带供应商响应细节，只进日志
+        logging.getLogger("aria").warning("[tts] 合成失败: %r", e)
+        return {"ok": False, "error": "语音合成失败，稍后再试试"}
 
 
 @chat_router.post("/upload")
@@ -537,7 +539,11 @@ async def voice_stream(websocket: WebSocket) -> None:
                                 await realtime_client.set_voice(control["voice"])
                                 await stream.send_text(f"音色已换成 {control['voice']}")
                             except Exception as exc:
-                                await stream.send_text(f"换音色没成功：{exc}")
+                                # R27a：对外只发固定安全文案——str(exc) 可能带内部
+                                # 细节/供应商响应，经 WS 直接推给客户端等于外泄。
+                                # 原始异常留日志排查。
+                                logging.getLogger("aria").warning("[voice] 换音色失败: %r", exc)
+                                await stream.send_text("换音色没成功，稍后再试试")
                         else:
                             await stream.send_text("当前不在实时专线路由上，换音色指令没生效")
                         continue

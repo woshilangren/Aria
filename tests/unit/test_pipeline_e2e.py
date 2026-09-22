@@ -28,10 +28,18 @@ class FakeLLM:
     """
 
     def __init__(self, stream_script: "list[str] | None" = None,
+                 stream_scripts: "list[list[str]] | None" = None,
                  chat_script: str = "FakeLLM 占位回复") -> None:
         self.chat_calls: list = []
         self.stream_calls: list = []
-        self._stream_script = list(stream_script or ["FakeLLM 流式回复。"])
+        # R27a：stream_scripts 支持多次调用各用一段脚本（审核重写每次是一次
+        # 新的 astream_chat 调用）；只传 stream_script 时退化为单脚本旧行为。
+        if stream_scripts is not None:
+            self._stream_queue = [list(s) for s in stream_scripts]
+        elif stream_script is not None:
+            self._stream_queue = [list(stream_script)]
+        else:
+            self._stream_queue = [["FakeLLM 流式回复。"]]
         # R02：chat 固定应答——工具链的转述调用（persona_wrap）也脚本化，
         # 返回值就是 _respond 写进 final_reply 的内容
         self._chat_script = chat_script
@@ -45,7 +53,9 @@ class FakeLLM:
 
     async def astream_chat(self, messages, **kwargs) -> AsyncIterator[str]:  # noqa: ARG002
         self.stream_calls.append(list(messages))
-        for chunk in self._stream_script:
+        if not self._stream_queue:
+            return
+        for chunk in self._stream_queue.pop(0):
             yield chunk
 
 
@@ -245,3 +255,143 @@ def test_tool_normal_reply_still_persisted(register_services, monkeypatch):
     rows = services.get("kv_store").read("session", sid) or []
     assistant_rows = [r.get("text") for r in rows if r.get("role") == "assistant"]
     assert assistant_rows == [_NORMAL_REPLY], f"chat_log 应有正常回复，实测 {assistant_rows!r}"
+
+
+# ------------------- R27a：审核原文不外泄（reason 输出边界） -------------------
+
+def _collect_stream(pipeline, msg) -> list:
+    """直接消费 astream 事件流——SSE 的完整载荷就是这些事件的 JSON 序列，
+    检查它们而不只看最终 UI（R27a 验收要求）。"""
+    import asyncio
+
+    async def _run():
+        evs = []
+        async for ev in pipeline.astream(msg):
+            evs.append(ev)
+        return evs
+
+    return asyncio.run(_run())
+
+
+def _assert_no_leak(evs, *secrets):
+    """哨兵不得出现在任何对外字段的任何事件里（含 reason/message/debug）。"""
+    import json
+
+    blob = json.dumps(evs, ensure_ascii=False, default=str)
+    for s in secrets:
+        assert s not in blob, f"对外事件载荷泄漏 {s!r}：{blob[:400]}"
+
+
+def test_review_reject_reason_code_text_path(register_services):
+    """文字拒绝 + 重写耗尽：refuse.reason 只带原因码，被拦原文一个字不外泄。"""
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+    from tools.storage import KVStoreTool
+
+    register_services(kv_store=KVStoreTool(), llm=FakeLLM(stream_scripts=[
+        ["作为一个AI不该说QW7X。"],
+        ["重写后还是带QW7X，作为一个AI。"],
+        ["第三次仍有QW7X，作为一个AI口吻。"],
+    ]), tts=FakeTTS())
+
+    evs = _collect_stream(
+        DialoguePipeline(),
+        InputMessage(text="随便聊聊天", session_id="r27a-text"),
+    )
+    _assert_no_leak(evs, "QW7X", "作为一个AI")
+    refuse = [e for e in evs if e.get("type") == "refuse"]
+    assert refuse, f"重写耗尽必须整轮降级，实测事件 {[(e.get('type')) for e in evs]}"
+    assert refuse[0]["reason"] == "review_output_blocked", (
+        f"reason 必须是有限原因码，实测 {refuse[0]['reason']!r}"
+    )
+    assert "QW7X" not in refuse[0].get("text", "")
+
+
+def test_review_reject_reason_code_voice_path(register_services):
+    """voice 拒绝：<voice> 被拦原文同样只出原因码。"""
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+    from tools.storage import KVStoreTool
+
+    register_services(kv_store=KVStoreTool(), llm=FakeLLM(stream_scripts=[
+        ["<voice>语音带QW7X，作为一个AI。</voice>"],
+        ["<voice>重说仍有QW7X，作为一个AI。</voice>"],
+        ["<voice>第三次QW7X，作为一个AI。</voice>"],
+    ]), tts=FakeTTS())
+
+    evs = _collect_stream(
+        DialoguePipeline(),
+        InputMessage(text="在吗", session_id="r27a-voice", input_mode="voice"),
+    )
+    _assert_no_leak(evs, "QW7X", "作为一个AI")
+    refuse = [e for e in evs if e.get("type") == "refuse"]
+    assert refuse and refuse[0]["reason"] == "review_output_blocked"
+
+
+def test_reject_after_pushed_prefix_keeps_prefix_hides_rest(register_services):
+    """已发布合格前缀后拒绝：前缀保留（合法已发布内容不在禁传范围），
+    未发布的被拒片段不外泄。"""
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+    from tools.storage import KVStoreTool
+
+    register_services(kv_store=KVStoreTool(), llm=FakeLLM(stream_scripts=[
+        ["这句完全没问题，先说着。第二句冒出作为一个AI的QW7X。"],
+        ["换说法还是有作为一个AI的QW7X。"],
+        ["依旧有QW7X，作为一个AI。"],
+    ]), tts=FakeTTS())
+
+    evs = _collect_stream(
+        DialoguePipeline(),
+        InputMessage(text="随便聊聊天", session_id="r27a-prefix"),
+    )
+    # 哨兵/被拦片段零外泄
+    _assert_no_leak(evs, "QW7X", "作为一个AI")
+    # 合法已发布前缀仍推给了前端（不能把"说出去的话"也藏了）
+    assert any(
+        e.get("type") == "sentence" and "这句完全没问题" in e.get("text", "")
+        for e in evs
+    ), f"已发布前缀不该被隐藏，实测 {[(e.get('type'), e.get('text', '')) for e in evs]}"
+    refuse = [e for e in evs if e.get("type") == "refuse"]
+    assert refuse and refuse[0]["reason"] == "review_output_blocked"
+
+
+def test_tool_reject_refuse_reason_no_draft(register_services, monkeypatch):
+    """工具拒绝：refuse.reason 同样不含被拒工具原稿（R27a 与 R02 同一条链）。"""
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+
+    calls = _register_tool_pipeline(register_services, monkeypatch, _REJECTED_REPLY)
+    evs = _collect_stream(
+        DialoguePipeline(),
+        InputMessage(text="搜索一下附近好吃的", session_id="r27a-tool"),
+    )
+    _assert_no_leak(evs, _TOOL_MARK, "作为一个AI")
+    refuse = [e for e in evs if e.get("type") == "refuse"]
+    assert refuse and refuse[0].get("reason", "") == ""
+    assert calls["n"] == 1
+
+
+def test_pipeline_error_event_whitelisted(register_services, monkeypatch):
+    """服务失败：error 事件只给固定安全文案 + 有限错误码，不回 str(exc)。
+    原因码区分：审核拒绝=refuse.review_output_blocked，服务失败=error.pipeline_error。"""
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import InputMessage
+    from tools.storage import KVStoreTool
+
+    register_services(kv_store=KVStoreTool(), llm=FakeLLM(stream_script=["正常一句话。"]),
+                      tts=FakeTTS())
+
+    def boom(self, state):  # noqa: ARG001
+        raise RuntimeError("内部装配细节SECRET-ERR")
+
+    monkeypatch.setattr(DialoguePipeline, "_compose", boom)
+    evs = _collect_stream(
+        DialoguePipeline(),
+        InputMessage(text="随便聊聊", session_id="r27a-err"),
+    )
+    _assert_no_leak(evs, "SECRET-ERR")
+    errs = [e for e in evs if e.get("type") == "error"]
+    assert errs, f"装配错误必须出 error 事件，实测 {[(e.get('type')) for e in evs]}"
+    assert errs[0]["code"] == "pipeline_error"
+    assert errs[0]["message"] == "这轮没接上，稍后再试试"

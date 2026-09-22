@@ -158,7 +158,16 @@ class _ReviewReject(Exception):
 
     这一层只负责"报告没过"，**不自己决定**怎么处理——由上层按统一规则裁决：
     还没推出任何内容 → 安全重写（最多 _MAX_REWRITE 次）；已经推过 → 整轮降级。
+
+    R27a：异常里**只带有限原因码，绝不带被拦原文**。以前 raise _ReviewReject(text)
+    让 str(exc) 一路漏进 state.review_block_reason → refuse.reason 推给前端——
+    等于把要拦的内容换个键原样发出去。原因码（review_output_blocked）要能和
+    服务失败（pipeline_error）、输入预检（"输入未过安全预检"）区分开。
     """
+
+    def __init__(self, reason_code: str = "review_output_blocked"):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
 
 
 class _RefuseTurn(Exception):
@@ -753,8 +762,14 @@ class DialoguePipeline:
             yield {"type": "refuse", "text": r.text, "replace": True,
                    "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}
-        except Exception as exc:
-            yield {"type": "error", "code": "pipeline_error", "message": str(exc)}
+        except Exception:
+            # R27a：对外只给固定安全文案 + 有限错误码。以前 message=str(exc) 直接
+            # 推给前端（前端原样上屏），等于把内部异常细节/供应商响应当回复发出去。
+            # 内部细节走 _log_exc 进日志排查；原因码区分服务失败（pipeline_error）
+            # 与审核拒绝（refuse 事件的 review_output_blocked）。
+            _log_exc("astream 本轮失败")
+            yield {"type": "error", "code": "pipeline_error",
+                   "message": "这轮没接上，稍后再试试"}
         finally:
             self._turns.finish(message.session_id, handle.turn_id)
 
@@ -860,7 +875,8 @@ class DialoguePipeline:
             raise
         except _ReviewReject as exc:
             # 句级 / <voice> 审核没过：_emit_frag 只负责报告，这里按"统一规则"裁决：
-            state.review_block_reason = str(exc)  # 拦截原因带出去，refuse 事件可排查误杀
+            # R27a：只带出有限原因码（不带被拦原文），refuse 事件可排查误杀类别
+            state.review_block_reason = exc.reason_code
             if pushed:
                 # 已经推过内容 → 撤不回，整轮降级成兜底话（与改造前行为一致）
                 state.was_poor = True
@@ -990,7 +1006,8 @@ class DialoguePipeline:
             if not ok:
                 # 只报告"没过"，怎么处理交给 _astream_chat 按统一规则裁决：
                 # 还没推过内容 → 安全重写；已经推过 → 整轮降级。这里不自己拍板。
-                raise _ReviewReject(text)
+                # R27a：异常只携带原因码，被拦原文不进异常链（refuse.reason 是对外字段）
+                raise _ReviewReject()
             self._check_cancel(handle)  # ② 准备推一句之前
             yield {"type": "sentence", "seq": next(seq), "text": text}
             return
@@ -1000,7 +1017,7 @@ class DialoguePipeline:
             # 先审、后合成——审不过直接抛给上层裁决（与句子一致）。
             ok, _reason = await asyncio.to_thread(SafetyReviewer().review, vtext, "output")
             if not ok:
-                raise _ReviewReject(vtext)
+                raise _ReviewReject()  # R27a：只带原因码，语音被拦原文不进异常链
             ev = {"type": "voice", "seq": next(seq), "voice_text": vtext}
             if synthesize_voice and vtext.strip():
                 audio = await self._synthesize(vtext, handle)

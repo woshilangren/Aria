@@ -96,3 +96,70 @@ def test_relationship_endpoint_exposes_mood(client):
     assert "mood" in body
     assert body["mood"] == "心软"
     assert "mood_baseline" not in body
+
+
+def test_voice_control_failure_sends_fixed_text(client, monkeypatch):
+    """WS 换音色控制失败：对外只发固定安全文案，str(exc) 细节不外泄（R27a）。
+
+    走真实 WS 端点检查完整载荷（不只看最终 UI）：先在 realtime 路由上跑通
+    一轮（替身实时客户端），再发换音色控制帧触发 set_voice 失败——
+    以前 `f"换音色没成功：{exc}"` 会把内部异常细节推给客户端。
+    """
+    from shared.singletons import services
+
+    services.get("kv_store").write(
+        "route_config", "ws-r27a",
+        {"route": "realtime", "fail_count": 0, "auto_degrade": True},
+    )
+
+    from tools import realtime as rt_mod
+
+    class _FakeRT:
+        """替身实时专线客户端：round_trip 正常、set_voice 必炸。"""
+
+        def __init__(self, session_id, instructions=None):
+            pass
+
+        async def connect(self):
+            pass
+
+        def set_time_hint(self, hint):
+            pass
+
+        async def refresh_time_config(self):
+            pass
+
+        async def round_trip(self, buffer):
+            return {"user_text": "你好", "reply_text": "嗯。",
+                    "reply_audio": b"\x00\x00", "emotion": ""}
+
+        async def set_voice(self, voice):
+            raise RuntimeError("内部细节SECRET-WS")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(rt_mod, "RealtimeDialogClient", _FakeRT)
+
+    texts = []
+    # WS 握手走查询串传 token（interaction/api.py 的 _TokenGuard：浏览器 WS
+    # 无法带自定义头，这是既有约定）
+    with client.websocket_connect(
+        "/api/voice/stream?session_id=ws-r27a&token=test-token"
+    ) as ws:
+        ws.send_bytes(b"\x00\x01" * 160)      # 一段"录音"
+        ws.send_text("END")
+        ws.send_text('{"voice":"新音色"}')     # 控制帧（文本帧，8.5 平台坑）
+        for _ in range(10):
+            msg = ws.receive()
+            if msg.get("type") in ("websocket.disconnect", None):
+                break
+            t = msg.get("text")
+            if t is None:
+                continue                       # 音频二进制帧，跳过
+            texts.append(t)
+            if "换音色没成功" in t:
+                break
+    joined = "".join(texts)
+    assert "SECRET-WS" not in joined, f"WS 泄漏内部异常细节: {texts!r}"
+    assert any("换音色没成功" in t for t in texts), f"应收到固定安全文案，实测 {texts!r}"
