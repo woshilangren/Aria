@@ -208,6 +208,13 @@ class TurnState:
     review_block_reason: str = ""   # 本轮被审核/降级拦下的原因（refuse 事件带出，排查误杀用）
     was_poor: bool = False          # 本轮触发了敷衍/违规重写（写回时落账，下一轮强制"认真想"）
     final_reply: str = ""
+    # R14a 正文契约：canonical 是唯一正式正文（审核通过片段的拼接，剥净协议），
+    # voice_text 是 <voice> 语音派生（单独走，不拼回正文）。final_reply 在
+    # R17b 写回迁移前仍是既有路径的载体，但两段拼接已终结。
+    canonical_text: str = ""
+    voice_text: str = ""
+    review_status: str = "accepted"  # accepted / rejected / unavailable
+    reason_code: str = ""            # 有限原因码（复用 R27 体系）
     output_mode: str = "text"
     image_path: str = ""
     error: str = ""
@@ -602,6 +609,8 @@ class DialoguePipeline:
         image_path = ""
         cancelled = False
         error_code = ""  # R27b：error 事件的有限错误码，循环后统一裁决
+        refused = False        # R14a：审核拒绝（refuse 事件）→ FinalReply.review_status
+        refuse_reason = ""     # R14a：有限原因码（refuse.reason，已是原因码体系）
 
         # astream 内部 finally 会调 TURN_REGISTRY.finish（详见 CLAUDE.md 关键单例）；
         # 显式 try/finally 保证 error 分支提前 return 时也立即收尾，
@@ -624,6 +633,8 @@ class DialoguePipeline:
                     frags = [(0, "text", ev.get("text", ""))]
                     emotion, desc = "", ""
                     output_mode, image_path = "text", ""
+                    refused = True
+                    refuse_reason = ev.get("reason") or ""
                 elif t == "done":
                     output_mode = ev.get("output_mode") or output_mode
                     image_path = ev.get("image_path") or image_path
@@ -647,19 +658,33 @@ class DialoguePipeline:
             raise PipelineInternalError("internal_error")
         if error_code:
             # 外部服务失败（external_degraded / 兼容旧 pipeline_error）：允许的
-            # 降级——llm 兜底话，聊天不断
-            return FinalReply(text=FallbackController().fallback_reply("llm"))
+            # 降级——llm 兜底话，聊天不断。审核结果 = 原生成内容不可用（R14a）
+            return FinalReply(
+                text=FallbackController().fallback_reply("llm"),
+                review_status="unavailable",
+                reason_code=error_code,
+            )
 
         frags.sort(key=lambda x: x[0])
-        body = "".join(
-            f"{_VOICE_OPEN}{c}{_VOICE_CLOSE}" if kind == "voice" else c
-            for _seq, kind, c in frags
-        )
+        # R14a：正文与语音派生**不再拼回一段**——canonical 唯一正文，
+        # voice_text 独立载体（旧协议"text 里塞 <voice> 再让 renderer 拆"终止）
+        canonical_parts = []
+        voice_parts = []
+        for _seq, kind, c in frags:
+            if kind == "voice":
+                voice_parts.append(c)
+            else:
+                canonical_parts.append(c)
+        body = "".join(canonical_parts)
         prefix = f"[{emotion}]" + (f"（{desc}）" if desc else "") if emotion else ""
+        review_status = "rejected" if refused else "accepted"
         return FinalReply(
             text=prefix + body,
             output_mode=output_mode or "text",
             image_path=image_path or "",
+            voice_text="".join(voice_parts),
+            review_status=review_status,
+            reason_code=refuse_reason or "",
         )
 
     # ================= 唯一实现：流式入口 =================
@@ -717,12 +742,16 @@ class DialoguePipeline:
             self._check_cancel(handle)
 
             # ③ 分流：工具链 / 人设链
+            canonical_parts = []  # R14a：审核通过片段的拼接 = canonical（唯一正文）
+            voice_parts = []      # R14a：<voice> 语音派生单独走，不拼回正文
             if state.intent.intent in _TOOL_INTENTS:
                 async for ev in self._astream_tool(state, handle, synthesize_voice, seq):
                     if ev.get("type") == "sentence":
                         display_parts.append(ev.get("text", ""))
+                        canonical_parts.append(ev.get("text", ""))
                     elif ev.get("type") == "voice":
                         voice_emitted = True
+                        voice_parts.append(ev.get("voice_text", ""))
                     yield ev
             else:
                 self._check_cancel(handle)
@@ -730,9 +759,20 @@ class DialoguePipeline:
                 async for ev in self._astream_chat(state, handle, synthesize_voice, seq):
                     if ev.get("type") == "sentence":
                         display_parts.append(ev.get("text", ""))
+                        canonical_parts.append(ev.get("text", ""))
                     elif ev.get("type") == "voice":
                         voice_emitted = True
+                        voice_parts.append(ev.get("voice_text", ""))
                     yield ev
+
+            # R14a：入口解析一次的产出在此定稿——canonical 唯一正文、voice
+            # 独立载体（都是审核通过的片段，被拒片段根本不会成为事件）。
+            # final_reply 同步收敛为 canonical：draft/raw 串（含 <voice>）从此
+            # 失去持久化资格——写回落库的只能是唯一正文
+            state.canonical_text = "".join(canonical_parts)
+            state.voice_text = "".join(voice_parts)
+            if state.canonical_text:
+                state.final_reply = state.canonical_text
 
             # ④ 记忆写回（含取消检查点，保证迟到的取消不会写出半截账）。
             # 写回跑在工作线程（无事件循环），它**不自己调度**后台待办，

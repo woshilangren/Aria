@@ -112,11 +112,24 @@ class PromptPackage:
 
 @dataclass
 class FinalReply:
-    """最终回复：文字为主，带图的时候补图片路径。"""
+    """最终回复：文字为主，带图的时候补图片路径。
+
+    R14a 正文契约（8.11.1 的最小载体）：
+    - `text` = canonical_text（唯一正式正文）：已剥净 <voice>/情绪标记等协议，
+      不再包含"语音版"内容——两段拼回正文的做法在此终结；
+    - `voice_text` = 语音派生：模型自标的 <voice> 内容，允许口语/节奏与正文
+      不同；**不能核验同义时，调用方直接拿 text 做 TTS**（契约明文允许）；
+    - `review_status` / `reason_code`：原生成内容的审核结果（accepted /
+      rejected / unavailable）与有限原因码——与生命周期无关，R27 原因码体系复用。
+    draft / 工具结果不在这张表里：它们不具备持久化资格（8.11.1）。
+    """
 
     text: str
     output_mode: str = "text"  # text / image
     image_path: str = ""
+    voice_text: str = ""          # 语音派生正文；空 = 无独立语音表达
+    review_status: str = "accepted"
+    reason_code: str = ""
 
 
 @dataclass

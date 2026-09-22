@@ -114,6 +114,11 @@ class OutputRenderer:
         免得前端拿个空路径干瞪眼。
         """
         voice_text, clean_text = extract_voice(reply.text)
+        if not voice_text and (reply.voice_text or "").strip():
+            # R14a：语音派生已有独立载体（FinalReply.voice_text）——正文里不再
+            # 塞 <voice> 标签，旧协议的"塞回去再拆"到此为止。extract_voice
+            # 保留是为了兼容仍带标签的 legacy 来源。
+            voice_text = reply.voice_text.strip()
         data = {
             "text": clean_text or reply.text,
             "output_mode": reply.output_mode,
