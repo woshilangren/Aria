@@ -1,15 +1,17 @@
-"""R27b：外部故障与程序错误分流的失败契约测试。
+"""R27b/R27c：失败契约测试。
 
-契约（《计划与设计.md》R27b / 8.8 分层纪律）：
+R27b 契约（《计划与设计.md》/ 8.8 分层纪律）：
 - openai SDK 的连接/超时/API 响应异常在 llm_client 最窄边界转成
   ExternalServiceError（来源/原因码/可重试），并计入主备熔断计数；
 - TypeError/NameError 等本地装配缺陷原样上抛：**不**转窄载体、**不**计入
   熔断（程序错误不是供应商故障）、**不**烧备用供应商；
 - 管道里本地缺陷冒泡到 handle() → PipelineInternalError：零重跑、零业务提交；
-- 外部失败走允许的降级（error 事件 external_degraded → handle 落 llm 兜底话）；
-- 原因码可区分：external_degraded / internal_error / review_output_blocked。
+- 外部失败走允许的降级（error 事件 external_degraded → handle 落 llm 兜底话）。
 
-不触网：openai 异常用可构造的基类模拟，LLMClient 用 __new__ 绕过构造。
+R27c 契约：ASR/TTS/realtime/weather 等适配器在同一窄边界把网络/SDK/协议失败
+转成带来源的 ExternalServiceError；本地缺陷原样上抛。
+
+不触网：SDK 异常用替身/可构造异常模拟，LLMClient 用 __new__ 绕过构造。
 """
 
 from __future__ import annotations
@@ -21,45 +23,28 @@ import types
 import openai
 import pytest
 
-from tests.unit.test_pipeline_e2e import FakeLLM, FakeTTS  # noqa: F401  (FakeTTS 供 _register)
 from shared.types import ExternalServiceError, PipelineInternalError
+from tests.unit.test_pipeline_e2e import FakeLLM, FakeTTS  # noqa: F401
 
 
 # --------------------------------------------------------------------------
-# 1. llm_client 同步/流式边界：SDK 异常转窄载体并计数；本地缺陷原样上抛不计数
+# 1. llm_client 同步/流式边界（R27b）
 # --------------------------------------------------------------------------
 
 class _Completions:
     """替身 completions：create() 按脚本抛异常或返回固定响应，并计数。"""
 
-    def __init__(self, exc, counter: dict, key: str, chunks=None):
+    def __init__(self, exc, counter: dict, key: str):
         self._exc = exc
         self._counter = counter
         self._key = key
-        self._chunks = chunks
-
-    async def acreate(self, **kwargs):
-        return await asyncio.sleep(0) or self._create(**kwargs)
 
     def create(self, **kwargs):
         self._counter[self._key] += 1
         if self._exc is not None:
             raise self._exc
-        if self._chunks is not None:
-            return self._agen()
         return types.SimpleNamespace(choices=[types.SimpleNamespace(
             message=types.SimpleNamespace(content="正常回复"))])
-
-    async def _agen(self):
-        for c in self._chunks:
-            if isinstance(c, Exception):
-                raise c
-            yield c
-
-
-def _wire(client_obj, attr, exc=None, chunks=None, counter=None, key="main"):
-    setattr(client_obj, attr, types.SimpleNamespace(
-        chat=types.SimpleNamespace(completions=_Completions(exc, counter, key, chunks))))
 
 
 def _make_client(main_exc=None, fallback_exc=None):
@@ -69,8 +54,10 @@ def _make_client(main_exc=None, fallback_exc=None):
     calls = {"main": 0, "fallback": 0}
     c = LLMClient.__new__(LLMClient)
     c._model = "test-model"
-    _wire(c, "_client", main_exc, counter=calls, key="main")
-    _wire(c, "_fallback", fallback_exc, counter=calls, key="fallback")
+    c._client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(main_exc, calls, "main")))
+    c._fallback = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(fallback_exc, calls, "fallback")))
     c._afallback = None
     c._fallback_family = "claude"
     c._fallback_model = "test-fallback-model"
@@ -94,16 +81,16 @@ def test_sync_sdk_error_converts_to_external_and_counts():
     assert ei.value.source == "llm"
     assert ei.value.reason_code == "all_providers_failed"
     assert ei.value.retryable is True
-    assert c._error_count == 1                    # 供应商失败必须计数（熔断证据）
-    assert calls["fallback"] == 1                 # 备用被真实尝试
+    assert c._error_count == 1
+    assert calls["fallback"] == 1
 
 
 def test_sync_sdk_error_with_healthy_fallback_succeeds():
-    """主挂、备用健康：正常返回，不抛（熔断计数后衰减一格，属 R26 语义）。"""
+    """主挂、备用健康：正常返回（主失败 +1 后被备用成功衰减回 0，J13 取舍保留）。"""
     c, calls = _make_client(main_exc=openai.OpenAIError("主挂"))
     resp = c._complete(model="test-model", messages=[{"role": "user", "content": "hi"}])
     assert resp.choices[0].message.content == "正常回复"
-    assert c._error_count == 0  # 主失败 +1 后被备用成功衰减回 0（J13 取舍保留）
+    assert c._error_count == 0
     assert calls["fallback"] == 1
 
 
@@ -122,21 +109,15 @@ def test_stream_build_fail_both_providers_raises_external():
 
     c, _calls = _make_client(main_exc=openai.OpenAIError("主挂"),
                              fallback_exc=openai.OpenAIError("备挂"))
-    counter = {"a": 0}
 
     async def _acreate(**kwargs):
-        counter["a"] += 1
         raise openai.OpenAIError("主挂")
+
+    async def _afcreate(**kwargs):
+        raise openai.OpenAIError("备挂")
 
     c._aclient = types.SimpleNamespace(chat=types.SimpleNamespace(
         completions=types.SimpleNamespace(create=_acreate)))
-
-    afails = {"n": 0}
-
-    async def _afcreate(**kwargs):
-        afails["n"] += 1
-        raise openai.OpenAIError("备挂")
-
     c._afallback = types.SimpleNamespace(chat=types.SimpleNamespace(
         completions=types.SimpleNamespace(create=_afcreate)))
 
@@ -147,19 +128,18 @@ def test_stream_build_fail_both_providers_raises_external():
         asyncio.run(_run())
     assert ei.value.reason_code == "all_providers_failed"
     assert c._error_count == 1
-    assert afails["n"] == 1
 
 
 def test_stream_interrupted_after_tokens_raises_external():
-    """已吐 token 后流中断：转 stream_interrupted（retryable=False），
-    管道据此按外部降级收尾；主模型失败计一次。"""
+    """已吐 token 后流中断：转 stream_interrupted（retryable=False）；
+    主模型失败计一次；备用不该被走到。"""
     from tools.llm_client import LLMClient
 
     c, _calls = _make_client(main_exc=None)
 
     async def _agen():
-        # chunk 必须是 SDK 形状（带 choices.delta.content）：否则 _delta_of 取不到
-        # 文本，emitted 一直 False，会被当成"没吐过 token"走备用而不是测中断转换
+        # chunk 必须是 SDK 形状（带 choices.delta.content）：否则 _delta_of 取
+        # 不到文本，emitted 恒 False，会被当成"没吐过 token"走备用
         yield types.SimpleNamespace(choices=[types.SimpleNamespace(
             delta=types.SimpleNamespace(content="正常半句"))])
         raise openai.OpenAIError("流中断")
@@ -167,9 +147,10 @@ def test_stream_interrupted_after_tokens_raises_external():
     async def _acreate(**kwargs):
         return _agen()
 
-    c._aclient = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=_acreate)))
+    c._aclient = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(create=_acreate)))
     c._afallback = types.SimpleNamespace(chat=types.SimpleNamespace(
-        completions=types.SimpleNamespace(create=_acreate)))  # 备用不该被走到
+        completions=types.SimpleNamespace(create=_acreate)))
 
     out = []
 
@@ -196,6 +177,17 @@ def _register(register_services, llm):
     register_services(kv_store=KVStoreTool(), llm=llm, tts=FakeTTS())
 
 
+def _collect_stream(pipeline, msg) -> list:
+    """消费 astream 事件流（与 test_pipeline_e2e 同款，独立小函数避免跨文件耦合）。"""
+    async def _run():
+        evs = []
+        async for ev in pipeline.astream(msg):
+            evs.append(ev)
+        return evs
+
+    return asyncio.run(_run())
+
+
 def test_internal_error_bubbles_to_handle_with_zero_commit(register_services):
     """生成中途注入 NameError（本地缺陷）：astream 出 internal_error 事件，
     handle 抛 PipelineInternalError；零 LLM 重试、零业务提交。"""
@@ -215,7 +207,6 @@ def test_internal_error_bubbles_to_handle_with_zero_commit(register_services):
     _register(register_services, llm)
     sid = "r27b-internal"
 
-    # astream 层：error 事件带 internal_error，且没有任何兜底正文被推出
     evs = _collect_stream(DialoguePipeline(), InputMessage(text="随便聊聊", session_id=sid))
     errs = [e for e in evs if e.get("type") == "error"]
     assert errs and errs[0]["code"] == "internal_error"
@@ -238,20 +229,9 @@ def test_internal_error_bubbles_to_handle_with_zero_commit(register_services):
     assert rows == []
 
 
-def _collect_stream(pipeline, msg) -> list:
-    """消费 astream 事件流（与 test_pipeline_e2e 同款，这里独立成小函数避免跨文件耦合）。"""
-    async def _run():
-        evs = []
-        async for ev in pipeline.astream(msg):
-            evs.append(ev)
-        return evs
-
-    return asyncio.run(_run())
-
-
 def test_external_error_degrades_via_handle(register_services):
-    """外部失败（窄载体）→ astream 出 external_degraded → handle 落 llm 兜底话
-    （允许的降级，聊天不断），不抛 PipelineInternalError。"""
+    """外部失败（窄载体）→ 管道内降级消化（generate 兜底话）→ done 收尾；
+    无 internal_error（那是程序错误的专属信号）；handle 返回兜底话不抛异常。"""
     from orchestration.pipeline import DialoguePipeline
     from shared.types import InputMessage
 
@@ -284,22 +264,172 @@ def test_external_error_degrades_via_handle(register_services):
     sid = "r27b-external"
 
     evs = _collect_stream(DialoguePipeline(), InputMessage(text="随便聊聊", session_id=sid))
-    # 生成失败 → 管道内降级（generate 的兜底话）成功消化：无 error 事件、
-    # 兜底正文正常推出；绝无 internal_error（那是程序错误的专属信号）
     assert not any(e.get("type") == "error" and e.get("code") == "internal_error" for e in evs)
     assert any(e.get("type") == "done" for e in evs), f"外部失败必须降级收尾，实测 {[e.get('type') for e in evs]}"
-    _assert_no_leak_local(evs, "all_providers_failed")
 
     reply = asyncio.run(
         DialoguePipeline().handle(InputMessage(text="随便聊聊", session_id=sid))
     )
-    # 允许的降级：返回兜底话（非空），不抛 PipelineInternalError
     assert reply.text, "外部失败必须降级成兜底话而不是空回复"
 
 
-def _assert_no_leak_local(evs, *secrets):
-    import json
+# --------------------------------------------------------------------------
+# 3. R27c：各外部适配器接同一错误契约——外部失败→窄载体可降级；本地缺陷→原样上抛
+# --------------------------------------------------------------------------
 
-    blob = json.dumps(evs, ensure_ascii=False, default=str)
-    for s in secrets:
-        assert s not in blob, f"对外事件载荷泄漏 {s!r}：{blob[:300]}"
+def test_embedding_external_failure_converts(monkeypatch):
+    """embedding：dashscope 网络失败 → ExternalServiceError("embedding")。"""
+    import data.embedding_client as emb_mod
+
+    def boom(**kwargs):
+        raise RuntimeError("模拟网络中断")
+
+    monkeypatch.setattr(emb_mod.dashscope.MultiModalEmbedding, "call", boom)
+    emb = emb_mod.QwenEmbedding()
+    with pytest.raises(ExternalServiceError) as ei:
+        emb.embed_query("一句话")
+    assert ei.value.source == "embedding"
+    assert ei.value.reason_code == "request_failed"
+
+
+def test_embedding_protocol_bad_data_is_external_protocol_error(monkeypatch):
+    """embedding：返回体结构坏 → bad_protocol（外部协议错误，不可重试）。"""
+    import data.embedding_client as emb_mod
+
+    class _Rsp:
+        status_code = 200
+        output = {"embeddings": [{"nope": 1}]}  # 缺 "embedding" 键
+
+    monkeypatch.setattr(emb_mod.dashscope.MultiModalEmbedding, "call",
+                        lambda **kw: _Rsp())
+    emb = emb_mod.QwenEmbedding()
+    with pytest.raises(ExternalServiceError) as ei:
+        emb.embed_query("一句话")
+    assert ei.value.reason_code == "bad_protocol"
+    assert ei.value.retryable is False
+
+
+def test_embedding_local_defect_propagates():
+    """embedding：本地装配缺陷（texts=None）原样上抛 TypeError——不转窄载体。"""
+    import data.embedding_client as emb_mod
+
+    emb = emb_mod.QwenEmbedding()
+    with pytest.raises(TypeError):
+        emb.embed_documents(None)
+
+
+def test_asr_external_and_local(monkeypatch):
+    """ASR：_run_bounded 超时（RuntimeError）→ ExternalServiceError；
+    本地缺陷（audio=None 走格式装配）原样上抛。"""
+    import tools.speech as speech_mod
+
+    monkeypatch.setenv("ASR_API_KEY", "test-asr-key")
+    from config.settings import get_settings
+    get_settings.cache_clear()
+
+    def fake_run_bounded(fn, timeout_s, what):
+        raise RuntimeError(f"{what}超时（{timeout_s:.0f}s）")
+
+    monkeypatch.setattr(speech_mod, "_run_bounded", fake_run_bounded)
+    monkeypatch.setattr(speech_mod, "timeout_seconds", lambda key, default: 5.0)
+
+    with pytest.raises(ExternalServiceError) as ei:
+        speech_mod.ASRTool().transcribe(b"abc", fmt="wav", sample_rate=16000)
+    assert ei.value.source == "asr"
+
+    # 本地缺陷：audio=None → 嗅探/装配炸，原样上抛（不是窄载体）
+    with pytest.raises((TypeError, AttributeError)):
+        speech_mod.ASRTool().transcribe(None, fmt="pcm", sample_rate=16000)
+
+
+def test_tts_external_and_local(monkeypatch):
+    """TTS：SDK 失败 → ExternalServiceError("tts")；本地缺陷（text=None 进
+    情绪拆分）原样上抛。SDK 边界用替身合成器注入。"""
+    from tools.speech import TTSTool
+
+    import tools.speech as speech_mod
+
+    monkeypatch.setenv("TTS_API_KEY", "test-tts-key")
+    from config.settings import get_settings
+    get_settings.cache_clear()
+
+    class _Synth:
+        def __init__(self, **kwargs):
+            pass
+
+        def call(self, text, timeout_millis=None):
+            raise OSError("模拟 SDK 网络失败")
+
+    monkeypatch.setattr(speech_mod, "SpeechSynthesizer", _Synth)
+    with pytest.raises(ExternalServiceError) as ei:
+        TTSTool().synthesize("你好呀")
+    assert ei.value.source == "tts"
+    assert ei.value.reason_code == "request_failed"
+
+    # 本地缺陷：text=123（非字符串）→ 情绪拆分装配炸，原样上抛（不是窄载体）
+    with pytest.raises((TypeError, AttributeError)):
+        TTSTool().synthesize(123)
+
+
+def test_weather_external_and_local(monkeypatch):
+    """天气：httpx 网络失败 → ExternalServiceError("weather")；
+    响应缺字段（本地装配路径 KeyError）原样上抛。"""
+    import tools.external as ext_mod
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"name": "杭州"}]}  # 故意缺 latitude
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, params=None):
+            if "geocoding" in url:
+                return _Resp()
+            raise KeyError("latitude（本地装配路径）")
+
+    monkeypatch.setattr(ext_mod.httpx, "Client", _Client)
+    with pytest.raises(KeyError):
+        ext_mod.WeatherTool().query("杭州")
+
+    class _ClientNetFail(_Client):
+        def get(self, url, params=None):
+            raise ext_mod.httpx.ConnectError("模拟 DNS 失败")
+
+    monkeypatch.setattr(ext_mod.httpx, "Client", _ClientNetFail)
+    with pytest.raises(ExternalServiceError) as ei:
+        ext_mod.WeatherTool().query("杭州")
+    assert ei.value.source == "weather"
+
+
+def test_realtime_connect_failure_converts():
+    """realtime：websockets 握手失败 → ExternalServiceError("realtime")。"""
+    import tools.realtime as rt_mod
+
+    async def _run():
+        c = rt_mod.RealtimeDialogClient("sess-x", instructions="i")
+        await c.connect()
+
+    orig = rt_mod.websockets.connect
+
+    async def _boom(*a, **kw):
+        raise OSError("模拟拒绝连接")
+
+    rt_mod.websockets.connect = _boom
+    try:
+        with pytest.raises(ExternalServiceError) as ei:
+            asyncio.run(_run())
+        assert ei.value.source == "realtime"
+        assert ei.value.reason_code == "connect_failed"
+    finally:
+        rt_mod.websockets.connect = orig

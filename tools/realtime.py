@@ -19,6 +19,7 @@ import json
 
 import websockets
 
+from shared.types import ExternalServiceError
 from tools.speech import pcm_to_wav
 
 
@@ -74,13 +75,23 @@ class RealtimeDialogClient:
         if self._ws is not None:
             return
         if not self._api_key or self._api_key.startswith("your-"):
-            raise RuntimeError("Realtime 没配 API Key（.env 里填百炼 key，或留空复用 LLM_API_KEY）")
+            # R27c：统一窄错误载体（RuntimeError 子类，上层既有兜底零破坏）
+            raise ExternalServiceError("realtime", "not_configured", retryable=False,
+                                       detail="Realtime 没配 API Key")
 
-        self._ws = await websockets.connect(
-            self._url,
-            additional_headers={"Authorization": f"Bearer {self._api_key}"},
-            max_size=16 * 1024 * 1024,
-        )
+        # R27c：网络边界——websockets 握手失败（网络/DNS/拒绝连接）转窄载体
+        try:
+            self._ws = await websockets.connect(
+                self._url,
+                additional_headers={"Authorization": f"Bearer {self._api_key}"},
+                max_size=16 * 1024 * 1024,
+            )
+        except ExternalServiceError:
+            raise
+        except Exception as exc:
+            raise ExternalServiceError(
+                "realtime", "connect_failed", retryable=True, detail=str(exc)
+            ) from exc
         self._configured = asyncio.Event()
         # 上一轮对话留下的报错得清掉，不然会把好连接误杀成配置失败
         self._round_error = ""
@@ -93,7 +104,9 @@ class RealtimeDialogClient:
         if not done or self._round_error:
             message = self._round_error or "服务端没确认开场配置"
             await self.close()
-            raise RuntimeError(f"Realtime 会话配置失败：{message}")
+            raise ExternalServiceError(
+                "realtime", "session_failed", retryable=True, detail=message
+            )
 
     def update_instructions(self, instructions: str) -> None:
         """换开场白（记忆注入内容）。已连接时只影响下次重连，不拆当前上下文。"""
@@ -220,7 +233,10 @@ class RealtimeDialogClient:
 
         await asyncio.wait_for(self._round_done.wait(), timeout=self._RESPONSE_TIMEOUT)
         if self._round_error:
-            raise RuntimeError(f"Realtime 服务端报错：{self._round_error}")
+            # R27c：服务端报错是外部失败，转窄载体（上层按外部失败降级/计路由失败）
+            raise ExternalServiceError(
+                "realtime", "server_error", retryable=True, detail=self._round_error
+            )
         # 这轮真跑通了，当前音色记成"可用音色"，之后重连失败就拿它兜底
         self._last_good_voice = self._voice
         # 服务端回的是 24kHz 裸 PCM，浏览器播不了：包上 WAV 头再下发。

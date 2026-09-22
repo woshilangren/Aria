@@ -1053,11 +1053,16 @@ class DialoguePipeline:
             return
 
     async def _synthesize(self, text: str, handle) -> bytes:
-        """合成语音（dashscope 同步调用，扔线程池）。失败只是少声音，不打断流程。"""
+        """合成语音（dashscope 同步调用，扔线程池）。失败只是少声音，不打断流程。
+
+        R27c：只有**外部失败**（窄载体）才降级成无声音——本地缺陷照常上抛
+        （astream 分流成 internal_error），不许把编程错误藏成"这次没语音"。
+        """
         self._check_cancel(handle)
         try:
             return await asyncio.to_thread(services.get("tts").synthesize, text)
-        except Exception:
+        except ExternalServiceError as exc:
+            print(f"[pipeline] 语音合成失败，本轮仅文字（{exc.source}/{exc.reason_code}）")
             return b""
 
     @staticmethod

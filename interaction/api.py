@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from shared.types import InputMessage, PipelineInternalError
+from shared.types import ExternalServiceError, InputMessage, PipelineInternalError
 
 # 上传文件大小上限（20MB）；一次从上传流里读多少字节做累加校验。
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -673,16 +673,30 @@ async def voice_stream(websocket: WebSocket) -> None:
                             audio = b""
                         # 标签只给合成器用：推给前端的文字剥干净，不展示标记
                         reply_text = strip_emotion_marks(reply.text)
-                except Exception:
-                    import traceback
-
-                    print("[voice] 这一轮处理失败：", traceback.format_exc(limit=3))
+                except ExternalServiceError as exc:
+                    # R27c：外部服务失败——按供应商故障计路由失败（连续挂够会
+                    # 自动降级到级联），用户拿到人设兜底话
+                    logging.getLogger("aria").warning(
+                        "[voice] 外部服务失败（%s/%s）: %r", exc.source, exc.reason_code, exc)
+                    manager.report_failure(session_id)
                     from orchestration.managers import FallbackController
 
-                    manager.report_failure(session_id)
                     reply_text = FallbackController().fallback_reply("voice_route")
                     audio = b""
                     # 实时专线这轮砸了，连接可能已经脏了，关掉下轮重建
+                    if realtime_client is not None:
+                        await realtime_client.close()
+                        realtime_client = None
+                except Exception:
+                    # R27c：本地缺陷（解析/装配 TypeError 等）——**不计**路由失败、
+                    # **不自动切路**（程序错误不是供应商故障，切路救不了它）；
+                    # 大声留痕 + 对用户发固定安全文案，绝不冒充外部故障
+                    import traceback
+
+                    print("[voice] 这一轮内部错误（internal_error）：",
+                          traceback.format_exc(limit=3))
+                    reply_text = "这轮没接上，稍后再试试"
+                    audio = b""
                     if realtime_client is not None:
                         await realtime_client.close()
                         realtime_client = None

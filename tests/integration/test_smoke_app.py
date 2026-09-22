@@ -119,6 +119,56 @@ def test_internal_error_returns_safe_500(client, monkeypatch):
     assert "XYZ" not in resp.text
 
 
+def test_voice_route_external_counts_local_does_not(client, monkeypatch):
+    """WS 路由层失败语义（R27c）：外部失败计路由失败（fail_count+1，可自动
+    降级）；本地 TypeError 不计数、不切路，用户拿到固定安全文案。
+
+    cascade 路由下 ASR 未配 key（integration 假环境）→ not_configured 窄载体
+    → 走"外部失败"分支；再把 receive_voice 换成本地缺陷 → 走"内部错误"分支。
+    """
+    from shared.singletons import services
+
+    kv = services.get("kv_store")
+
+    def _one_round(sid):
+        texts = []
+        with client.websocket_connect(
+            f"/api/voice/stream?session_id={sid}&token=test-token"
+        ) as ws:
+            ws.send_bytes(b"\x00\x01" * 160)
+            ws.send_text("END")
+            while True:
+                msg = ws.receive()
+                if msg.get("type") in ("websocket.disconnect", None):
+                    break
+                if msg.get("text"):
+                    texts.append(msg["text"])
+                    break  # cascade 轮只回一条文字（识别失败→兜底/安全文案）
+        return texts
+
+    # 第一轮：外部失败（ASR not_configured）
+    texts1 = _one_round("ws-r27c")
+    cfg1 = kv.read("route_config", "ws-r27c") or {}
+    assert cfg1.get("fail_count") == 1, f"外部失败应计一次路由失败，实测 {cfg1}"
+
+    # 第二轮：本地缺陷（注入 TypeError），fail_count 不动、不切路由
+    route_before = cfg1.get("route", "cascade")
+    from interaction.api import _get_gateway
+
+    gw = _get_gateway()
+
+    def boom(buffer, session_id, audio_fmt, audio_rate):
+        raise TypeError("语音路径注入的本地缺陷XYZ")
+
+    monkeypatch.setattr(gw["receiver"], "receive_voice", boom)
+    texts2 = _one_round("ws-r27c")
+    cfg2 = kv.read("route_config", "ws-r27c") or {}
+    assert cfg2.get("fail_count") == 1, f"本地缺陷不许计入路由失败，实测 {cfg2}"
+    assert cfg2.get("route", "cascade") == route_before, "本地缺陷不许触发自动切路"
+    assert any("没接上" in t for t in texts2), f"应收到固定安全文案，实测 {texts2!r}"
+    assert all("XYZ" not in t for t in texts2), "本地缺陷细节不外泄"
+
+
 def test_voice_control_failure_sends_fixed_text(client, monkeypatch):
     """WS 换音色控制失败：对外只发固定安全文案，str(exc) 细节不外泄（R27a）。
 

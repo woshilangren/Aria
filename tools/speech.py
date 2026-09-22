@@ -32,6 +32,7 @@ from dashscope.audio.asr import Recognition, RecognitionCallback
 from dashscope.audio.tts_v2 import SpeechSynthesizer
 
 from config.settings import get_settings, timeout_seconds
+from shared.types import ExternalServiceError
 from tools.misc import has_key
 
 # config.json 的 timeouts 段缺失/写坏时的兜底上限（秒），与 config/settings.py 的
@@ -189,7 +190,10 @@ class ASRTool:
         """
         cfg = get_settings()
         if not has_key(cfg.asr_api_key):
-            raise RuntimeError("语音识别服务没配置（ASR_API_KEY）")
+            # R27c：统一窄错误载体（ExternalServiceError 是 RuntimeError 子类，
+            # 既有按 RuntimeError 兜底的调用方零破坏）
+            raise ExternalServiceError("asr", "not_configured", retryable=False,
+                                       detail="ASR_API_KEY 没配")
         # 这版 SDK 的 key 不走构造参数，走全局设置（和 TTS 同一套路，调用前各设各的）
         # 格式判定：显式参数 > 魔数嗅探 > 文件名后缀
         fmt = (fmt or "").lower().strip() or sniff_audio_format(audio) or (
@@ -231,11 +235,21 @@ class ASRTool:
                 # 本来要防的"key 被覆盖"窗口。不放锁则是永久死锁，两害相权取其轻——
                 # 窗口只有"僵尸还没读完请求参数"那么长，且专用池已经把爆炸半径限制
                 # 在语音功能内。
-                result = _run_bounded(
-                    lambda: recognition.call(file=tmp.name),
-                    timeout_seconds("asr_seconds", _ASR_TIMEOUT_DEFAULT),
-                    "语音识别（ASR）",
-                )
+                # R27c：SDK/超时边界——try 里只有这次调用，里面抛的都是
+                # dashscope 的事（超时/网络/服务端错误），统一转窄载体；
+                # _extract_text 是本地装配，留在边界之外
+                try:
+                    result = _run_bounded(
+                        lambda: recognition.call(file=tmp.name),
+                        timeout_seconds("asr_seconds", _ASR_TIMEOUT_DEFAULT),
+                        "语音识别（ASR）",
+                    )
+                except RuntimeError as exc:
+                    # _run_bounded 的超时走 RuntimeError（本模块旧契约），
+                    # dashscope 自身的异常原样穿过来——都归外部失败
+                    raise ExternalServiceError(
+                        "asr", "request_failed", retryable=True, detail=str(exc)
+                    ) from exc
             return _extract_text(result.get_sentence() if result else None)
         finally:
             # 就算 ASR 超时留下了僵尸线程，这里删临时文件也是安全的：SDK 在
@@ -254,7 +268,8 @@ class TTSTool:
     def synthesize(self, text: str, instruction: str = "") -> bytes:
         cfg = get_settings()
         if not has_key(cfg.tts_api_key):
-            raise RuntimeError("语音合成服务没配置（TTS_API_KEY）")
+            raise ExternalServiceError("tts", "not_configured", retryable=False,
+                                       detail="TTS_API_KEY 没配")
         # 文本里带的 [情绪] 和（语气描述）是给合成器的：拆出来转成指令，
         # 剥干净的正文才拿去念，标记绝不能被念出来
         clean, tags, descs = split_emotion(text)
@@ -288,10 +303,21 @@ class TTSTool:
                 # （1.27.2 签名：call(text, timeout_millis=None)），超时抛 TimeoutError，
                 # 并且 streaming_complete 的 finally 里会 __cleanup_task() 把 websocket
                 # 关掉——比 ASR 那样从外面包线程池干净得多，所以能用原生的就用原生的。
+                #
+                # R27c：SDK 边界——call 抛的都算外部失败，统一转窄载体；
+                # 构造函数在 try 之外（参数装配错了是本地缺陷，不伪装成供应商故障）
                 return synthesizer.call(clean, timeout_millis=int(timeout_s * 1000))
             except TimeoutError as exc:
-                # 转成 RuntimeError：本模块既有的失败契约就是它（key 没配也是 RuntimeError），
-                # 上层靠它降级成纯文字；把内建 TimeoutError 直接漏出去，只 catch
-                # RuntimeError 的地方就会漏接。超时本身要留痕，别静默。
+                # 超时本身要留痕，别静默。窄载体是 RuntimeError 子类：上层按
+                # RuntimeError 降级成纯文字的既有路径零破坏
                 print(f"[speech] 语音合成（TTS）超过 {timeout_s:.0f}s 未完成，本次按失败处理")
-                raise RuntimeError(f"语音合成超时（{timeout_s:.0f}s）") from exc
+                raise ExternalServiceError(
+                    "tts", "timeout", retryable=True,
+                    detail=f"语音合成超时（{timeout_s:.0f}s）",
+                ) from exc
+            except ExternalServiceError:
+                raise
+            except Exception as exc:
+                raise ExternalServiceError(
+                    "tts", "request_failed", retryable=True, detail=str(exc)
+                ) from exc
