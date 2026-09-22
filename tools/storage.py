@@ -7,6 +7,7 @@
 """
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -407,10 +408,17 @@ class VectorStoreTool:
         for idx, (doc, meta, dist) in enumerate(zip(docs, metas, dists)):
             meta = meta or {}
             doc_id = res_ids[idx] if ids_ok and idx < len(res_ids) else ""
+            # R08：语义置信分 = 1/(1+d)，非负且随距离单调递减。
+            # 旧 1-d 在 l2 距离 >1 时为负，负分再乘衰减/热度会让**更旧**的记忆
+            # 反而排更前（越负乘得越负）。NaN/Infinity/负距离是异常数据，
+            # 直接跳过——宁可少一条，不许它进榜首冒充"最相关"。
             try:
-                sim = 1.0 - float(dist)  # l2 距离转粗相似度（仅用于相对排序）
+                d = float(dist)
             except (TypeError, ValueError):
-                sim = 0.5
+                continue
+            if not math.isfinite(d) or d < 0:
+                continue
+            similarity = 1.0 / (1.0 + d)
             valence = meta.get("valence", 0.0)
             arousal = meta.get("arousal", 0.3)
             try:
@@ -442,7 +450,11 @@ class VectorStoreTool:
                     "feeling": meta.get("feeling", ""),
                     "appraisal": meta.get("appraisal", ""),
                     "valence": valence,
-                    "score": sim * decay * boost,
+                    # 语义置信分（只看距离，S7 措辞用它）与排序分（乘了衰减与
+                    # 热度，只用于排序）是**两个量**——混用会让热门召回把模糊
+                    # 记忆说得斩钉截铁（R08）
+                    "similarity": similarity,
+                    "score": similarity * decay * boost,
                 }
             )
         items.sort(key=lambda x: x["score"], reverse=True)

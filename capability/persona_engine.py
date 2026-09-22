@@ -15,6 +15,35 @@ from config.settings import PROJECT_ROOT
 from capability.memory import SessionMemoryKeeper, recent_arc
 from capability import self_identity, char_life
 
+# S7 低置信阈值（R08）：旧的 0.35 是排序分时代的口径（1-d 相似度 <0.35 ⇔
+# 距离 >0.65 就该含糊）。召回分改成 1/(1+d) 语义置信分后，同一边界 =
+# 1/(1+0.65) ≈ 0.61，取 0.6。**必须用语义置信分（similarity）判断**——
+# 排序分混入了时间衰减与热度加成，一次热门召回会让她把模糊记忆说得
+# 斩钉截铁（"不确定措辞"的触发不该取决于这条记忆红不红）。
+_S7_LOW_CONFIDENCE = 0.6
+
+
+def _needs_uncertain_hedge(item) -> bool:
+    """这条召回是不是该配"不确定"措辞（S7 会记错）。
+
+    优先用校准过的语义置信分（similarity）；旧调用方喂来的条目没有
+    similarity 字段时，退回旧排序分 0.35 口径（legacy 兼容）；两者都没有
+    就当高置信——不确定措辞宁少勿滥，滥了她句句都"好像记岔了"。
+    """
+    sim = item.get("similarity")
+    if sim is not None:
+        try:
+            return float(sim) < _S7_LOW_CONFIDENCE
+        except (TypeError, ValueError):
+            return False
+    score = item.get("score")
+    if score is not None:
+        try:
+            return float(score) < 0.35
+        except (TypeError, ValueError):
+            return False
+    return False
+
 
 # 心情惯性的措辞（N2）：mood_from 存的是引起心情的情绪标签，翻成起因人话
 _MOOD_FROM_TEXT = {
@@ -234,13 +263,10 @@ class PersonaEngine:
                 if item.get("feeling"):
                     line += f"（当时的感觉：{item['feeling']}）"
                 # S7 会记错：召回分低的记忆配"不确定"措辞——把模糊当特性，
-                # 她会说"好像有点印象……是不是记岔了"，而不是斩钉截铁
-                score = item.get("score")
-                try:
-                    if score is not None and float(score) < 0.35:
-                        line += "（这条你只是有点印象，说的时候带上不确定——\"好像……是不是记岔了\"）"
-                except (TypeError, ValueError):
-                    pass
+                # 她会说"好像有点印象……是不是记岔了"，而不是斩钉截铁。
+                # R08：按校准的语义置信分判断，不再照搬排序分阈值 0.35
+                if _needs_uncertain_hedge(item):
+                    line += "（这条你只是有点印象，说的时候带上不确定——\"好像……是不是记岔了\"）"
                 lines.append(line)
             sections.append(
                 "【记得的事】\n"
