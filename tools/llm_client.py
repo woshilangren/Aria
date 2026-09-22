@@ -131,6 +131,12 @@ class LLMClient:
         # 半开探测专用短超时：探测不再复用客户端默认的 60 秒，避免聊天节奏下每条都白等
         self._probe_timeout = float(fb_cfg.get("probe_timeout_seconds", 5) or 5)
         self._error_count = 0
+        # R26a：主供应商**连续**失败次数——与 _error_count（整体故障压力，会被
+        # 备用成功衰减）是两个量。以前只有 _error_count：主失败 +1、备用成功 -1，
+        # "主挂→备活"的循环里计数永远在 0~1 打转，主熔断永远开不了
+        # （真机 429 复现：error_counts=[0,0,0]）。现在开熔断只认 _main_fail_streak：
+        # 只有实际主调用失败才 +1，主**完整**成功才清零，备用成功绝不衰减它。
+        self._main_fail_streak = 0
         self._opened_at: float | None = None  # 熔断打开时刻（单调时钟），None=未打开
         # 半开探测连续失败次数：每失败一次探测超时翻倍（封顶 60 秒）。
         # 否则主模型首包常态超过探测短超时（开思考/高峰期）时，探测永远失败、
@@ -278,23 +284,30 @@ class LLMClient:
                 if is_probe:
                     kwargs["timeout"] = self._probe_timeout_now()
                 resp = self._client.chat.completions.create(**kwargs)
-                # 成功即闭合：清空错误计数、清掉熔断时刻、探测超时回到最短档
+                # 主完整成功即闭合（R26a）：主失败连击清零、整体压力清零、
+                # 熔断时刻清掉、探测超时回到最短档
                 with self._cb_lock:
                     self._error_count = 0
+                    self._main_fail_streak = 0
                     self._opened_at = None
                     self._probe_fail_streak = 0
                 return resp
             except openai.OpenAIError as exc:
+                # R26a：计数归属——只有实际主调用失败才动这两个计数
                 with self._cb_lock:
-                    self._error_count += 1
+                    self._error_count += 1          # 整体故障压力（可被备用成功衰减）
+                    self._main_fail_streak += 1     # 主连续失败（开熔断的唯一依据）
                     last_error = exc
                     if is_probe:
+                        # R26b：半开探测是**真实主调用**——任何失败都立即重新打开
+                        # 并刷新冷却起点，同时探测退避 +1；不等连击凑满
                         self._probe_fail_streak += 1
-                    # 静默降级会让"主模型 key 失效"这种事藏好几个星期没人发现，至少喊一声
-                    print(f"[llm] 主模型调用失败({self._error_count}/{self._max_errors})，走备用：{exc}")
-                    if self._error_count >= self._max_errors:
-                        # 连续失败到阈值：打开熔断；半开再次失败时也会走到这，等于刷新打开时刻
                         self._opened_at = time.monotonic()
+                    elif self._main_fail_streak >= self._max_errors:
+                        # 连续主失败到阈值：打开熔断
+                        self._opened_at = time.monotonic()
+                    # 静默降级会让"主模型 key 失效"这种事藏好几个星期没人发现，至少喊一声
+                    print(f"[llm] 主模型调用失败(连击 {self._main_fail_streak}/{self._max_errors})，走备用：{exc}")
             finally:
                 # 名额无论成功失败都得还回去，否则熔断从此再也放不出探测、永久停在备用
                 if is_probe:
@@ -308,9 +321,9 @@ class LLMClient:
             kwargs["model"] = self._fallback_model
             try:
                 resp = self._fallback.chat.completions.create(**kwargs)
-                # 备用每成功一次就把主模型错误计数衰减一格，而不是只等主模型自己成功清零——
-                # 否则相隔几小时的两次网络抖动各自被兜住、计数却累到阈值，白开一轮 120 秒熔断，
-                # 期间感知/画像/日记全换小模型，用户感知为"她突然变了个人"
+                # 备用每成功一次就把整体故障压力衰减一格（J13 取舍保留）——但
+                # R26a：**绝不碰 _main_fail_streak**，备用成功抵消不了"主刚失败"
+                # 的证据，否则"主挂→备活"循环里主熔断永远开不了
                 with self._cb_lock:
                     self._error_count = max(0, self._error_count - 1)
                 return resp
@@ -438,15 +451,19 @@ class LLMClient:
                 try:
                     stream = await self._aclient.chat.completions.create(**kwargs)
                 except openai.OpenAIError as exc:
-                    # R27b：只把 SDK 异常当供应商失败；本地装配缺陷原样上抛不计数
+                    # R27b：只把 SDK 异常当供应商失败；本地装配缺陷原样上抛不计数。
+                    # R26b：流式与同步同语义——建流失败按实际主故障计一次（连击 +
+                    # 压力），半开探测失败立即重开刷新冷却
                     with self._cb_lock:
                         self._error_count += 1
+                        self._main_fail_streak += 1
                         last_error = exc
                         if is_probe:
                             self._probe_fail_streak += 1
-                        print(f"[llm] 主模型流式建流失败({self._error_count}/{self._max_errors})，走备用：{exc}")
-                        if self._error_count >= self._max_errors:
                             self._opened_at = time.monotonic()
+                        elif self._main_fail_streak >= self._max_errors:
+                            self._opened_at = time.monotonic()
+                        print(f"[llm] 主模型流式建流失败(连击 {self._main_fail_streak}/{self._max_errors})，走备用：{exc}")
                 if stream is not None:
                     # 建流成功：正常逐块产出。中途出错：吐过内容就直接抛；没吐过则回落去试备用
                     emitted = False
@@ -457,15 +474,23 @@ class LLMClient:
                                 emitted = True
                                 yield delta
                         with self._cb_lock:
+                            # R26b：完整流结束才算成功——四项状态一并复位
                             self._error_count = 0
+                            self._main_fail_streak = 0
                             self._opened_at = None
                             self._probe_fail_streak = 0
                         return
                     except openai.OpenAIError as exc:
+                        # R26b：首 token 前失败、已出 token 后失败都是实际主故障，
+                        # 同样计连击；半开探测失败立即重开刷新冷却
                         with self._cb_lock:
                             self._error_count += 1
+                            self._main_fail_streak += 1
                             last_error = exc
-                            if self._error_count >= self._max_errors:
+                            if is_probe:
+                                self._probe_fail_streak += 1
+                                self._opened_at = time.monotonic()
+                            elif self._main_fail_streak >= self._max_errors:
                                 self._opened_at = time.monotonic()
                         if emitted:
                             # R27b：吐过 token 换备用也接不上——统一转窄载体交给上层
@@ -510,7 +535,8 @@ class LLMClient:
                         emitted = True
                         yield delta
                 with self._cb_lock:
-                    self._error_count = max(0, self._error_count - 1)  # 备用成功，错误计数衰减（同同步路径）
+                    # 备用成功衰减整体压力（J13）；R26a：主失败连击不受影响
+                    self._error_count = max(0, self._error_count - 1)
             except openai.OpenAIError as exc:
                 # R27b：备用流中途断流同样转窄载体——以前这里裸抛 SDK 异常，
                 # 管道会把它误分成 internal_error（程序错误），污染错误语义

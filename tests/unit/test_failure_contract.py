@@ -67,6 +67,7 @@ def _make_client(main_exc=None, fallback_exc=None):
     c._cooldown = 120.0
     c._error_count = 0
     c._max_errors = 2
+    c._main_fail_streak = 0  # R26a：主连续失败连击（开熔断的唯一依据）
     c._probe_in_flight = False
     c._probe_fail_streak = 0
     return c, calls
