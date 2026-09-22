@@ -51,17 +51,18 @@ def test_turn_registry_rejects_none_turn_id() -> None:
 # =================== 3. _writeback 有取消检查点 ===================
 
 def test_writeback_has_cancel_checkpoints() -> None:
-    """_writeback 函数体内必须有 ≥2 次 self._check_cancel(handle) 调用。
+    """写回协调器体内必须有 ≥4 次 _check_cancel(handle) 调用。
 
     每个子步骤（KEEPER / chat_log / distiller / tracker / note_user_reply）之前
     各插一个——取消的轮什么都不写（CLAUDE.md 有意的设计取舍 #3）。
+    R17a：写回本体已机械提取到 orchestration/writeback.py，不变式跟着搬。
     """
-    src = Path("orchestration/pipeline.py").read_text(encoding="utf-8")
-    fn_start = src.find("def _writeback(")
+    src = Path("orchestration/writeback.py").read_text(encoding="utf-8")
+    fn_start = src.find("def writeback(self, state, handle)")
     fn_end = src.find("\n    def ", fn_start + 1)
     body = src[fn_start:fn_end if fn_end > 0 else None]
     count = body.count("_check_cancel(handle)")
-    assert count >= 4, f"_writeback 应有 ≥4 个取消检查点（KEEPER/chat_log/distiller/tracker），实测 {count}"
+    assert count >= 4, f"writeback 应有 ≥4 个取消检查点（KEEPER/chat_log/distiller/tracker），实测 {count}"
 
 
 # =================== 4. writeback 顺序：tracker 在 note_user_reply 之前 ===================
@@ -71,15 +72,16 @@ def test_writeback_tracker_before_note_user_reply() -> None:
 
     否则首轮会被预创建空 relationship、tracker 的"首次初始化"分支失效，
     default_intimacy 被吞成 0（开发日志 BUG-20260916-首聊 已踩中）。
+    R17a：写回本体已机械提取到 orchestration/writeback.py，不变式跟着搬。
     """
-    src = Path("orchestration/pipeline.py").read_text(encoding="utf-8")
-    fn_start = src.find("def _writeback(")
+    src = Path("orchestration/writeback.py").read_text(encoding="utf-8")
+    fn_start = src.find("def writeback(self, state, handle)")
     fn_end = src.find("\n    def ", fn_start + 1)
     body = src[fn_start:fn_end if fn_end > 0 else None]
     tracker_pos = body.find("RelationshipTracker")
     note_pos = body.find("note_user_reply(session_id)")
-    assert tracker_pos > 0, "_writeback 必须实例化 RelationshipTracker"
-    assert note_pos > 0, "_writeback 必须调用 note_user_reply"
+    assert tracker_pos > 0, "writeback 必须实例化 RelationshipTracker"
+    assert note_pos > 0, "writeback 必须调用 note_user_reply"
     assert tracker_pos < note_pos, (
         f"顺序反了：tracker 在 L{fn_start + tracker_pos}，"
         f"note_user_reply 在 L{fn_start + note_pos}。"
