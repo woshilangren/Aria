@@ -47,7 +47,10 @@ def bootstrap() -> None:
         # 时机与改造前一致（都在 lifespan startup），所以不是行为变化。
         vector_store.ensure_ready()
     except Exception as exc:
-        services.mark_error("vector_store", str(exc))
+        # R06b：ensure_ready 是"注册之后"的第二段初始化——它挂了必须撤出
+        # 注册表（fail = mark_error + 摘除实例），否则 health 假绿：
+        # 服务看着活着，一用就炸。只 mark_error 不摘除的旧写法就是这个缺口。
+        services.fail("vector_store", str(exc))
 
     # 拆成两个 try：以前两个共用同一个 try，registry 初始化一失败就把 executor 一起带走，
     # 等于工具表整体成功但 executor 不在工作位（key 是 `tool_registry` 拿不到真实原因）。

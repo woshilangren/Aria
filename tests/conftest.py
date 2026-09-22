@@ -177,6 +177,17 @@ def _isolate(tmp_path, monkeypatch):
     saved_active = dict(TURN_REGISTRY._active)
     saved_bg = set(_pipeline_mod._BG_TASKS)
 
+    # R06a：装配状态（_ASSEMBLY_STATE）也是进程级单例——每个用例必须从
+    # "未装配"开始。否则上一个用例留下的 status=ready 会让下一个用例的
+    # lifespan 跳过 bootstrap，直接面对被本 fixture 清空的 services 注册表
+    # （集成冒烟实测：kv_store 不可用）。装配屏障的 Event 同步清零。
+    import main as _main_mod
+
+    _main_mod._ASSEMBLY_STATE.update(
+        {"servers": 0, "watcher": None, "status": "idle", "error": None}
+    )
+    _main_mod._ASSEMBLY_DONE.clear()
+
     try:
         yield
     finally:

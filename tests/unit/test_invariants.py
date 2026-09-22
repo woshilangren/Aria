@@ -201,8 +201,11 @@ def test_double_lifespan_assembles_once(monkeypatch) -> None:
     # 所以 patch 模块属性就生效
     monkeypatch.setattr(proactive_mod, "IdleDiaryWatcher", FakeWatcher)
     # 守卫是模块级状态，必须归零再测，否则上一个用例的残留会让 first 判定失真
+    # （R06a 新增 status/error 两个就绪屏障字段，同样要复位）
     monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "servers", 0)
     monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "watcher", None)
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "status", "idle")
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "error", None)
 
     app = main_mod.create_app()
     factory = app.router.lifespan_context
@@ -285,3 +288,107 @@ class _FakeTTSStub:
 
     def synthesize(self, text, **kwargs):  # noqa: ARG002
         raise AssertionError("被取消的轮不应走到语音合成")
+
+# =================== 11. R06a：装配就绪屏障 ===================
+
+def _reset_assembly(monkeypatch):
+    import main as main_mod
+
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "servers", 0)
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "watcher", None)
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "status", "idle")
+    monkeypatch.setitem(main_mod._ASSEMBLY_STATE, "error", None)
+    main_mod._ASSEMBLY_DONE.clear()
+    return main_mod
+
+
+def _bare_app(monkeypatch, main_mod, bootstrap_fn):
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(main_mod, "_ensure_access_token", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod, "bootstrap", bootstrap_fn)
+    monkeypatch.setattr(main_mod, "build_app", lambda: FastAPI())
+
+    class FakeWatcher:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    import capability.proactive as proactive_mod
+
+    monkeypatch.setattr(proactive_mod, "IdleDiaryWatcher", FakeWatcher)
+    return main_mod.create_app()
+
+
+def test_assembly_barrier_blocks_second_lifespan_until_ready(monkeypatch):
+    """第二个 lifespan 必须等首次装配完成才进入（Event 控制交错，不靠 sleep 碰运气）。"""
+    import asyncio
+
+    main_mod = _reset_assembly(monkeypatch)
+    release = threading.Event()
+
+    def slow_bootstrap():
+        assert release.wait(timeout=5), "测试引导事件超时"
+
+    app = _bare_app(monkeypatch, main_mod, slow_bootstrap)
+    factory = app.router.lifespan_context
+
+    async def _run():
+        entered = []
+
+        async def entry(tag):
+            async with factory(app):
+                entered.append(tag)
+                await asyncio.sleep(0.02)
+
+        t1 = asyncio.create_task(entry("first"))
+        await asyncio.sleep(0.05)  # 让第一个入口进入 assembling（卡在 bootstrap）
+        t2 = asyncio.create_task(entry("second"))
+        await asyncio.sleep(0.1)  # 给等待者机会——它必须还在等
+        assert entered == [], "装配未完成前任何入口都不许进入服务期"
+        release.set()
+        await asyncio.gather(t1, t2)
+        assert sorted(entered) == ["first", "second"]
+
+    asyncio.run(_run())
+    assert main_mod._ASSEMBLY_STATE["servers"] == 0
+    assert main_mod._ASSEMBLY_STATE["status"] == "ready"
+
+
+def test_assembly_failure_wakes_waiters_and_rolls_back(monkeypatch):
+    """装配失败：装配者与等待者一起失败、计数回退归零；后续入口快速失败。"""
+    import asyncio
+
+    main_mod = _reset_assembly(monkeypatch)
+
+    def boom():
+        raise RuntimeError("装配炸了")
+
+    app = _bare_app(monkeypatch, main_mod, boom)
+    factory = app.router.lifespan_context
+
+    async def _run():
+        results = []
+
+        async def entry(tag):
+            try:
+                async with factory(app):
+                    results.append((tag, "entered"))
+            except RuntimeError as exc:
+                results.append((tag, str(exc)))
+
+        t1 = asyncio.create_task(entry("first"))
+        await asyncio.sleep(0.05)
+        t2 = asyncio.create_task(entry("second"))
+        await asyncio.sleep(0.05)
+        # 失败后新入口：快速失败，不重试半套装配
+        t3 = asyncio.create_task(entry("third"))
+        await asyncio.gather(t1, t2, t3)
+        return results
+
+    results = asyncio.run(_run())
+    assert all("失败" in msg for _tag, msg in results), f"全部入口都该失败: {results}"
+    assert main_mod._ASSEMBLY_STATE["servers"] == 0, "失败后计数必须回退归零"
+    assert main_mod._ASSEMBLY_STATE["status"] == "failed"

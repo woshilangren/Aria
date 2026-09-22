@@ -14,7 +14,20 @@ class ServiceRegistry:
         self._errors: dict = {}
 
     def register(self, name: str, obj) -> None:
+        # R06b：成功注册即清掉同名的旧错误——"成功恢复要清掉旧错误"，
+        # 否则一次失败的重挂着永久留在 _errors 里污染 get() 的报错理由
+        self._errors.pop(name, None)
         self._services[name] = obj
+
+    def fail(self, name: str, reason: str) -> None:
+        """注册后初始化失败（R06b）：撤出注册表并记账。
+
+        "注册对象"不等于"初始化成功"——先 register 再 ensure_ready 这类
+        两段式服务，第二段挂了如果只 mark_error、实例还留在表里，
+        health 就会假绿（服务看着活着，一用就炸）。
+        """
+        self._errors[name] = reason
+        self._services.pop(name, None)
 
     def get(self, name: str):
         if name not in self._services:

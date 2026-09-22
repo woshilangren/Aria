@@ -17,6 +17,7 @@
 （能读到九个服务的存活状态）。"无口令对外监听"的告警只有控制台一条通道，见 _UNPROTECTED_STATE。
 """
 
+import asyncio
 import os
 import secrets
 import threading
@@ -99,7 +100,30 @@ def _start_unprotected_alarm() -> None:
 # 用引用计数而不是"只在主线程装配"，是因为 `uvicorn main:app` 单端口路径也走这里，
 # 而且两个 server 的启动先后顺序不保证（HTTPS 是 daemon 线程）。
 _ASSEMBLY_LOCK = threading.Lock()
-_ASSEMBLY_STATE = {"servers": 0, "watcher": None}
+# R06a：装配状态机 idle→assembling→ready/failed + 跨线程/跨 loop 完成通知。
+# "servers" 是引用计数，"watcher" 是唯一巡检实例（I10 原有语义不变）；
+# "status"/"error" 是就绪屏障的新增字段：第二个 lifespan 必须等首次装配
+# 出结果才能对外服务——以前它不等，装配没做完就有流量进来（读空注册表）；
+# 装配失败则唤醒全部等待者一起失败（回退各自的计数），进程重启才重试。
+_ASSEMBLY_STATE = {"servers": 0, "watcher": None, "status": "idle", "error": None}
+_ASSEMBLY_DONE = threading.Event()
+
+
+def _assembly_release() -> None:
+    """一个 server 退出：回退引用计数；最后一个退出才停巡检线程。
+
+    HTTPS 那条是 daemon 线程，Ctrl-C 时主线程的 server 先收尾——所以判
+    "归零"而不是无条件 stop，否则先退出的那个会把还在对外服务的另一个的
+    巡检停掉。装配失败的回退也走这里（finally 必须罩住 bootstrap）。
+    """
+    with _ASSEMBLY_LOCK:
+        _ASSEMBLY_STATE["servers"] = max(0, _ASSEMBLY_STATE["servers"] - 1)
+        last = _ASSEMBLY_STATE["servers"] == 0
+        watcher = _ASSEMBLY_STATE["watcher"] if last else None
+        if last:
+            _ASSEMBLY_STATE["watcher"] = None
+    if watcher is not None:
+        watcher.stop()
 
 
 def create_app() -> FastAPI:
@@ -119,35 +143,82 @@ def create_app() -> FastAPI:
         # 且没配口令时全站（记忆/档案/聊天）不鉴权对外。挪进 lifespan 后任何
         # 启动方式都先过这道防线。
         # 但双端口下 lifespan 会跑两遍，所以装配整体只挂在"第一个 server"上（I10）。
+        #
+        # R06a 就绪屏障：
+        # - 锁内只做状态翻转（bootstrap/网络一律在锁外——锁内跑慢活会把所有
+        #   入口串行化）；
+        # - status=assembling 时后来者在**线程池里**等 Event（to_thread 阻塞等，
+        #   事件循环本身不被堵住），装配完成/失败各 set 一次唤醒全部等待者；
+        # - 失败路径：装配者置 failed 并抛错（其 finally 正常回退自己的计数），
+        #   等待者收到 failed 一起抛（它们从未加过计数，无泄漏）；之后再来的
+        #   入口快速失败，进程重启才重试——不做半套装配上的自动重试。
+        i_am_assembler = False
+        need_wait = False
         with _ASSEMBLY_LOCK:
-            first = _ASSEMBLY_STATE["servers"] == 0
-            _ASSEMBLY_STATE["servers"] += 1
-        if first:
-            _ensure_access_token(get_settings())
-            bootstrap()
-            from capability.proactive import IdleDiaryWatcher
+            status = _ASSEMBLY_STATE["status"]
+            if status == "assembling":
+                # 有人在装：本入口是等待者（尚未挂计数，等出结果后才挂）
+                need_wait = True
+            elif status == "failed":
+                raise RuntimeError(
+                    f"服务装配此前已失败，需重启进程重试：{_ASSEMBLY_STATE['error']}"
+                )
+            else:
+                # idle → 首次装配；ready → 直接挂计数对外服务
+                _ASSEMBLY_STATE["servers"] += 1
+                i_am_assembler = status == "idle"
+                if i_am_assembler:
+                    _ASSEMBLY_STATE["status"] = "assembling"
+                    _ASSEMBLY_DONE.clear()
 
-            watcher = IdleDiaryWatcher()
-            watcher.start()
-            with _ASSEMBLY_LOCK:
-                _ASSEMBLY_STATE["watcher"] = watcher
-        try:
-            # gradio 的 lifespan 仍按每个 server 各进一次——ASGI lifespan 协议是
-            # 每连接一次的，这里不能也跟着"只跑一遍"，否则第二个 server 起不来。
-            async with old_lifespan(app) as state:
-                yield state
-        finally:
-            # 最后一个 server 退出才停巡检线程。HTTPS 那条是 daemon 线程，Ctrl-C 时
-            # 主线程的 server 先收尾——所以判"归零"而不是无条件 stop，
-            # 否则先退出的那个会把还在对外服务的另一个的巡检停掉。
-            with _ASSEMBLY_LOCK:
-                _ASSEMBLY_STATE["servers"] = max(0, _ASSEMBLY_STATE["servers"] - 1)
-                last = _ASSEMBLY_STATE["servers"] == 0
-                watcher = _ASSEMBLY_STATE["watcher"] if last else None
-                if last:
-                    _ASSEMBLY_STATE["watcher"] = None
-            if watcher is not None:
-                watcher.stop()
+        if i_am_assembler:
+            try:
+                try:
+                    # R06a：装配本身也不在事件循环线程上跑（to_thread）——
+                    # bootstrap 里的 SDK 构造/集合装配是秒级慢活，同步跑会把
+                    # 整个 loop（含正在等待的第二个 lifespan）冻结
+                    await asyncio.to_thread(_ensure_access_token, get_settings())
+                    await asyncio.to_thread(bootstrap)
+                    from capability.proactive import IdleDiaryWatcher
+
+                    watcher = IdleDiaryWatcher()
+                    watcher.start()
+                    with _ASSEMBLY_LOCK:
+                        _ASSEMBLY_STATE["watcher"] = watcher
+                        _ASSEMBLY_STATE["status"] = "ready"
+                    _ASSEMBLY_DONE.set()  # 唤醒全部等待者
+                except Exception as exc:
+                    with _ASSEMBLY_LOCK:
+                        _ASSEMBLY_STATE["status"] = "failed"
+                        _ASSEMBLY_STATE["error"] = f"{type(exc).__name__}: {exc}"
+                    _ASSEMBLY_DONE.set()  # 失败也要唤醒等待者，不许任何人挂死
+                    raise RuntimeError(f"服务装配失败：{exc}") from exc
+                # gradio 的 lifespan 仍按每个 server 各进一次——ASGI lifespan 协议是
+                # 每连接一次的，这里不能也跟着"只跑一遍"，否则第二个 server 起不来。
+                async with old_lifespan(app) as state:
+                    yield state
+            finally:
+                # 装配者退出（正常收摊或装配失败）：回退**自己的**计数。
+                # 这条 finally 必须罩住 bootstrap——失败路径同样要回退，否则计数泄漏
+                _assembly_release()
+        else:
+            if need_wait:
+                # 等待者：等首次装配出结果。阻塞等放线程池，事件循环不被堵住
+                ok = await asyncio.to_thread(_ASSEMBLY_DONE.wait, 300)
+                with _ASSEMBLY_LOCK:
+                    st = _ASSEMBLY_STATE["status"]
+                    err = _ASSEMBLY_STATE["error"]
+                if not ok or st != "ready":
+                    # 失败唤醒：等待者从未挂过计数，直接失败即可（无泄漏）
+                    raise RuntimeError(f"服务装配未就绪（status={st}）：{err}")
+                with _ASSEMBLY_LOCK:
+                    _ASSEMBLY_STATE["servers"] += 1
+            # status==ready 的直接进入者：计数已在上面的锁里挂好，直接服务
+            try:
+                async with old_lifespan(app) as state:
+                    yield state
+            finally:
+                _assembly_release()
 
     app.router.lifespan_context = lifespan
     return app
