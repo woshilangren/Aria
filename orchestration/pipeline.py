@@ -209,6 +209,7 @@ class TurnState:
     turn_id: str = ""
     request_id: str = ""
     request_digest: str = ""
+    burn_topic: str = ""  # R17d：小动作嵌进指令的生活素材，等提交成功后再烧计数
     output_mode: str = "text"
     image_path: str = ""
     error: str = ""
@@ -814,6 +815,11 @@ class DialoguePipeline:
                 extras=state.extras,
                 utterance_text=state.canonical_text,
                 mode="voice" if state.voice_mode else "text",
+                memory_ids=[
+                    item.get("id") for item in ((state.memory.distilled if state.memory else None) or [])
+                    if item.get("id")
+                ],
+                burn_topic=state.burn_topic,
             )
             receipt = await asyncio.to_thread(
                 self._writeback_coord.commit_prepared, prepared
@@ -1284,13 +1290,17 @@ class DialoguePipeline:
         mode = "comfort" if state.comfort_mode else "chat"
         memory = state.memory or MemoryBundle()
         rel = memory.relationship or {}
+        burns: list = []
         quirk = QuirkDirector().roll(
             memory,
             stage=rel.get("stage", "初识"),
             mood=rel.get("mood", "平常"),
             comfort_mode=state.comfort_mode,
             session_id=state.session_id,
+            deferred_burns=burns,
         )
+        # R17d：素材烧计数延后到提交成功（正常轮才有资格消耗她的生活面）
+        state.burn_topic = burns[0][1] if burns else ""
         emotion = state.emotion
         state.prompt = _ENGINE.compose(
             mode,

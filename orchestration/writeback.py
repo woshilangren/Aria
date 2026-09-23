@@ -207,6 +207,24 @@ class WritebackCoordinator:
                 note_user_reply(turn.session_id)
             except Exception:
                 pass
+            # R17d：提交前不落的隐式业务更新在这里补账——只有提交成功的正常轮
+            # 才有资格记召回热度、消耗生活素材；取消/降级/危机轮什么都留不下。
+            # 回执 already_committed 的重试轮 post_commit 直接早退（上面），
+            # 所以每种效果天然最多一次。
+            if turn.memory_ids:
+                try:
+                    from data.sqlite_store import get_db
+
+                    get_db().touch_memories(list(turn.memory_ids))
+                except Exception as exc:
+                    print(f"[writeback] 召回热度补记失败（不影响本轮）: {exc}")
+            if turn.burn_topic:
+                try:
+                    from capability import char_life
+
+                    char_life.commit_topic(turn.session_id, turn.burn_topic)
+                except Exception as exc:
+                    print(f"[writeback] 生活素材烧计数失败（不影响本轮）: {exc}")
             rel = kv.read("relationship", turn.session_id) or {}
             tasks: list = []
             interval = _portrait_interval()

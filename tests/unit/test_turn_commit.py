@@ -450,3 +450,77 @@ def test_coordinator_returns_typed_deferred_tasks(kv, register_services):
     # 不破坏载荷语义
     for key in wb.pending_commit_tasks():
         assert key.count(":") >= 1
+
+# ------------------- R17d：提交前隐式写入清点（热度/素材消费移到提交后） -------------------
+
+class _KeeperStub:
+    """post_commit 里的 KEEPER 替身：追加与上下文都进内存。"""
+
+    def __init__(self):
+        self.msgs = []
+
+    def append_turn(self, sid, user, assistant):
+        self.msgs += [{"role": "user", "content": user},
+                      {"role": "assistant", "content": assistant}]
+
+    def get_context(self, sid):
+        return list(self.msgs)
+
+    def has_pending_summary(self, sid):
+        return False
+
+    def run_pending_summary(self, sid):
+        return True
+
+
+def _prepared(**kw):
+    from shared.types import PreparedTurn
+
+    base = dict(session_id="r17d", turn_id="t-r17d", request_id="req-r17d",
+                request_digest="d", user_text="hi", assistant_text="你好")
+    base.update(kw)
+    return PreparedTurn(**base)
+
+
+def test_post_commit_deferred_writes_only_on_committed_normal(kv, register_services, monkeypatch):
+    """R17d：召回热度与素材烧计数只在提交成功的正常轮补账。
+
+    - receipt 非 committed（取消/失败/重试 already_committed）→ 一概不动；
+    - degraded 轮即使提交成功也不烧素材、不记热度（副作用表）；
+    - normal committed → 每种效果恰好一次，重试轮不重复补账。
+    """
+    from capability import char_life
+    from orchestration import writeback as wb
+    from orchestration.writeback import WritebackCoordinator
+
+    register_services(kv_store=kv)
+    touched, burned = [], []
+    db = get_db()
+    monkeypatch.setattr(db, "touch_memories", touched.extend)
+    monkeypatch.setattr(char_life, "commit_topic",
+                        lambda sid, topic: burned.append((sid, topic)))
+    monkeypatch.setattr(wb, "ConversationDistiller", lambda: type(
+        "D", (), {"distill_turn": lambda *a, **k: None})())
+
+    coord = WritebackCoordinator(keeper=_KeeperStub())
+    ok = _prepared(memory_ids=["m1", "m2"], burn_topic="那本书")
+    coord.post_commit(ok, {"status": "committed", "turn_id": ok.turn_id})
+    assert touched == ["m1", "m2"]
+    assert burned == [("r17d", "那本书")]
+
+    # 重试拿原回执：post_commit 早退，不重复补账
+    coord.post_commit(ok, {"status": "already_committed", "turn_id": ok.turn_id})
+    assert touched == ["m1", "m2"]
+    assert burned == [("r17d", "那本书")]
+
+    # 取消/失败回执：不动
+    coord.post_commit(ok, {"status": "cancelled", "turn_id": ok.turn_id})
+    assert touched == ["m1", "m2"]
+    assert burned == [("r17d", "那本书")]
+
+    # degraded 提交成功也不许消耗（副作用表：零学习更新）
+    deg = _prepared(turn_id="t-r17d-d", request_id="req-r17d-d",
+                    disposition="degraded", memory_ids=["m1"], burn_topic="那本书")
+    coord.post_commit(deg, {"status": "committed", "turn_id": deg.turn_id})
+    assert touched == ["m1", "m2"]
+    assert burned == [("r17d", "那本书")]

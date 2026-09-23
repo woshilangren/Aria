@@ -34,6 +34,9 @@ class PreparedTurn:
     utterance_text: str = ""                 # 她实际说出口的正文（C6 反向标定输入）
     mode: str = "text"
     delivery: str = "unknown"                # 发送确认由适配器回填（8.11.1 规则 6）
+    # R17d：提交前不落的隐式业务更新，随载荷带到提交后执行——
+    memory_ids: list = field(default_factory=list)  # 召回命中的记忆 id，提交成功后补记热度
+    burn_topic: str = ""                     # 小动作嵌入的生活素材，提交成功后烧计数
 
 
 @dataclass

@@ -194,6 +194,48 @@ def test_quirk_roll_only_burns_topic_when_used(kv, monkeypatch, pick, action, bu
     assert _used_count("t1") == (1 if burns else 0)
 
 
+def test_quirk_roll_deferred_burn_waits_for_commit(kv, monkeypatch):
+    """R17d：deferred_burns 传入时烧计数不当场落账。
+
+    取消/降级轮的指令已经拼出去了，但她的生活素材不该被没提交的轮白白
+    消耗——挑与烧分离（I1）延伸到提交边界：烧不烧等写回协调器裁决。
+    """
+    from capability import quirks
+    from shared.types import MemoryBundle
+
+    char_life.ensure("t1")
+    topic = char_life.peek_topic("t1")
+    assert topic
+    monkeypatch.setattr(quirks, "random", _StubRandom(4.0))  # 命中 off_topic（嵌素材）
+    monkeypatch.setattr(quirks, "load_app_config",
+                        lambda: {"personality": {"quirk_rate": 1.0}})
+
+    burns: list = []
+    directive = quirks.QuirkDirector().roll(
+        MemoryBundle(), stage="初识", mood="平常", session_id="t1",
+        deferred_burns=burns,
+    )
+    assert directive and topic in directive
+    assert burns == [("t1", topic)], "该把待烧素材交给调用方"
+    assert _used_count("t1") == 0, "延后烧不许当场落账"
+
+
+def test_search_memory_touch_flag_controls_heat(kv, monkeypatch):
+    """R17d：touch=False 召回不记热度（轮内路径，提交后补记）；默认保持原行为。"""
+    from data.sqlite_store import get_db
+
+    rows = [("m1", "甲", 0.3, "2026-09-23T10:00:00")]
+    tool = _make_search_tool(monkeypatch, rows)
+    got = tool.search_memory("随便搜搜", top_k=5, touch=False)
+    assert got and got[0]["id"] == "m1"
+    stats = get_db().memory_stats_bulk(["m1"])
+    assert not stats.get("m1"), "touch=False 不许记热度"
+
+    tool.search_memory("随便搜搜", top_k=5)  # 默认 touch=True：turn 外的独立检索口子
+    stats = get_db().memory_stats_bulk(["m1"])
+    assert (stats.get("m1") or {}).get("count") == 1
+
+
 def test_shape_line_only_today(kv):
     assert char_life.shape_line("t1") == ""      # 没生成过
     char_life.ensure("t1")

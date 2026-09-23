@@ -372,7 +372,7 @@ class VectorStoreTool:
             print(f"[memory] 记忆写入失败: {exc}")
             return False
 
-    def search_memory(self, query: str, top_k: int = 5) -> list:
+    def search_memory(self, query: str, top_k: int = 5, touch: bool = True) -> list:
         """按语义搜记忆，重排后返回 [{content, kind, importance, timestamp, feeling, ...}]。
 
         重排（S1 调制 / S5 生命力雏形）：score = 相似度 × 时间衰减。
@@ -460,11 +460,16 @@ class VectorStoreTool:
             )
         items.sort(key=lambda x: x["score"], reverse=True)
         picked = items[:top_k]
-        # 召回即 touch：只在最终入选的条目上记热度，失败不影响召回
-        try:
-            get_db().touch_memories([p["id"] for p in picked if p.get("id")])
-        except Exception:
-            pass
+        # 召回即 touch：只在最终入选的条目上记热度，失败不影响召回。
+        # R17d：对话轮内的召回**不在召回当场记**——取消/降级轮不许留下学习
+        # 热度（业务更新必须等提交裁决），调用方传 touch=False 并把入选 id
+        # 带进 PreparedTurn，由写回协调器在提交成功后补记。turn 之外的独立
+        # 检索口子（记忆搜索 API）维持原行为。
+        if touch:
+            try:
+                get_db().touch_memories([p["id"] for p in picked if p.get("id")])
+            except Exception:
+                pass
         return picked
 
 

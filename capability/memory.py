@@ -323,7 +323,11 @@ class MemoryRecaller:
 
         try:
             top_k = load_app_config()["memory"]["recall_top_k"]
-            bundle.distilled = services.get("vector_store").search_memory(query or session_id, top_k=top_k)
+            # R17d：touch=False——热度不记在召回当场，入选 id 随 bundle 带出，
+            # 由写回协调器在轮提交成功后补记（取消/降级轮不留学习热度）
+            bundle.distilled = services.get("vector_store").search_memory(
+                query or session_id, top_k=top_k, touch=False
+            )
         except Exception as exc:
             logger.warning(f"[memory] 长期记忆召回失败（按无记忆继续）: {exc}")
             bundle.distilled = []

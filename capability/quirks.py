@@ -10,6 +10,7 @@
 """
 
 import random
+from typing import Optional
 
 from config.settings import load_app_config
 from shared.types import MemoryBundle
@@ -105,8 +106,14 @@ class QuirkDirector:
 
     def roll(self, memory: MemoryBundle, stage: str = "初识",
              mood: str = "平常", comfort_mode: bool = False,
-             session_id: str = "") -> str:
-        """掷骰子。返回注入 system prompt 的指令文本，没命中返回空串（普通回合）。"""
+             session_id: str = "",
+             deferred_burns: Optional[list] = None) -> str:
+        """掷骰子。返回注入 system prompt 的指令文本，没命中返回空串（普通回合）。
+
+        R17d：deferred_burns 传入列表时，素材烧计数**不当场落账**，只把
+        (session_id, topic) 追加进去，由写回协调器在轮提交成功后执行——
+        取消/降级轮不许白白消耗她的生活素材（挑与烧分离的 I1 延伸到提交边界）。
+        """
         if comfort_mode:
             return ""  # 安抚轮只安慰，别阴阳怪气
 
@@ -153,7 +160,10 @@ class QuirkDirector:
         # 其余四种命中以前也各烧一次——约半数素材被白白消耗，而 used_count>=2 就退休，
         # 等于把她的生活面提前掏空（"昨天说的那本书"再也提不起来）。
         if life_topic and life_topic in directive:
-            char_life.commit_topic(session_id, life_topic)
+            if deferred_burns is None:
+                char_life.commit_topic(session_id, life_topic)
+            else:
+                deferred_burns.append((session_id, life_topic))
         return directive
 
     def _directive(self, name: str, flaws: list, distilled: list, mood: str,
