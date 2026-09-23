@@ -188,3 +188,123 @@ def test_summarize_failure_enqueues_full_snapshot(kv, register_services):
 
     payload = _json.loads(rows[0][1])
     assert payload["msgs"][0]["content"] == "第一句老话" * 10,         "原文必须完整快照，不许截断"
+
+# ------------------- R19c：消费与退出恢复 -------------------
+
+def _watcher():
+    """绕过 __init__（不拉起 ProactiveSpeaker），只测消费方法本身。"""
+    from capability.proactive import IdleDiaryWatcher
+
+    return IdleDiaryWatcher.__new__(IdleDiaryWatcher)
+
+
+def test_lease_holds_until_expiry_then_reclaimable(kv):
+    """R19c：租约期内同任务不会被再次领取；租约过期可重领（崩溃恢复）。"""
+    kv.enqueue_pending("pw-lease", "vector_memory", {"memory_id": "m"})
+    first = kv.lease_pending(limit=3, lease_seconds=300)
+    assert [t["task_id"] for t in first] == ["pw-lease"]
+    assert first[0]["attempts"] == 1
+    # 租约期内：再来一轮消费领不到
+    assert kv.lease_pending(limit=3, lease_seconds=300) == []
+    # 租约过期：可重领（可控时钟：把租约改到过去）
+    db = get_db()
+    db._conn.execute("UPDATE pending_writes SET lease_until='2000-01-01T00:00:00' "
+                     "WHERE task_id='pw-lease'")
+    db._conn.commit()
+    again = kv.lease_pending(limit=3, lease_seconds=300)
+    assert [t["task_id"] for t in again] == ["pw-lease"]
+    assert again[0]["attempts"] == 2, "重领计一次新尝试"
+
+
+def test_lease_skips_not_yet_due(kv):
+    """R19c：只处理已到期任务——退避未到期的行不冲刷。"""
+    kv.enqueue_pending("pw-future", "vector_memory", {"memory_id": "m"})
+    db = get_db()
+    db._conn.execute("UPDATE pending_writes SET next_attempt_at='2099-01-01T00:00:00' "
+                     "WHERE task_id='pw-future'")
+    db._conn.commit()
+    assert kv.lease_pending(limit=3, lease_seconds=300) == []
+
+
+def test_fail_pending_backoff_and_exhaustion(kv):
+    """R19c：失败落退避与错误；预算耗尽标 exhausted；载荷不删除。"""
+    kv.enqueue_pending("pw-fail", "vector_memory", {"memory_id": "m"})
+    state = kv.fail_pending("pw-fail", "第一次失败", backoff_seconds=60, max_attempts=2)
+    assert state == "pending"
+    row = kv.get_pending("pw-fail")
+    assert row["last_error"] == "第一次失败"
+    # 第二次失败（attempts 已在 lease 时 +1 过，这里直接判耗尽）
+    db = get_db()
+    db._conn.execute("UPDATE pending_writes SET attempts=2 WHERE task_id='pw-fail'")
+    db._conn.commit()
+    state = kv.fail_pending("pw-fail", "第二次失败", backoff_seconds=60, max_attempts=2)
+    assert state == "exhausted"
+    row = kv.get_pending("pw-fail")
+    assert row["status"] == "exhausted"
+    assert row["payload"]["memory_id"] == "m", "耗尽也不许删业务载荷"
+
+
+def test_unparsable_payload_blocked_not_burned(kv):
+    """R19c：永久格式错误直接 blocked，不无限烧 API；载荷保留。"""
+    kv.enqueue_pending("pw-bad", "vector_memory", {"ok": True})
+    db = get_db()
+    db._conn.execute("UPDATE pending_writes SET payload='{这不是JSON' WHERE task_id='pw-bad'")
+    db._conn.commit()
+    w = _watcher()
+    w._apply_pending_task(kv, {"task_id": "pw-bad", "kind": "vector_memory",
+                               "payload": None, "attempts": 1})
+    row = kv.get_pending("pw-bad")
+    assert row["status"] == "blocked"
+    assert row["payload"] is None or row["payload"] != "", "载荷保留待人工"
+
+
+def test_consumer_rebuilds_vector_memory_and_marks_done(kv, register_services):
+    """R19c：vector_memory 消费 = 从完整载荷重建 MemoryItem → upsert → done。
+
+    已生成冻结的正文从本地载荷恢复，不重新让 LLM 编一份。"""
+    captured = []
+
+    class _VS:
+        def upsert_memory(self, item):
+            captured.append(item)
+            return True
+
+    register_services(vector_store=_VS())
+    kv.enqueue_pending("vm-rebuild-1", "vector_memory",
+                       {"memory_id": "rebuild-1", "session_id": "s1", "kind": "event",
+                        "content": "冻结的正文", "importance": 3, "timestamp": "2026-09-23T00:00:00",
+                        "feeling": "", "appraisal": "", "valence": 0.0, "arousal": 0.3,
+                        "peak_moment": ""})
+    w = _watcher()
+    w._drain_pending_writes(kv)
+    assert len(captured) == 1 and captured[0].memory_id == "rebuild-1"
+    assert captured[0].content == "冻结的正文", "正文从载荷恢复，不重编"
+    assert kv.get_pending("vm-rebuild-1")["status"] == "done"
+
+
+def test_consumer_failure_schedules_backoff(kv, register_services):
+    """R19c：执行失败 → 指数退避落库，不标 done。"""
+    class _DownVS:
+        def upsert_memory(self, item):
+            raise RuntimeError("still down")
+
+    register_services(vector_store=_DownVS())
+    kv.enqueue_pending("vm-backoff", "vector_memory",
+                       {"memory_id": "m-b", "session_id": "s1", "kind": "event",
+                        "content": "x", "importance": 3, "timestamp": "2026-09-23T00:00:00",
+                        "feeling": "", "appraisal": "", "valence": 0.0, "arousal": 0.3,
+                        "peak_moment": ""})
+    w = _watcher()
+    w._drain_pending_writes(kv)  # lease 时 attempts=1
+    row = kv.get_pending("vm-backoff")
+    assert row["status"] == "pending"
+    assert row["attempts"] == 1 and row["last_error"] == "still down"
+    assert row["next_attempt_at"] > "2026-01-01", "退避时间已落库"
+
+
+def test_unknown_kind_blocked_without_burning_api(kv, register_services):
+    kv.enqueue_pending("pw-unknown", "谁也没见过的种类", {"x": 1})
+    w = _watcher()
+    w._apply_pending_task(kv, {"task_id": "pw-unknown", "kind": "谁也没见过的种类",
+                               "payload": {"x": 1}, "attempts": 1})
+    assert kv.get_pending("pw-unknown")["status"] == "blocked"

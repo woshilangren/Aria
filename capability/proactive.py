@@ -10,6 +10,10 @@ import threading
 import time
 from datetime import datetime, timedelta
 
+import logging
+
+logger = logging.getLogger("aria")
+
 from config.settings import load_app_config
 from shared.singletons import services
 from shared.timeutils import safe_delta_seconds
@@ -315,6 +319,15 @@ class IdleDiaryWatcher:
     # 每 60 秒重试一轮、每轮白烧 LLM 调用；现在 1/2/4…分钟指数退避
     _DIARY_BACKOFF_CAP_SEC = 3600
 
+    # R19c：补偿任务消费参数。每轮巡检最多领 3 条、租约 5 分钟、退避从 1 分钟
+    # 起指数翻倍封顶 1 小时、预算 5 次——耗尽标 exhausted（保留载荷），格式坏
+    # 直接 blocked，都不自动删除，不无限烧 API。
+    _PW_BATCH = 3
+    _PW_LEASE_SECONDS = 300
+    _PW_MAX_ATTEMPTS = 5
+    _PW_BACKOFF_BASE = 60
+    _PW_BACKOFF_CAP = 3600
+
     def __init__(self):
         # I2-1：_done 从"写没写过 (session_id, 日期)"的集合改成
         # {(session_id, 日期): 已覆盖到的最后聊天时间}——幂等键加上"是否已覆盖
@@ -361,6 +374,13 @@ class IdleDiaryWatcher:
 
         self._prune_candidates_once(kv)
 
+        # R19c：补偿任务消费复用本巡检调度点（不另起线程）——每轮只领一小批
+        # 到期任务，绝不一次冲刷所有历史；任务在数据库锁外执行。
+        try:
+            self._drain_pending_writes(kv)
+        except Exception as exc:
+            logger.warning(f"[proactive] 补偿任务消费失败（下轮再试）: {exc}")
+
         for entry in kv.last_chat_per_session():
             last_time = entry.get("last_time") or ""
             if not last_time:
@@ -388,6 +408,61 @@ class IdleDiaryWatcher:
                 continue  # 还没闲够，下轮再看
 
             self._write_idle_diary(session_id, last_time)
+
+    def _drain_pending_writes(self, kv) -> None:
+        """消费 pending_writes 里的到期补偿任务（R19c）。
+
+        只处理已到期且未持租约的行，每轮一小批；成功标 done，失败按次数
+        指数退避、耗尽标 exhausted，坏载荷/未知种类标 blocked——全都不自动
+        删除业务载荷。执行在巡检线程里、数据库锁外（租约已由领取事务落下）。
+        """
+        claimed = kv.lease_pending(limit=self._PW_BATCH,
+                                   lease_seconds=self._PW_LEASE_SECONDS)
+        for task in claimed:
+            self._apply_pending_task(kv, task)
+
+    def _apply_pending_task(self, kv, task: dict) -> None:
+        task_id = task["task_id"]
+        kind = task["kind"]
+        payload = task.get("payload")
+        if payload is None:
+            kv.block_pending(task_id, "payload 不可解析（永久格式错误）")
+            return
+        try:
+            if kind == "vector_memory":
+                from data.schemas import MemoryItem
+
+                item = MemoryItem(**payload)
+                if services.get("vector_store").upsert_memory(item) is True:
+                    kv.finish_pending(task_id)
+                    return
+                raise RuntimeError("upsert 未成功（返回非 True）")
+            if kind == "session_summarize":
+                # 延迟 import 破环：proactive 不在顶层依赖 orchestration
+                from orchestration.pipeline import KEEPER
+
+                msgs = payload.get("msgs") or []
+                if KEEPER._summarize(payload.get("session_id", ""), msgs):
+                    kv.finish_pending(task_id)
+                    return
+                raise RuntimeError("summarize 未成功")
+            # 未知种类：不烧 API，保留载荷待人工
+            kv.block_pending(task_id, f"未知任务种类：{kind}")
+            return
+        except TypeError as exc:
+            # 载荷结构与当前代码不匹配属于永久错误，重试无意义
+            kv.block_pending(task_id, f"载荷重构失败（永久格式错误）: {exc}")
+            return
+        except Exception as exc:
+            backoff = min(
+                self._PW_BACKOFF_CAP,
+                self._PW_BACKOFF_BASE * (2 ** max(0, task.get("attempts", 1) - 1)),
+            )
+            state = kv.fail_pending(task_id, str(exc),
+                                    backoff_seconds=backoff,
+                                    max_attempts=self._PW_MAX_ATTEMPTS)
+            logger.warning(f"[proactive] 补偿任务失败（{task_id} → {state}，"
+                           f"退避 {backoff}s）: {exc}")
 
     def _prune_candidates_once(self, kv) -> None:
         """E1：memory_candidates 的 14 天过期清理，挂巡检、一天只做一次。

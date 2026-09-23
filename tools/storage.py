@@ -906,6 +906,33 @@ class KVStoreTool:
 
         return get_db().get_pending(task_id)
 
+    def lease_pending(self, limit: int = 3, lease_seconds: int = 300) -> list:
+        """原子领取到期补偿任务（R19c）：租约期内同任务不会被第二个消费者领走。"""
+        from data.sqlite_store import get_db
+        from datetime import datetime as _dt
+
+        return get_db().lease_pending(
+            limit=limit, now=_dt.now().isoformat(timespec="seconds"),
+            lease_seconds=lease_seconds)
+
+    def fail_pending(self, task_id: str, error: str, backoff_seconds: int,
+                     max_attempts: int) -> str:
+        """记录一次失败：退避落库；耗尽标 exhausted；坏载荷标 blocked。"""
+        from data.sqlite_store import get_db
+        from datetime import datetime as _dt
+
+        return get_db().fail_pending(
+            task_id, error, now=_dt.now().isoformat(timespec="seconds"),
+            backoff_seconds=backoff_seconds, max_attempts=max_attempts)
+
+    def block_pending(self, task_id: str, error: str) -> bool:
+        """永久性失败标 blocked，保留载荷待人工（不自动删除）。"""
+        from data.sqlite_store import get_db
+        from datetime import datetime as _dt
+
+        return get_db().block_pending(
+            task_id, error, now=_dt.now().isoformat(timespec="seconds"))
+
     def finish_pending(self, task_id: str) -> bool:
         """应用成功标 done（R19b）：该任务不再会被消费者重试。"""
         from data.sqlite_store import get_db

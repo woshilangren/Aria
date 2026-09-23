@@ -1022,6 +1022,93 @@ class SQLiteStorage:
             )
             return cur.rowcount > 0
 
+    def lease_pending(self, *, limit: int = 3, now: str,
+                      lease_seconds: int = 300) -> list:
+        """原子领取到期任务（R19c）：锁内 UPDATE 租约，锁外执行。
+
+        领取条件：status=pending、next_attempt_at 已到、租约已过期（或从未
+        租出）。进程崩溃后租约到期即可被重领——租约只保证"同一时刻一个
+        执行者"，不保证完成（完成看 status）。每次领取 attempts/total+1。
+        """
+        import json as _json
+        from datetime import timedelta as _td
+
+        lease_until = (datetime.fromisoformat(now)
+                       + _td(seconds=lease_seconds)).isoformat(timespec="seconds")
+        claimed = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT task_id, kind, source_turn_id, payload, attempts FROM pending_writes "
+                "WHERE status='pending' AND next_attempt_at <= ? "
+                "AND (lease_until = '' OR lease_until IS NULL OR lease_until < ?) "
+                "ORDER BY next_attempt_at LIMIT ?",
+                (now, now, limit),
+            ).fetchall()
+            for task_id, kind, source_turn_id, payload, attempts in rows:
+                cur = self._conn.execute(
+                    "UPDATE pending_writes SET lease_until=?, attempts=attempts+1, "
+                    "attempts_total=attempts_total+1, updated_at=? "
+                    "WHERE task_id=? AND status='pending'",
+                    (lease_until, now, task_id),
+                )
+                if not cur.rowcount:
+                    continue  # 并发下被别人抢先：不交给执行者
+                try:
+                    data = _json.loads(payload)
+                except ValueError:
+                    data = None  # 坏载荷照常交付，由消费侧标 blocked
+                claimed.append({"task_id": task_id, "kind": kind,
+                                "source_turn_id": source_turn_id,
+                                "payload": data, "attempts": attempts + 1})
+        return claimed
+
+    def fail_pending(self, task_id: str, error: str, *, now: str,
+                     backoff_seconds: int, max_attempts: int) -> str:
+        """记录一次失败：落退避与错误；预算耗尽标 exhausted；坏载荷标 blocked。
+
+        返回最终状态（pending / exhausted / blocked / missing）。本批不自动
+        删除业务载荷——blocked/exhausted 行保留原文待人工处置。
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT attempts, payload FROM pending_writes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            if row[1] is None:  # 载荷反序列化失败 = 永久格式错误，重试无意义
+                self._conn.execute(
+                    "UPDATE pending_writes SET status='blocked', last_error=?, "
+                    "lease_until='', updated_at=? WHERE task_id=?",
+                    (error[:500], now, task_id),
+                )
+                return "blocked"
+            if row[0] >= max_attempts:
+                self._conn.execute(
+                    "UPDATE pending_writes SET status='exhausted', last_error=?, "
+                    "lease_until='', updated_at=? WHERE task_id=?",
+                    (error[:500], now, task_id),
+                )
+                return "exhausted"
+            next_at = (datetime.fromisoformat(now)
+                       + timedelta(seconds=backoff_seconds)).isoformat(timespec="seconds")
+            self._conn.execute(
+                "UPDATE pending_writes SET last_error=?, next_attempt_at=?, "
+                "lease_until='', updated_at=? WHERE task_id=?",
+                (error[:500], next_at, now, task_id),
+            )
+            return "pending"
+
+    def block_pending(self, task_id: str, error: str, now: str) -> bool:
+        """永久性失败（重构 TypeError 等）：标 blocked，保留载荷待人工。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE pending_writes SET status='blocked', last_error=?, "
+                "lease_until='', updated_at=? WHERE task_id=?",
+                (error[:500], now, task_id),
+            )
+            return cur.rowcount > 0
+
     def requeue_pending(self, task_id: str, now: str) -> bool:
         """人工重新入队：当前预算清零（attempts_total 审计保留），立即到期。"""
         with self._lock, self._conn:
