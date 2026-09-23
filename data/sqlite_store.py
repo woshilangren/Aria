@@ -809,6 +809,87 @@ class SQLiteStorage:
             )
             return 1, cur.lastrowid
 
+    # ------------------- R11c：仲裁 keep 复用缓存 -------------------
+    #
+    # keep 是"仲裁员认定口误/玩笑"的裁决。E2 修复后被否决的候选会标晋升，但
+    # 用户每把同一句话再说两遍，就会攒出一条新候选、再烧一次仲裁 LLM——同样的
+    # 证据 + 同样的档案现态，答案不会变。缓存键 = (session, field, 值归一化)，
+    # 命中还要求：档案现态没变 + 本次引文在已裁决引文集里。新的独立证据
+    # （没见过的引文）或档案变化都会重新仲裁；update 裁决直接清缓存。
+    # 这不是永久拉黑：用户以后真搬去被否过的城市，换个说法（新证据）即可重裁。
+
+    _KEEP_CACHE_TTL_DAYS = 30
+
+    @staticmethod
+    def _keep_cache_key(session_id: str, field: str, value_key: str) -> str:
+        return f"{session_id}|{field}|{value_key}"
+
+    def keep_cache_lookup(self, session_id: str, field: str, value_key: str,
+                          old_value: str, quote_key: str) -> bool:
+        """查 keep 缓存。命中条件：键在、档案现态一致、引文在已裁决集合里。"""
+        import json as _json
+
+        key = self._keep_cache_key(session_id, field, value_key)
+        cutoff = (datetime.now() - timedelta(days=self._KEEP_CACHE_TTL_DAYS)
+                  ).isoformat(timespec="seconds")
+        with self._lock, self._conn:
+            # 懒清理：过期缓存顺手删（不挂巡检，代价最小的收口）
+            self._conn.execute("DELETE FROM arbitration_keep WHERE created_at < ?", (cutoff,))
+            row = self._conn.execute(
+                "SELECT old_value, quotes FROM arbitration_keep WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        if row is None or row[0] != old_value:
+            return False  # 档案变了（或没缓存过）：证据的语境不同了，重裁
+        try:
+            quotes = _json.loads(row[1] or "[]")
+        except ValueError:
+            quotes = []
+        return quote_key in quotes
+
+    def keep_cache_store(self, session_id: str, field: str, value_key: str,
+                         old_value: str, quote_key: str) -> None:
+        """记一次 keep 裁决（或往已裁决引文集里添一条新证据的裁决结果）。"""
+        import json as _json
+
+        key = self._keep_cache_key(session_id, field, value_key)
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT old_value, quotes FROM arbitration_keep WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+            if row is not None and row[0] == old_value:
+                try:
+                    quotes = _json.loads(row[1] or "[]")
+                except ValueError:
+                    quotes = []
+                if quote_key not in quotes:
+                    quotes.append(quote_key)
+                self._conn.execute(
+                    "UPDATE arbitration_keep SET quotes = ?, created_at = ? WHERE cache_key = ?",
+                    (_json.dumps(quotes, ensure_ascii=False), now, key),
+                )
+            else:
+                # 档案已变化（或首次）：旧的引文集不作数，按当前语境重开
+                self._conn.execute(
+                    "INSERT INTO arbitration_keep "
+                    "(cache_key, session_id, field, value_key, old_value, quotes, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET old_value = excluded.old_value, "
+                    "quotes = excluded.quotes, created_at = excluded.created_at",
+                    (key, session_id, field, value_key, old_value,
+                     _json.dumps([quote_key], ensure_ascii=False), now),
+                )
+
+    def keep_cache_drop(self, session_id: str, field: str, value_key: str) -> None:
+        """update 裁决/档案变更后清缓存：同值再出现要重新仲裁。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM arbitration_keep WHERE cache_key = ?",
+                (self._keep_cache_key(session_id, field, value_key),),
+            )
+
     def mark_candidate_promoted(self, cand_id: int) -> None:
         with self._lock, self._conn:
             self._conn.execute(

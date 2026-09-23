@@ -576,3 +576,103 @@ def test_recent_chat_rows_carry_message_id(kv):
     _insert_chat_row("t11f", "user", "我住在杭州", "normal")
     rows = kv.recent_chat("t11f", 10)
     assert rows and isinstance(rows[-1]["id"], int), f"行必须带 id，实测 {rows[-1]}"
+
+# ------------------- R11c：keep 结果可复用而不永久拉黑 -------------------
+
+def _counting_arb(kv, calls):
+    """给仲裁 LLM 计数：数 chat 被调几次 = 烧了几次仲裁。"""
+    orig = kv.scripted_llm.chat
+
+    def _wrap(messages, temperature=None, max_tokens=None):
+        calls["n"] += 1
+        return orig(messages, temperature=temperature, max_tokens=max_tokens)
+
+    kv.scripted_llm.chat = _wrap
+
+
+def test_keep_reused_for_same_evidence_and_profile(kv):
+    """R11c：相同证据 + 相同档案现态复用 keep——第二次不烧仲裁 LLM。"""
+    kv.write("profile", "t11g", {"city": "上海"})
+    kv.scripted_llm.arbitrate_action = "keep"
+    calls = {"n": 0}
+    _counting_arb(kv, calls)
+    g = MemoryGatekeeper()
+    # 第一轮候选攒到门槛：烧 1 次仲裁 → keep
+    g.process("t11g", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m1")
+    g.process("t11g", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m2")
+    assert calls["n"] == 1
+    assert (kv.read("profile", "t11g") or {}).get("city") == "上海"
+    # 用户把同一句话再说两遍：新候选再次到门槛 → **复用 keep，0 次仲裁**
+    g.process("t11g", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m3")
+    g.process("t11g", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m4")
+    assert calls["n"] == 1, f"相同证据不许再次付费仲裁，实测 {calls['n']} 次"
+    assert (kv.read("profile", "t11g") or {}).get("city") == "上海"
+
+
+def test_new_evidence_reenters_arbitration(kv):
+    """R11c：新的独立证据（没见过的引文）可重新仲裁——不是永久拉黑。"""
+    kv.write("profile", "t11h", {"city": "上海"})
+    kv.scripted_llm.arbitrate_action = "keep"
+    calls = {"n": 0}
+    _counting_arb(kv, calls)
+    g = MemoryGatekeeper()
+    g.process("t11h", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m1")
+    g.process("t11h", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m2")
+    assert calls["n"] == 1
+    # 用户换了说法、说了新的理由：新证据 → 重新仲裁
+    kv.scripted_llm.arbitrate_action = "update"
+    g.process("t11h", "city", "杭州", quote="工作定在杭州了，下周就搬", confidence=0.9,
+              source_message_id="m3")
+    g.process("t11h", "city", "杭州", quote="房子都租好了，就等搬家", confidence=0.9,
+              source_message_id="m4")
+    assert calls["n"] > 1, "新证据必须重新仲裁"
+    assert (kv.read("profile", "t11h") or {}).get("city") == "杭州"
+
+
+def test_profile_change_reenters_arbitration(kv):
+    """R11c：档案现态变了（旧值不再一致）→ 同样的证据也要重裁。"""
+    kv.write("profile", "t11i", {"city": "上海"})
+    kv.scripted_llm.arbitrate_action = "keep"
+    calls = {"n": 0}
+    _counting_arb(kv, calls)
+    g = MemoryGatekeeper()
+    g.process("t11i", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m1")
+    g.process("t11i", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m2")
+    assert calls["n"] == 1
+    # 档案被别的路径改掉（如手动修正），再出现同样的话：语境不同了，重裁
+    kv.write("profile", "t11i", {"city": "苏州"})
+    kv.scripted_llm.arbitrate_action = "update"
+    g.process("t11i", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m5")
+    g.process("t11i", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m6")
+    assert calls["n"] == 2, "档案变化必须重裁"
+    assert (kv.read("profile", "t11i") or {}).get("city") == "杭州"
+
+
+def test_update_verdict_drops_keep_cache(kv):
+    """R11c：update 裁决清掉同值 keep 缓存，避免陈旧裁决残留。"""
+    from data.sqlite_store import get_db
+
+    kv.write("profile", "t11j", {"city": "上海"})
+    kv.scripted_llm.arbitrate_action = "keep"
+    g = MemoryGatekeeper()
+    g.process("t11j", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m1")
+    g.process("t11j", "city", "杭州", quote="我要搬去杭州", confidence=0.9,
+              source_message_id="m2")
+    assert get_db()._conn.execute("SELECT COUNT(*) FROM arbitration_keep").fetchone()[0] == 1
+    kv.scripted_llm.arbitrate_action = "update"
+    g.process("t11j", "city", "杭州", quote="真搬了，杭州见", confidence=0.9,
+              source_message_id="m3")
+    g.process("t11j", "city", "杭州", quote="户口都迁过去了", confidence=0.9,
+              source_message_id="m4")
+    assert get_db()._conn.execute("SELECT COUNT(*) FROM arbitration_keep").fetchone()[0] == 0

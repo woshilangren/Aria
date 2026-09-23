@@ -443,14 +443,25 @@ class MemoryGatekeeper:
             return
         # 仲裁员看到的旧值统一成人话：列表摊平成顿号串，否则它拿 "['咖啡']" 比 "咖啡"
         old_for_arb = "、".join(str(x) for x in old) if isinstance(old, list) else old
+        # R11c：keep 复用——相同证据（同一句引文）+ 相同档案现态，裁决不会变，
+        # 直接复用上一次 keep，不再付费仲裁。新引文/档案变了都会重新仲裁。
+        value_key = get_db().candidate_key(content)
+        quote_key = get_db().candidate_key(quote or content)
+        if get_db().keep_cache_lookup(session_id, field, value_key,
+                                      str(old_for_arb), quote_key):
+            self._mark_promoted(cand_id)
+            return  # 复用既有 keep 裁决
         verdict = self._arbitrate(field, old_for_arb, content, quote, session_id=session_id)
         if verdict == "keep":
             # E2：注释曾经声称"候选标晋升"而代码什么都没做——被否决的值每次重现都
             # 重跑一次仲裁 LLM，还可能哪天翻成 update 把口误焊进档案。现在真的标。
+            get_db().keep_cache_store(session_id, field, value_key,
+                                      str(old_for_arb), quote_key)
             self._mark_promoted(cand_id)
             return  # 仲裁认定口误/玩笑：保留旧值，候选已标晋升
         if verdict is None:
             return  # 仲裁失败（LLM 挂/输出坏）：不标晋升，下次出现重试
+        get_db().keep_cache_drop(session_id, field, value_key)  # update 裁决作废旧 keep 缓存
         distiller = ConversationDistiller()  # E5：只有 update 路径才用得上，别在白跑的路径上构造
         value = [content] if is_list_field else content
         if distiller.apply_fact(session_id, field, value):
