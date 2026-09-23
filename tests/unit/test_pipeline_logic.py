@@ -153,69 +153,85 @@ def test_has_city(text, expected):
     assert _has_city(text) is expected
 
 
-# --------------- F：_writeback 语音轮标记剥离（端到端） ---------------
+# --------------- F→R17b：正文剥净后的提交落库（PreparedTurn 直测） ---------------
 from orchestration.pipeline import DialoguePipeline  # noqa: E402
+from orchestration.writeback import WritebackCoordinator  # noqa: E402
+from shared.types import PreparedTurn  # noqa: E402
 from tools.storage import KVStoreTool  # noqa: E402
 
 
-class _NoopHandle:
-    def is_cancelled(self) -> bool:
+class _FakeKeeper:
+    """post_commit 里的 KEEPER 替身：追加与上下文都进内存。"""
+
+    def __init__(self):
+        self.msgs = []
+
+    def append_turn(self, sid, user, assistant):
+        self.msgs += [{"role": "user", "content": user},
+                      {"role": "assistant", "content": assistant}]
+
+    def get_context(self, sid):
+        return list(self.msgs)
+
+    def has_pending_summary(self, sid):
         return False
 
+    def run_pending_summary(self, sid):
+        return True
 
-def _run_writeback(monkeypatch, state):
-    """把 _writeback 的外部依赖打桩，只验证标记剥离与落库文本。"""
-    import orchestration.pipeline as pl
+
+def _commit_prepared(monkeypatch, turn):
+    """把协调器的外部依赖打桩，只验证"canonical 原样落库"。"""
+    import orchestration.writeback as wb
 
     kv = KVStoreTool()
-    monkeypatch.setattr(pl, "RelationshipTracker", lambda: type(
-        "T", (), {"update": lambda *a, **k: {"interaction_count": 1, "intimacy": 0}}
-    )())
-    monkeypatch.setattr(pl, "ConversationDistiller", lambda: type(
+    monkeypatch.setattr(wb.services, "get", lambda name: kv)
+
+    monkeypatch.setattr(wb, "ConversationDistiller", lambda: type(
         "D", (), {"distill_turn": lambda *a, **k: None}
     )())
-    monkeypatch.setattr(pl, "PortraitBuilder", lambda: type(
+    monkeypatch.setattr(wb, "PortraitBuilder", lambda: type(
         "P", (), {"refresh": lambda *a, **k: None}
     )())
-    monkeypatch.setattr(pl.services, "get", lambda name: kv)
-    written = []
-    orig_write = kv.write
+    monkeypatch.setattr(wb, "RelationshipTracker", lambda: type(
+        "T", (), {"update": lambda *a, **k: {"interaction_count": 1, "intimacy": 0},
+                  "update_bookkeeping_only": lambda *a, **k: {}}
+    )())
+    coord = WritebackCoordinator(keeper=_FakeKeeper())
+    receipt = coord.commit_prepared(turn)
+    assert receipt["status"] == "committed", f"提交没成功: {receipt}"
+    coord.post_commit(turn, receipt)
+    # 副作用落点已从逐键 write 换成 commit_turn 事务（chat_log）——验证方式
+    # 相应改为提交后从正式记录回读。
+    return kv.read("session", turn.session_id)
 
-    def spy_write(store, key, value):
-        written.append(value)
-        return orig_write(store, key, value)
 
-    monkeypatch.setattr(kv, "write", spy_write)
-    pl.DialoguePipeline()._writeback(state, _NoopHandle())
-    return written
-
-
-def test_writeback_voice_strips_reaction_keeps_emotion(monkeypatch):
-    """语音轮 [开心]@r 你好：落库正文无 @r，final_reply 仍留情绪标签给合成。"""
-    st = TurnState(user_text="hi", session_id="f-writeback", voice_mode=True)
-    st.final_reply = "[开心]@r 你好"
-    st.emotion = None
-    stored = _run_writeback(monkeypatch, st)
-
-    assistant_records = [r for r in stored if r.get("role") == "assistant"]
+def test_commit_prepared_voice_text_stored_clean(monkeypatch):
+    """语音轮 [开心]@r 你好：剥离责任在流式装配器（push 前）；提交落库的是
+    已剥净的 canonical——PreparedTurn 原样入 chat_log，无 @r 无情绪标记。"""
+    turn = PreparedTurn(
+        session_id="f-writeback", turn_id="t-f1", request_id="req-f1",
+        request_digest="d", user_text="hi", assistant_text="你好",
+        disposition="normal", emotion="happy", mode="voice",
+    )
+    written = _commit_prepared(monkeypatch, turn)
+    assistant_records = [r for r in written if r.get("role") == "assistant"]
     assert assistant_records, "assistant 记录没落库"
     assert "@r" not in assistant_records[0]["text"]
     assert assistant_records[0]["text"] == "你好"
-    # final_reply 必须保留情绪标签（合成路径 split_emotion 要拆得出来）
-    from tools.speech import split_emotion
-    body, tags, _d = split_emotion(st.final_reply)
-    assert tags == ["开心"]
-    assert body == "你好"
 
 
-def test_writeback_text_mode_strips_reaction(monkeypatch):
-    """纯文本轮 @r 你好：落库正文为 你好，final_reply 无标记。"""
-    st = TurnState(user_text="hi", session_id="f-writeback-text", voice_mode=False)
-    st.final_reply = "@r 你好"
-    stored = _run_writeback(monkeypatch, st)
-    assistant_records = [r for r in stored if r.get("role") == "assistant"]
+def test_commit_prepared_text_mode_strips_upstream(monkeypatch):
+    """纯文本轮：canonical 由 astream 事件流拼出（已剥 @r）——提交只认
+    canonical，任何带标记的原稿到了这里都说明上游漏剥（红）。"""
+    turn = PreparedTurn(
+        session_id="f-writeback-text", turn_id="t-f2", request_id="req-f2",
+        request_digest="d", user_text="hi", assistant_text="你好",
+        disposition="normal", mode="text",
+    )
+    written = _commit_prepared(monkeypatch, turn)
+    assistant_records = [r for r in written if r.get("role") == "assistant"]
     assert assistant_records[0]["text"] == "你好"
-    assert st.final_reply == "你好"
 
 
 # --------- F 补丁：<voice> 内 @r 逃过 _tag_checked 一次性开关 ---------

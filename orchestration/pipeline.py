@@ -29,6 +29,7 @@
 
 import asyncio
 import base64
+import hashlib
 import itertools
 import re
 import sys
@@ -72,7 +73,15 @@ from config.settings import load_app_config
 
 from orchestration.cancellation import TURN_REGISTRY, TurnCancelled
 from orchestration.managers import FallbackController, InfoGapCoordinator
+from orchestration.writeback import (
+    WritebackCoordinator,
+    _expression_cfg,
+    _portrait_interval,
+    _strip_reaction_tag,
+)
+from shared.ids import new_turn_id
 from shared.singletons import services
+from shared.types import PreparedTurn
 from tools.speech import EMOTION_WORDS, split_emotion, strip_emotion_marks
 
 # 短期记忆的管家全项目就这一份：compose 要拿上下文、writeback 要写记录，
@@ -109,17 +118,8 @@ _VOICE_OPEN = "<voice>"
 _VOICE_CLOSE = "</voice>"
 # 反应前缀与强切长度不再硬编码：以前 config.json 里的 reaction_tag / force_cut_chars
 # 是摆设（代码用常量，改配置不生效）。现在统一从 expression 配置读，读不到落默认值。
-
-
 # R17a：_expression_cfg / _strip_reaction_tag / _portrait_interval / 写回协调器
-# 已机械提取到 orchestration/writeback.py；这里 import（转发）保持既有
-# import 路径不破——test_humanization 等仍从 pipeline 取 _strip_reaction_tag。
-from orchestration.writeback import (  # noqa: E402,F401
-    _expression_cfg,
-    _strip_reaction_tag,
-    _portrait_interval,
-    WritebackCoordinator,
-)
+# 已提取到 orchestration/writeback.py（见下方 import 区的转发说明）。
 
 
 def _log_exc(where: str) -> None:
@@ -205,6 +205,10 @@ class TurnState:
     voice_text: str = ""
     review_status: str = "accepted"  # accepted / rejected / unavailable
     reason_code: str = ""            # 有限原因码（复用 R27 体系）
+    # R17b：轮/请求的持久标识（uuid；request_id 旧客户端缺省由服务端补）
+    turn_id: str = ""
+    request_id: str = ""
+    request_digest: str = ""
     output_mode: str = "text"
     image_path: str = ""
     error: str = ""
@@ -573,6 +577,8 @@ class DialoguePipeline:
 
     def __init__(self, turns=None):
         self._turns = turns or TURN_REGISTRY
+        # R17b：写回协调器（提交走 CommitGate→commit_turn；KEEPER 注入唯一实例）
+        self._writeback_coord = WritebackCoordinator(keeper=KEEPER)
 
     # ================= 消费者：非流式入口 =================
     async def handle(self, message: InputMessage) -> FinalReply:
@@ -691,10 +697,44 @@ class DialoguePipeline:
             voice_mode=message.input_mode == "voice",
             user_image=message.image_url or "",
         )
+        # R17b：轮/请求的持久标识——turn_id 跨重启唯一（uuid），request_id 由
+        # 前端带或服务端补（补生成时明确无跨重试去重）；digest 用于同请求
+        # 重放/冲突裁决
+        state.turn_id = new_turn_id()
+        state.request_id = message.request_id or f"srv-{new_turn_id()}"
+        state.request_digest = hashlib.sha256(
+            f"{state.session_id}|{state.request_id}|{message.text or ''}".encode("utf-8")
+        ).hexdigest()
         handle = self._turns.start(message.session_id)
         seq = itertools.count(1)
         display_parts = []
         voice_emitted = False
+        canonical_parts = []  # R14a：审核通过片段的拼接 = canonical（唯一正文）
+        voice_parts = []      # R14a：<voice> 语音派生单独走，不拼回正文
+
+        # R17b：请求领取——同 request 已提交 → 直接回放已存正文，不再生成
+        # （重试不重复计数、不重复生成；digest 冲突在 commit_turn 里裁决）
+        try:
+            prior = services.get("kv_store").get_commit_receipt(
+                state.session_id, state.request_id
+            )
+        except Exception:
+            prior = None
+        if prior and prior.get("status") == "committed":
+            msgs = services.get("kv_store").get_turn_messages(
+                state.session_id, prior["turn_id"]
+            )
+            replay = next(
+                (m["content"] for m in reversed(msgs) if m["role"] == "assistant"), ""
+            )
+            yield {"type": "start", "turn_id": prior["turn_id"],
+                   "session_id": state.session_id, "text": state.user_text,
+                   "replay": True}
+            if replay:
+                yield {"type": "sentence", "seq": next(seq), "text": replay}
+            yield {"type": "done", "full_text": replay, "output_mode": "text",
+                   "image_path": ""}
+            return
 
         try:
             yield {
@@ -722,8 +762,6 @@ class DialoguePipeline:
             self._check_cancel(handle)
 
             # ③ 分流：工具链 / 人设链
-            canonical_parts = []  # R14a：审核通过片段的拼接 = canonical（唯一正文）
-            voice_parts = []      # R14a：<voice> 语音派生单独走，不拼回正文
             if state.intent.intent in _TOOL_INTENTS:
                 async for ev in self._astream_tool(state, handle, synthesize_voice, seq):
                     if ev.get("type") == "sentence":
@@ -754,14 +792,45 @@ class DialoguePipeline:
             if state.canonical_text:
                 state.final_reply = state.canonical_text
 
-            # ④ 记忆写回（含取消检查点，保证迟到的取消不会写出半截账）。
-            # 写回跑在工作线程（无事件循环），它**不自己调度**后台待办，
-            # 而是把闭包列表带回来由这里（持有 loop 的一方）调度——I11
-            deferred = await asyncio.to_thread(self._writeback, state, handle)
-            self._check_cancel(handle)
-            # R18a 旧适配器：协调器现返回 DeferredTask 载荷，legacy 路径解包
-            # fn（新入口 schedule_commit_tasks 由 R17b 接线后取代此适配器）
-            _schedule_bg_writeback([t.fn for t in deferred])
+            # ④ R17b：先在门上裁决提交（CommitGate → commit_turn 事务），
+            # 提交成功才动 KEEPER / 派生任务——历史持久化失败不缓存为成功。
+            # 副作用表：normal 全量（关系+账本+蒸馏+学习任务）；crisis 只落
+            # 正式记录；degraded（审核拒绝/外部失败）只落安全正文 + 质量标志。
+            prepared = PreparedTurn(
+                session_id=state.session_id,
+                turn_id=state.turn_id,
+                request_id=state.request_id,
+                request_digest=state.request_digest,
+                user_text=state.user_text,
+                assistant_text=state.canonical_text,
+                disposition="crisis" if (state.emotion and state.emotion.is_crisis) else "normal",
+                source_review_status=state.review_status,
+                reason_code=state.reason_code,
+                intent=state.intent.intent if state.intent else "",
+                emotion=state.emotion.emotion if state.emotion else "",
+                intensity=state.emotion.intensity if state.emotion else 0.5,
+                comfort_mode=state.comfort_mode,
+                was_poor=state.was_poor,
+                extras=state.extras,
+                utterance_text=state.canonical_text,
+                mode="voice" if state.voice_mode else "text",
+            )
+            receipt = await asyncio.to_thread(
+                self._writeback_coord.commit_prepared, prepared
+            )
+            if receipt.get("status") == "cancelled":
+                # 取消在提交门上先赢：这轮当没发生过
+                yield {"type": "cancelled", "reason": "cancel_won"}
+                return
+            if receipt.get("status") != "committed":
+                # 提交失败（SQLite 等）：无半轮历史，明确告知未保存
+                yield {"type": "error", "code": "commit_failed",
+                       "message": "这轮没存下来，稍后再试试"}
+                return
+            runnable = await asyncio.to_thread(
+                self._writeback_coord.post_commit, prepared, receipt
+            )
+            _schedule_bg_writeback(runnable)
 
             # ⑤ _wants_voice 兜底：用户点名要语音但整轮没出 <voice>，用简短正文补一条
             if want_voice and not voice_emitted:
@@ -789,31 +858,79 @@ class DialoguePipeline:
             # 被更新的同一会话轮次取代：什么都不写（见 _writeback 注释）
             yield {"type": "cancelled", "reason": "superseded"}
         except _RefuseTurn as r:
-            # I13：refuse 降级也跑写回，让 was_poor 落 relationship.last_poor，否则
-            # force_if_last_poor 在降级后的下一轮永远不触发。_writeback 内部
-            # 检测 final_reply/draft_reply 都空时走 refuse-only 分支（只写关系层），
-            # 不写 KEEPER / chat_log / 蒸馏 / 画像——refuse 没说过话。
-            #
-            # R14b：**已发布合格前缀后再拒绝**——降级 canonical = 已发布的合格
-            # 前缀 + 实际采用的兜底（8.11.1 发布规则 2）。已说的话不能装没说、
-            # 也不能把完整原稿存回去：只存"推出去过的 + 兜底"。没有任何已发布
-            # 前缀时维持 refuse-only（什么都没说过）。
+            # I13 + R14b + R17b：refuse 降级的写回按副作用表分流——
+            # **已发布合格前缀后再拒绝**：降级 canonical = 已发布前缀 + 兜底
+            # （8.11.1 规则 2），经 commit_turn 落正式记录（disposition=degraded，
+            # 无关系增量、无学习任务），KEEPER/质量标志在提交成功后更新；
+            # **零前缀**：什么都没说过——只落质量 bookkeeping（last_poor），
+            # 不预创建 relationship、不写历史。
             published = "".join(canonical_parts)
             if published:
                 state.canonical_text = published + r.text
                 state.final_reply = state.canonical_text
-            deferred = await asyncio.to_thread(self._writeback, state, handle)
-            self._check_cancel(handle)
-            # R18a 旧适配器：协调器现返回 DeferredTask 载荷，legacy 路径解包
-            # fn（新入口 schedule_commit_tasks 由 R17b 接线后取代此适配器）
-            _schedule_bg_writeback([t.fn for t in deferred])
+                prepared = PreparedTurn(
+                    session_id=state.session_id,
+                    turn_id=state.turn_id,
+                    request_id=state.request_id,
+                    request_digest=state.request_digest,
+                    user_text=state.user_text,
+                    assistant_text=state.canonical_text,
+                    disposition="degraded",
+                    source_review_status="rejected",
+                    reason_code=state.review_block_reason or "review_output_blocked",
+                    intent=state.intent.intent if state.intent else "",
+                    emotion=state.emotion.emotion if state.emotion else "",
+                    intensity=state.emotion.intensity if state.emotion else 0.5,
+                    comfort_mode=state.comfort_mode,
+                    was_poor=state.was_poor,
+                    extras=state.extras,
+                    utterance_text=state.canonical_text,
+                    mode="voice" if state.voice_mode else "text",
+                )
+                receipt = await asyncio.to_thread(
+                    self._writeback_coord.commit_prepared, prepared
+                )
+                await asyncio.to_thread(
+                    self._writeback_coord.post_commit, prepared, receipt
+                )
+            else:
+                await asyncio.to_thread(
+                    RelationshipTracker().update_bookkeeping_only,
+                    state.session_id, state.was_poor,
+                )
             yield {"type": "refuse", "text": r.text, "replace": True,
                    "reason": state.review_block_reason}
             yield {"type": "done", "full_text": r.text, "output_mode": "text", "image_path": ""}
         except ExternalServiceError as exc:
             # R27b：外部服务失败——允许的降级路径。细节（来源/原因码）进日志，
             # 对外只给固定文案 + 有限错误码（R27a 的输出边界规则继续适用）。
+            # R17b：降级正文（本地模板兜底）按副作用表提交——disposition=degraded，
+            # 无关系增量、无学习任务（8.11.2：外部失败的兜底提交成功标 degraded）。
             _log_exc(f"astream 外部服务失败（{exc.source}/{exc.reason_code}）")
+            state.canonical_text = FallbackController().fallback_reply("llm")
+            prepared = PreparedTurn(
+                session_id=state.session_id,
+                turn_id=state.turn_id,
+                request_id=state.request_id,
+                request_digest=state.request_digest,
+                user_text=state.user_text,
+                assistant_text=state.canonical_text,
+                disposition="degraded",
+                source_review_status="unavailable",
+                reason_code=exc.reason_code,
+                intent=state.intent.intent if state.intent else "",
+                emotion=state.emotion.emotion if state.emotion else "",
+                intensity=state.emotion.intensity if state.emotion else 0.5,
+                comfort_mode=state.comfort_mode,
+                was_poor=state.was_poor,
+                extras=state.extras,
+                utterance_text=state.canonical_text,
+                mode="voice" if state.voice_mode else "text",
+            )
+            receipt = await asyncio.to_thread(
+                self._writeback_coord.commit_prepared, prepared
+            )
+            await asyncio.to_thread(self._writeback_coord.post_commit, prepared, receipt)
             yield {"type": "error", "code": "external_degraded",
                    "message": "这轮没接上，稍后再试试"}
         except Exception:

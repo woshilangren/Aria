@@ -22,12 +22,15 @@ from capability.memory import (
     ConversationDistiller,
     PortraitBuilder,
     RelationshipTracker,
+    compute_relationship_update,
 )
 from capability import self_identity
 from config.settings import load_app_config
 from shared.singletons import services
-from shared.types import DeferredTask
-from tools.speech import split_emotion, strip_emotion_marks
+from shared.types import DeferredTask, PreparedTurn
+from tools.speech import strip_emotion_marks
+
+from orchestration.cancellation import COMMIT_GATE
 
 # R18a：后台待办的任务种类。载荷绑定 (turn_id, kind) 幂等键——同一轮的
 # 同类任务重启/重试最多登记一次。
@@ -108,207 +111,136 @@ def _check_cancel(handle) -> None:
 
 
 class WritebackCoordinator:
-    """把"她这轮说过的话"落到该落的地方：KEEPER / chat_log / 蒸馏 / 关系 /
-    收手环，并把画像/身份冻结/摘要的后台待办打包返回（由持有 running loop
-    的一方调度，I11）。
+    """R17b：文字轮的新契约写回——提交（CommitGate→commit_turn 事务）先行，
+    提交成功才动 KEEPER 与派生任务；副作用按 disposition 分流。
 
     keeper 注入：必须是 pipeline 顶层的全项目唯一 KEEPER（8.3）。
     """
 
-    def __init__(self, keeper):
+    _LEDGER_REASONS = {
+        "happy": "聊得开心，关系热乎了一点",
+        "sad": "他说了难过的事，信任多了一分",
+        "crisis": "陪他熬过了一段艰难的时刻",
+        "angry": "闹了点不愉快，热度降了一点",
+        "tired": "平平常常聊了一会儿",
+    }
+
+    def __init__(self, keeper, gate=None):
         self._keeper = keeper
+        self._gate = gate or COMMIT_GATE
 
-    def writeback(self, state, handle) -> list:
-        """记忆写回。短期记忆、长期沉淀、亲密度、画像，一样别落。
+    def _kv(self):
+        return services.get("kv_store")
 
-        取消检查点插在每个子步骤之前：迟到的取消（被新轮顶掉）不会写出半截账。
-        注意：一旦取消，本方法**什么都不写**——不写 KEEPER、不写聊天记录、
-        不蒸馏、不涨亲密度、不刷画像。这偏离了设计文档里
-        "chat_log 可补一条 cancelled 标记"的说法，是**有意选择**：
-        写任何东西都会让"这轮当没发生过"不彻底，而 chat_log 的两个用途
-        （写日记、重启后恢复短期记忆）都不需要一条中途被丢弃的痕迹。
-        实际也很少出现"取消但没被新轮接管"——TurnRegistry.start 的会话级
-        单轮不变式会让新轮先取消旧轮，旧轮本来就不该留痕。
-        """
-        session_id = state.session_id
-        # I13 refuse-only 分支：refuse 路径（_RefuseTurn 被外层 except 接走）的写回，
-        # final_reply / draft_reply 都空说明这轮没产出正文——但 was_poor=True 仍要
-        # 落库，否则 force_if_last_poor（见 :247-250）在降级后下一轮永远不触发。
-        # 机制只在"轮内重写成功"时生效，与 _think_needed 注释意图不符，而这
-        # 恰恰是最需要它的时候。其他副作用一律不走：KEEPER / chat_log / 蒸馏 / 画像
-        # 都是"这轮说过话"的产物，refuse 没说过。
-        if not (state.final_reply or state.draft_reply):
-            _check_cancel(handle)
-            tracker = RelationshipTracker()
-            tracker.update(
-                state.session_id,
-                state.emotion.emotion if state.emotion else "neutral",
-                comfort_mode=state.comfort_mode,
-                was_poor=state.was_poor,
-                intensity=state.emotion.intensity if state.emotion else 0.5,
-                extras=state.extras,
+    def _default_intimacy(self) -> int:
+        """首次初始化的种子默认亲密度（读人设文件，不经库锁）。"""
+        try:
+            return self._kv().read("persona_config", "").default_intimacy
+        except Exception as exc:
+            print(f"[writeback] 读初始亲密度失败（按 0 起）: {exc}")
+            return 0
+
+    def _mood_engine(self):
+        from capability.quirks import MoodEngine
+
+        return MoodEngine()
+
+    def _relation_fn(self, turn: PreparedTurn):
+        """normal 轮的关系纯计算（R15b），注入 commit_turn 事务内执行。"""
+        def _apply(rel):
+            new_rel, _ = compute_relationship_update(
+                rel, emotion=turn.emotion or "neutral",
+                comfort_mode=turn.comfort_mode, was_poor=turn.was_poor,
+                intensity=turn.intensity, extras=turn.extras,
+                utterance_text=turn.utterance_text,
+                mood_engine=self._mood_engine(),
+                default_intimacy=self._default_intimacy(),
             )
-            _check_cancel(handle)
+            return new_rel
+        return _apply
+
+    def commit_prepared(self, turn: PreparedTurn) -> dict:
+        """R17b：先在门上裁决取消（取消先赢→数据事务根本不开始），未取消才
+        跑 kv.commit_turn 数据事务。
+
+        副作用表（8.11.2）按 disposition 分流：
+        - normal：关系纯计算 + intimacy 账本（与正式记录同一事务）；
+        - degraded / crisis：只落正式记录——无关系增量、无账本、无学习任务。
+        """
+        return self._gate.run_commit(turn.turn_id, fn=lambda: self._kv().commit_turn(
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            request_id=turn.request_id,
+            request_digest=turn.request_digest,
+            disposition=turn.disposition,
+            source_review_status=turn.source_review_status,
+            reason_code=turn.reason_code,
+            user_text=turn.user_text,
+            assistant_text=turn.assistant_text,
+            intent=turn.intent,
+            emotion=turn.emotion,
+            mode=turn.mode,
+            relation_fn=self._relation_fn(turn) if turn.disposition == "normal" else None,
+            relation_ledger=(self._LEDGER_REASONS.get(turn.emotion or "neutral", "又聊了一轮")
+                             if turn.disposition == "normal" else ""),
+            ledger_event_id=turn.turn_id,
+        ))
+
+    def post_commit(self, turn: PreparedTurn, receipt: dict) -> list:
+        """提交成功后的内存与派生动作（8.11.3 原子边界 5：SQLite 成功才更新
+        KEEPER）。返回经新入口去重后的可执行 fn 列表（由持有 loop 的一方调度）。
+
+        - normal：KEEPER 追加 + 蒸馏 + 收手环 + 画像/冻结/摘要任务（新入口调度）；
+        - degraded：KEEPER 追加 + 质量标志 bookkeeping + 收手环，**零学习任务**；
+        - crisis：KEEPER 追加（对话发生过该留痕），零学习任务；
+        - cancelled / failed：一律不动。
+        """
+        if receipt.get("status") != "committed":
+            return []
+        self._keeper.append_turn(turn.session_id, turn.user_text, turn.assistant_text)
+        kv = self._kv()
+        if turn.disposition == "normal":
+            ConversationDistiller().distill_turn(turn.session_id, turn.user_text)
             try:
                 from capability.proactive import note_user_reply
-                note_user_reply(state.session_id)
+
+                note_user_reply(turn.session_id)
+            except Exception:
+                pass
+            rel = kv.read("relationship", turn.session_id) or {}
+            tasks: list = []
+            interval = _portrait_interval()
+            if rel.get("interaction_count", 0) % interval == 0:
+                ctx = self._keeper.get_context(turn.session_id)[-6:]
+                tasks.append(DeferredTask(
+                    kind=TASK_PORTRAIT,
+                    fn=lambda: PortraitBuilder().refresh(turn.session_id, ctx)))
+            her_lines = [
+                m.get("content", "")
+                for m in self._keeper.get_context(turn.session_id)
+                if m.get("role") == "assistant"
+            ]
+            count = rel.get("interaction_count", 0)
+            tasks.append(DeferredTask(
+                kind=TASK_IDENTITY_FREEZE,
+                fn=lambda: self_identity.maybe_freeze(
+                    turn.session_id, turn.assistant_text,
+                    recent_her_lines=her_lines, interaction_count=count,
+                    user_text=turn.user_text)))
+            if self._keeper.has_pending_summary(turn.session_id):
+                tasks.append(DeferredTask(
+                    kind=TASK_SUMMARY,
+                    fn=lambda: self._keeper.run_pending_summary(turn.session_id)))
+            return schedule_commit_tasks(receipt, tasks)
+        if turn.disposition == "degraded":
+            # 副作用表：质量标志 + 收手环 bookkeeping——零关系增量、零学习任务
+            RelationshipTracker().update_bookkeeping_only(
+                turn.session_id, was_poor=turn.was_poor)
+            try:
+                from capability.proactive import note_user_reply
+
+                note_user_reply(turn.session_id)
             except Exception:
                 pass
             return []
-
-        user_text = state.user_text
-        # 普通聊天的回复还停在初稿里，先定稿再写回；标记落库前剥掉——
-        # final_reply 存的是模型原始输出，不剥的话标记会进 chat_log 和短期记忆
-        #
-        # 剥离顺序**必须先剥情绪标记、再剥反应前缀**（F）：
-        # _strip_reaction_tag 只看字符串开头，语音轮模型输出 "[开心]@r 你好" 时，
-        # 开头是 '[' 而非 '@r'，反过来的顺序会让 @r 逃过剥离，随后 strip_emotion_marks
-        # 只剥情绪标记、把 @r 留在正文 → 落库 "@r 你好" 而前端推送 "你好"，
-        # @r 进 chat_log 和短期记忆还会污染后续上下文（角色读到自己上一轮的 @r）。
-        reply_raw = state.final_reply or state.draft_reply
-        # 先记录情绪前缀（只取开头第一个，剥之前拿）：语音轮要把它拼回 final_reply
-        _, emo_tags, emo_descs = split_emotion(reply_raw)
-        # 干净正文：先剥情绪标记、再剥反应前缀。剥完可能前头又露出反应前缀
-        # （极端情况 "@r [开心] 你好"），所以在小循环里交替剥直到稳定，
-        # 保证落库文本里既没有 @r 也没有 [情绪]。
-        reply = reply_raw
-        for _ in range(3):
-            cleaned = _strip_reaction_tag(strip_emotion_marks(reply))
-            if cleaned == reply:
-                break
-            reply = cleaned
-        # 语音轮：final_reply 必须**保留情绪标签**——上层（renderer / voice 事件）
-        # 拿它去合成语音、拆情绪。上面剥干净的是"落库用"的干净文本，
-        # 这里把被剥掉的情绪前缀原样拼回 final_reply，别把标签一起削掉。
-        if state.voice_mode:
-            prefix = f"[{emo_tags[0]}]" if emo_tags else ""
-            prefix += f"（{emo_descs[0]}）" if emo_descs else ""
-            state.final_reply = prefix + reply
-        else:
-            state.final_reply = reply
-        # 短期记忆和 chat_log 只收剥干净标记的正文（语音轮同样如此，情绪标签不进库）
-        clean_reply = strip_emotion_marks(reply) if state.voice_mode else reply
-        emotion = state.emotion
-
-        # 短期记忆成对追加这一轮的问答（F12）：一次加锁写 user+assistant 两条，
-        # 迟到的取消不会留下"只有问没有答"的半截记忆
-        _check_cancel(handle)
-        self._keeper.append_turn(session_id, user_text, clean_reply)
-
-        # 聊天记录落库（chat_log 表）：日记生成、重启恢复都靠这份数据
-        # 危机轮也要记——对话发生过就该留痕，只是不涨亲密度不沉淀记忆
-        _check_cancel(handle)
-        intent = state.intent
-        emotion_label = emotion.emotion if emotion else ""
-        kv = services.get("kv_store")
-        kv.write(
-            "session",
-            session_id,
-            {
-                "role": "user",
-                "text": user_text,
-                "intent": intent.intent if intent else "",
-                "emotion": emotion_label,
-                "mode": "voice" if state.voice_mode else "text",
-            },
-        )
-        if clean_reply:
-            kv.write(
-                "session",
-                session_id,
-                {
-                    "role": "assistant",
-                    "text": clean_reply,
-                    "intent": intent.intent if intent else "",
-                    "emotion": emotion_label,
-                    "mode": state.output_mode,
-                },
-            )
-
-        # 危机或婉拒的轮次不沉淀、不涨亲密度，这些轮次不算正常互动
-        if emotion and emotion.is_crisis:
-            return []  # 无后台待办
-
-        _check_cancel(handle)
-        distiller = ConversationDistiller()
-        distiller.distill_turn(session_id, user_text)
-
-        _check_cancel(handle)
-        # 关系数值 + 心情状态机 + 阶段标记 + last_poor + 账本，一次原子闭包全部落好（F3 收口）。
-        # 以前这里写两次库（tracker 一次、mood 一次），既可能被打断也可能互相覆盖。
-        # last_poor（F8）必须传进闭包**一起写**，绝不能在 update 返回后再整包 kv.write：
-        # 那正是 F3 要消灭的"陈旧整包覆盖"，并发 REST 的 intimacy 增量会被吞掉。
-        tracker = RelationshipTracker()
-        rel = tracker.update(
-            session_id,
-            emotion.emotion if emotion else "neutral",
-            comfort_mode=state.comfort_mode,
-            was_poor=state.was_poor,
-            intensity=emotion.intensity if emotion else 0.5,
-            extras=state.extras,
-            # C6 反向标定：传她这轮**真说出口**的正文，安抚话能把误判的负面心情
-            # 校回来。用 clean_reply 不用 final_reply——后者还带着语音轮的情绪标签。
-            utterance_text=clean_reply,
-        )
-
-        # 用户开口 = 她的主动消息被回应了（N3 收手环）：清等待标记、重置连击。
-        # 必须在 tracker 之后——放前面会在首次对话预创建一个空 relationship，
-        # 让 tracker 的"首次初始化"分支失效（default_intimacy 被吞成 0，实测踩中）
-        _check_cancel(handle)
-        try:
-            from capability.proactive import note_user_reply
-
-            note_user_reply(session_id)
-        except Exception:
-            pass
-
-        # 聊够几轮才重新画像，别一句话就给人家贴标签。
-        # 画像与身份冻结都是 LLM 秒级调用——阻塞在 done 之前会让"她说完了"
-        # 你还要等她做完笔记。这里**只把待办闭包打包返回**，由 astream（持有
-        # running loop 的一方）create_task 调度——写回自己跑在工作线程里，
-        # 线程内没有事件循环，在这里调度会退化成同步执行（I11，实测踩中）。
-        deferred: list = []  # DeferredTask 载荷（R18a）：绑定 (turn_id, kind) 幂等键
-        interval = _portrait_interval()
-        if rel.get("interaction_count", 0) % interval == 0:
-            context_snapshot = self._keeper.get_context(session_id)[-6:]
-
-            def _bg_portrait(handle=handle, sid=session_id, ctx=context_snapshot):
-                if handle is not None and handle.is_cancelled():
-                    return  # 迟到的取消：什么都不写
-                PortraitBuilder().refresh(sid, ctx)
-
-            deferred.append(DeferredTask(kind=TASK_PORTRAIT, fn=_bg_portrait))
-
-        # 她自己的身份冻结（批次0"种子+涌现"）：从她刚说的话里定下名字/年龄/
-        # 城市/职业/住处（只收她亲口说的、只填空不改口），第 3 轮后提炼一次
-        # 自我认知基线。LLM 失败静默跳过，下轮再试；下一轮 compose 注入"你是谁"
-        her_lines = [
-            m.get("content", "")
-            for m in self._keeper.get_context(session_id)
-            if m.get("role") == "assistant"
-        ]
-        freeze_text = re.sub(r"</?voice>", "", clean_reply or "")
-
-        # user_text 是 G1-G4 披露预算闸门的输入（他这轮问过什么 → 她可以冻什么）。
-        # 不传就是闸门按"问过"放行——compose 侧已经不催她倒档案了，冻结侧不接
-        # 就只剩半边生效。
-        def _bg_freeze(handle=handle, sid=session_id, text=freeze_text, lines=her_lines,
-                       count=rel.get("interaction_count", 0), asked=user_text):
-            if handle is not None and handle.is_cancelled():
-                return  # 迟到的取消：什么都不写
-            self_identity.maybe_freeze(sid, text, recent_her_lines=lines,
-                                       interaction_count=count, user_text=asked)
-
-        deferred.append(DeferredTask(kind=TASK_IDENTITY_FREEZE, fn=_bg_freeze))
-
-        # J12：短期记忆的摘要不再内联在 append_turn 里（那是一次秒级 LLM 调用，
-        # 阻塞在写回路径上）。append_turn 只登记待办，这里打包成后台闭包，
-        # 由持有 running loop 的一方调度——工作线程内没有事件循环（I11）。
-        if self._keeper.has_pending_summary(session_id):
-            def _bg_summary(handle=handle, sid=session_id):
-                if handle is not None and handle.is_cancelled():
-                    return  # 迟到的取消：什么都不写
-                self._keeper.run_pending_summary(sid)
-
-            deferred.append(DeferredTask(kind=TASK_SUMMARY, fn=_bg_summary))
-        return deferred
+        return []  # crisis

@@ -11,9 +11,10 @@
 完整的检查点插桩与 cancelled 写回分支在后续批次补。
 """
 
-import itertools
 import threading
+import uuid
 
+from shared.ids import new_turn_id
 from shared.types import CommitReceipt
 
 
@@ -24,7 +25,7 @@ class TurnCancelled(Exception):
 class TurnHandle:
     """单轮的取消句柄。"""
 
-    def __init__(self, session_id: str, turn_id: int):
+    def __init__(self, session_id: str, turn_id: str):
         self.session_id = session_id
         self.turn_id = turn_id
         self._cancelled = threading.Event()
@@ -48,15 +49,19 @@ class TurnRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._active: dict[str, TurnHandle] = {}
-        self._ids = itertools.count(1)
 
     def start(self, session_id: str) -> TurnHandle:
-        """开一轮：先把该会话上一个活跃轮取消掉，再登记并返回新句柄。"""
+        """开一轮：先把该会话上一个活跃轮取消掉，再登记并返回新句柄。
+
+        R17b：turn_id 改用跨重启不碰撞的 uuid（shared.ids）——它是持久层
+        （chat_log.turn_id / 回执 / 取消门）的同一把键，前端 cancel 传回的
+        也是它，不再有"进程内递增数当持久键"的重数撞键问题。
+        """
         with self._lock:
             prev = self._active.get(session_id)
             if prev is not None:
                 prev.cancel()
-            handle = TurnHandle(session_id=session_id, turn_id=next(self._ids))
+            handle = TurnHandle(session_id=session_id, turn_id=new_turn_id())
             self._active[session_id] = handle
             return handle
 
@@ -65,7 +70,7 @@ class TurnRegistry:
         with self._lock:
             return self._active.get(session_id)
 
-    def cancel(self, session_id: str, turn_id: "int | None" = None) -> bool:
+    def cancel(self, session_id: str, turn_id: "str | None" = None) -> bool:
         """取消某会话的活跃轮（按 turn_id 精确匹配）。
 
         turn_id=None 一律拒绝（F4）：竞态下"start 事件还没到、turnId 还是 null"
@@ -83,7 +88,7 @@ class TurnRegistry:
             handle.cancel()
             return True
 
-    def finish(self, session_id: str, turn_id: int) -> None:
+    def finish(self, session_id: str, turn_id: str) -> None:
         """轮次正常结束就登出，避免登记表无限增长。"""
         with self._lock:
             handle = self._active.get(session_id)

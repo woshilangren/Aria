@@ -18,11 +18,11 @@ import json
 import re
 import sqlite3
 import threading
-import uuid
 from datetime import datetime, timedelta
 from typing import Callable, List, Optional
 
 from config.settings import get_settings
+from shared.ids import new_turn_id
 
 # 允许当 KV 表用的表名白名单，防呆：写错名字宁可报错也别建出脏表
 # self：她自己定下的身份（名字/年龄/城市/自我认知），懒生成冻结（批次0）
@@ -182,15 +182,8 @@ _MIGRATIONS: tuple = (
 # 当前代码期望的 schema 版本 = 迁移批次数（每批把版本 +1）
 _SCHEMA_VERSION = len(_MIGRATIONS)
 
-
-def new_turn_id() -> str:
-    """生成跨重启不碰撞的轮 ID（R15a）。
-
-    TurnRegistry 的进程内递增数**不许**当持久唯一键：进程重启后从 1 重数，
-    与历史 chat_log/回执撞键。uuid4 全串无时序含义但绝对不撞；持久表里的
-    turn_id 一律出自这里。
-    """
-    return uuid.uuid4().hex
+# new_turn_id 从 shared.ids 导入（R15a 引入，R17b 收口到 shared 层——
+# orchestration 的取消门也要用同一生成器，data 层不再自有副本）
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -479,6 +472,8 @@ class SQLiteStorage:
                     user_text: str = "", assistant_text: str = "",
                     intent: str = "", emotion: str = "", mode: str = "text",
                     relation_fn: Optional[Callable] = None,
+                    relation_ledger: str = "",
+                    ledger_event_id: str = "",
                     ledger: Optional[dict] = None,
                     created_at: Optional[str] = None) -> dict:
         """一轮提交 = **一个短事务**：请求登记 → user/assistant 正式记录 →
@@ -561,19 +556,35 @@ class SQLiteStorage:
                          turn_id, disposition, source_review_status, reason_code),
                     )
                     message_ids.append(cur.lastrowid)
-                # ④ 关系：事务内读**最新**现态 → 调用方注入的纯计算 → 写回
+                # ④ 关系：事务内读**最新**现态 → 调用方注入的纯计算 → 写回；
+                # relation_ledger 非空时自动记 intimacy 账本（值来自同一事务内的
+                # 前后差，与 R15b 纯计算共用现态，不先读快照）
                 if relation_fn is not None:
                     rel_row = self._conn.execute(
                         "SELECT value FROM relationship WHERE session_id = ?",
                         (session_id,),
                     ).fetchone()
                     rel = json.loads(rel_row[0]) if rel_row else {}
+                    old_intimacy = float((rel or {}).get("intimacy") or 0)
                     new_rel = relation_fn(rel)
+                    new_intimacy = float((new_rel or {}).get("intimacy") or 0)
                     self._conn.execute(
                         "INSERT INTO relationship (session_id, value) VALUES (?, ?) "
                         "ON CONFLICT(session_id) DO UPDATE SET value = excluded.value",
                         (session_id, json.dumps(new_rel, ensure_ascii=False)),
                     )
+                    if relation_ledger:
+                        self._conn.execute(
+                            "INSERT INTO affection_history "
+                            "(session_id, old_score, new_score, delta, reason, source_quote, "
+                            "created_at, field, old_value, new_value, event_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, 'intimacy', ?, ?, ?)",
+                            (session_id, old_intimacy, new_intimacy,
+                             round(new_intimacy - old_intimacy, 4),
+                             relation_ledger[:150], (user_text or "")[:150], now,
+                             json.dumps(old_intimacy), json.dumps(new_intimacy),
+                             ledger_event_id),
+                        )
                 # ⑤ 账本（可选；field != intimacy 不占旧分数列，R15a 结构）
                 if ledger:
                     fld = ledger.get("field", "intimacy")
@@ -630,6 +641,19 @@ class SQLiteStorage:
                 "request_id": request_id, "disposition": row[1],
                 "committed_at": row[3], "message_ids": json.loads(row[4] or "[]"),
                 "reason_code": row[5] or ""}
+
+    def get_turn_messages(self, session_id: str, turn_id: str) -> List[dict]:
+        """按 turn_id 取该轮的全部正式记录（role/content），旧 -> 新。
+
+        R17b 重试回放用：同 request 的已提交轮直接回放已存正文，不再生成。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT role, content FROM chat_log "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY id",
+                (session_id, turn_id),
+            ).fetchall()
+        return [{"role": r[0], "content": r[1]} for r in rows]
 
     # ---------- 关系数值账本（S3）：追加写 + 近 N 条读 ----------
 

@@ -48,43 +48,46 @@ def test_turn_registry_rejects_none_turn_id() -> None:
     assert reg.get(sid) is handle, "turn_id=None 不能误杀现有活跃轮"
 
 
-# =================== 3. _writeback 有取消检查点 ===================
+# =================== 3. 取消不写：提交走同一原子门（R17b 结构） ===================
 
-def test_writeback_has_cancel_checkpoints() -> None:
-    """写回协调器体内必须有 ≥4 次 _check_cancel(handle) 调用。
-
-    每个子步骤（KEEPER / chat_log / distiller / tracker / note_user_reply）之前
-    各插一个——取消的轮什么都不写（CLAUDE.md 有意的设计取舍 #3）。
-    R17a：写回本体已机械提取到 orchestration/writeback.py，不变式跟着搬。
+def test_writeback_commits_through_gate() -> None:
+    """提交必须经 CommitGate（8.11.3 原子门）：门在数据事务前裁决取消，
+    取消先赢 → 数据事务根本不开始（行为级验证见 test_turn_commit.py）。
+    R17b：写回重构后，"取消检查点"升级为"门裁决"，这里钉住接线不回退。
     """
     src = Path("orchestration/writeback.py").read_text(encoding="utf-8")
-    fn_start = src.find("def writeback(self, state, handle)")
+    fn_start = src.find("def commit_prepared(self, turn: PreparedTurn)")
     fn_end = src.find("\n    def ", fn_start + 1)
     body = src[fn_start:fn_end if fn_end > 0 else None]
-    count = body.count("_check_cancel(handle)")
-    assert count >= 4, f"writeback 应有 ≥4 个取消检查点（KEEPER/chat_log/distiller/tracker），实测 {count}"
+    assert "self._gate.run_commit(turn.turn_id" in body, (
+        "commit_prepared 必须经 CommitGate 裁决（取消先赢→事务不开始）"
+    )
 
 
-# =================== 4. writeback 顺序：tracker 在 note_user_reply 之前 ===================
+# =================== 4. writeback 顺序：KEEPER 在提交后、学习派生在最后 ===================
 
-def test_writeback_tracker_before_note_user_reply() -> None:
-    """note_user_reply(session_id) 必须在 RelationshipTracker().update 之后调用。
-
-    否则首轮会被预创建空 relationship、tracker 的"首次初始化"分支失效，
-    default_intimacy 被吞成 0（开发日志 BUG-20260916-首聊 已踩中）。
-    R17a：写回本体已机械提取到 orchestration/writeback.py，不变式跟着搬。
+def test_writeback_post_commit_order() -> None:
+    """post_commit 的顺序不变式：先 KEEPER.append_turn（8.11.3 边界 5：
+    SQLite 成功才更新缓存），再蒸馏/收手环，学习任务最后打包。
+    R17b：旧"tracker 在 note_user_reply 之前"随副作用表升级为本顺序。
     """
     src = Path("orchestration/writeback.py").read_text(encoding="utf-8")
-    fn_start = src.find("def writeback(self, state, handle)")
+    fn_start = src.find("def post_commit(self, turn: PreparedTurn, receipt: dict)")
     fn_end = src.find("\n    def ", fn_start + 1)
     body = src[fn_start:fn_end if fn_end > 0 else None]
-    tracker_pos = body.find("RelationshipTracker")
-    note_pos = body.find("note_user_reply(session_id)")
-    assert tracker_pos > 0, "writeback 必须实例化 RelationshipTracker"
-    assert note_pos > 0, "writeback 必须调用 note_user_reply"
-    assert tracker_pos < note_pos, (
-        f"顺序反了：tracker 在 L{fn_start + tracker_pos}，"
-        f"note_user_reply 在 L{fn_start + note_pos}。"
+    keeper_pos = body.find("append_turn")
+    distill_pos = body.find("distill_turn")
+    note_pos = body.find("note_user_reply")
+    tasks_pos = body.find("schedule_commit_tasks")
+    assert keeper_pos > 0, "post_commit 必须先更新 KEEPER"
+    assert distill_pos > keeper_pos and note_pos > keeper_pos, (
+        "蒸馏/收手环必须在 KEEPER 之后"
+    )
+    assert tasks_pos > keeper_pos, "学习任务打包必须在 KEEPER 之后"
+    # 降级分支：bookkeeping-only（无学习任务）
+    degraded_pos = body.find('turn.disposition == "degraded"')
+    assert degraded_pos > 0 and "update_bookkeeping_only" in body[degraded_pos:], (
+        "降级轮必须走 bookkeeping-only"
     )
 
 

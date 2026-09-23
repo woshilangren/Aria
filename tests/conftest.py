@@ -177,6 +177,12 @@ def _isolate(tmp_path, monkeypatch):
     saved_active = dict(TURN_REGISTRY._active)
     saved_bg = set(_pipeline_mod._BG_TASKS)
 
+    # R17b：派生任务调度登记表也是进程级单例（R18a）——PreparedTurn 直测等
+    # 走 post_commit 的用例会往里登记，不清会串染后面断言"登记表为空"的用例。
+    from orchestration import writeback as _wb_mod
+
+    saved_commit_tasks = dict(_wb_mod._COMMIT_TASK_REGISTRY)
+
     # R06a：装配状态（_ASSEMBLY_STATE）也是进程级单例——每个用例必须从
     # "未装配"开始。否则上一个用例留下的 status=ready 会让下一个用例的
     # lifespan 跳过 bootstrap，直接面对被本 fixture 清空的 services 注册表
@@ -200,6 +206,8 @@ def _isolate(tmp_path, monkeypatch):
             TURN_REGISTRY._active.update(saved_active)
         _pipeline_mod._BG_TASKS.clear()
         _pipeline_mod._BG_TASKS.update(saved_bg)
+        _wb_mod._COMMIT_TASK_REGISTRY.clear()
+        _wb_mod._COMMIT_TASK_REGISTRY.update(saved_commit_tasks)
 
         try:
             if _sqlite_mod._db is not None and _sqlite_mod._db is not saved_db:

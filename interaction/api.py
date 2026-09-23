@@ -366,13 +366,20 @@ async def stream_message(payload: dict, request: Request):
 
 @chat_router.post("/cancel")
 async def cancel_message(payload: dict) -> dict:
-    """取消某会话当前活跃的那一轮对话（后端据此停止生成、且不写记忆）。"""
-    from orchestration.cancellation import TURN_REGISTRY
+    """取消某会话当前活跃的那一轮对话（后端据此停止生成、且不写记忆）。
+
+    R17b：取消走 CommitGate 裁决——若该轮**已提交**，迟到取消返回
+    already_committed（历史与派生任务保留，只停输出）；取消先赢才真的取消。
+    """
+    from orchestration.cancellation import COMMIT_GATE, TURN_REGISTRY
 
     session_id = payload.get("session_id", "default")
     turn_id = payload.get("turn_id")
     TURN_REGISTRY.cancel(session_id, turn_id)
-    return {"ok": True}
+    if turn_id:
+        verdict = COMMIT_GATE.cancel_turn(str(turn_id), reason="api_cancel")
+        return {"ok": True, "commit_status": verdict.get("status", "cancelled")}
+    return {"ok": True, "commit_status": "cancelled"}
 
 
 @chat_router.get("/history")

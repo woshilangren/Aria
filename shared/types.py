@@ -8,6 +8,35 @@ from typing import Callable, Optional
 
 
 @dataclass
+class PreparedTurn:
+    """R17b：提交前的正式轮载荷（8.11.1 确认的接口名）。
+
+    唯一允许进入提交路径的载体——携带 canonical 正文与提交所需的全部技术
+    字段；draft / 工具原始结果 / 被拒原稿**不在此载体**，天然失去持久化资格。
+    relation/ledger 副作用按 disposition 由写回协调器决定（R17b 副作用表）。
+    """
+
+    session_id: str
+    turn_id: str
+    request_id: str
+    request_digest: str
+    user_text: str
+    assistant_text: str                      # canonical（唯一正式正文）
+    disposition: str = "normal"              # normal / degraded / crisis
+    source_review_status: str = "accepted"   # accepted / rejected / unavailable
+    reason_code: str = ""
+    intent: str = ""
+    emotion: str = ""                        # 情绪标签（关系增量 + chat_log 列）
+    intensity: float = 0.5
+    comfort_mode: bool = False
+    was_poor: bool = False
+    extras: Optional[object] = None          # PerceptionExtras（避免反向 import 用 object）
+    utterance_text: str = ""                 # 她实际说出口的正文（C6 反向标定输入）
+    mode: str = "text"
+    delivery: str = "unknown"                # 发送确认由适配器回填（8.11.1 规则 6）
+
+
+@dataclass
 class DeferredTask:
     """后台待办载荷（R18a）：绑定任务种类与可调用体。
 
@@ -171,9 +200,14 @@ class FinalReply:
 
 @dataclass
 class InputMessage:
-    """一条收进来的用户消息。"""
+    """一条收进来的用户消息。
+
+    request_id（R17b）：前端一次发送生成一个、整次重试沿用；旧客户端缺 ID
+    时由服务端补（此时明确无法提供跨重试去重）。
+    """
 
     text: str
     input_mode: str = "text"   # text / voice
     session_id: str = "default"
     image_url: str = ""        # 用户随消息上传的图片（可选），多模态模型跟着一起看
+    request_id: str = ""       # 请求去重键；空 = 旧客户端，服务端补生成
