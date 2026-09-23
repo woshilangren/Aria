@@ -233,15 +233,23 @@ class WritebackCoordinator:
             rel = kv.read("relationship", turn.session_id) or {}
             tasks: list = []
             interval = _portrait_interval()
+            # R14c：画像/身份的学习素材只取**可学习的已提交正常轮**——
+            # KEEPER 上下文里混着降级轮的兜底正文（模板话），拿去做人格证据
+            # 等于把"这轮没接上"炼成她的性格。走 learnable 读口直查持久层，
+            # legacy 行（分类字段为空）按可学习对待。
+            learnable = kv.recent_chat(turn.session_id, 100, learnable=True)
             if rel.get("interaction_count", 0) % interval == 0:
-                ctx = self._keeper.get_context(turn.session_id)[-6:]
+                ctx = [
+                    {"role": r.get("role"), "content": r.get("text", "")}
+                    for r in learnable[-6:]
+                ]
                 tasks.append(DeferredTask(
                     kind=TASK_PORTRAIT,
                     fn=lambda: PortraitBuilder().refresh(turn.session_id, ctx)))
             her_lines = [
-                m.get("content", "")
-                for m in self._keeper.get_context(turn.session_id)
-                if m.get("role") == "assistant"
+                r.get("text", "")
+                for r in learnable
+                if r.get("role") == "assistant"
             ]
             count = rel.get("interaction_count", 0)
             tasks.append(DeferredTask(

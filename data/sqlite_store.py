@@ -864,14 +864,25 @@ class SQLiteStorage:
                 (session_id, role, content, intent, emotion, mode, created_at),
             )
 
-    def get_recent_chat(self, session_id: str, n: int = 10) -> List[dict]:
-        """最近 n 条对话，按时间正序返回（老 -> 新），给恢复短期记忆用。"""
+    def get_recent_chat(self, session_id: str, n: int = 10,
+                        learnable: bool = False) -> List[dict]:
+        """最近 n 条对话，按时间正序返回（老 -> 新），给恢复短期记忆用。
+
+        R14c：learnable=True 只取**可学习的已提交正常轮**（disposition='normal'，
+        或旧记录分类字段为空——legacy 行按原样对待，不假装能自动辨认旧污染）。
+        身份/画像/事实提炼的学习素材必须走这个口子；聊天展示与短期记忆恢复
+        用默认全量（降级轮的兜底正文是真实发布过的）。
+        """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT role, content, intent, emotion, mode, created_at FROM chat_log "
-                "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
-                (session_id, n),
-            ).fetchall()
+            sql = ("SELECT role, content, intent, emotion, mode, created_at FROM chat_log "
+                   "WHERE session_id = ?")
+            params: list = [session_id]
+            if learnable:
+                sql += (" AND (disposition = 'normal' OR disposition IS NULL "
+                        "OR disposition = '')")
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(n)
+            rows = self._conn.execute(sql, params).fetchall()
         # 倒序取的，翻回来才是对话本来的顺序
         return [
             {
@@ -890,8 +901,11 @@ class SQLiteStorage:
     ) -> List[dict]:
         """捞某个时间段内的对话（含头不含尾），写日记时取"今天聊了啥"用。"""
         with self._lock:
+            # R14c：带出 disposition——日记把降级轮当"回复失败"的客观记录，
+            # 不能当成她真的说了一段有意义的话。
             rows = self._conn.execute(
-                "SELECT role, content, intent, emotion, mode, created_at FROM chat_log "
+                "SELECT role, content, intent, emotion, mode, created_at, disposition "
+                "FROM chat_log "
                 "WHERE session_id = ? AND created_at >= ? AND created_at < ? "
                 "ORDER BY id ASC",
                 (session_id, start_iso, end_iso),
@@ -904,6 +918,7 @@ class SQLiteStorage:
                 "emotion": r[3],
                 "mode": r[4],
                 "time": r[5],
+                "disposition": r[6] or "",
             }
             for r in rows
         ]

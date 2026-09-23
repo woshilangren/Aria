@@ -407,3 +407,72 @@ def test_s7_uncertain_hedge_fixed_samples():
     assert _needs_uncertain_hedge({"score": 0.3}) is True     # legacy 兼容
     assert _needs_uncertain_hedge({"score": 0.4}) is False
     assert _needs_uncertain_hedge({}) is False                # 双缺：宁少勿滥
+
+# ------------------- R14c：消费端统一（学习素材只取可学习的已提交正常轮） -------------------
+
+def _insert_chat_row(session_id, role, text, disposition, mode="text"):
+    from data.sqlite_store import get_db
+
+    db = get_db()
+    with db._lock, db._conn:
+        db._conn.execute(
+            "INSERT INTO chat_log (session_id, role, content, intent, emotion, mode, "
+            "created_at, turn_id, disposition, source_review_status, reason_code) "
+            "VALUES (?, ?, ?, '', '', ?, ?, ?, ?, 'accepted', '')",
+            (session_id, role, text, mode,
+             datetime.now().isoformat(timespec="seconds"),
+             "t-" + text[:6], disposition),
+        )
+
+
+def test_learnable_recent_chat_filters_degraded(kv):
+    """R14c：learnable 读口只出 normal + legacy（分类为空的旧行）；降级轮的
+    兜底正文不许变成画像/身份的学习素材。"""
+    _insert_chat_row("r14c", "assistant", "正常轮一", "normal")
+    _insert_chat_row("r14c", "assistant", "降级兜底话", "degraded")
+    _insert_chat_row("r14c", "assistant", "危机轮", "crisis")
+    _insert_chat_row("r14c", "assistant", "legacy 旧记录", "")
+
+    rows = kv.recent_chat("r14c", 100, learnable=True)
+    texts = [r["text"] for r in rows]
+    assert "正常轮一" in texts and "legacy 旧记录" in texts
+    assert "降级兜底话" not in texts and "危机轮" not in texts
+    # 默认全量（聊天展示/短期记忆恢复）：降级轮真实发布过，照样在
+    all_rows = kv.recent_chat("r14c", 100)
+    assert "降级兜底话" in [r["text"] for r in all_rows]
+
+
+def test_diary_compose_marks_degraded_rows(kv):
+    """R14c：日记把降级轮当"回复失败"的客观记录——transcript 里明确标注，
+    不许把模板兜底话当成她说了段有意义的话来写日记。"""
+    from capability.diary import DiaryWriter
+
+    captured = {}
+
+    class _CaptureLLM:
+        def chat(self, messages, temperature=None, max_tokens=None):
+            captured["content"] = messages[-1]["content"]
+            return '{"items": [], "diary": "今天没聊什么。"}'
+
+    kv.scripted_llm_orig = None
+    import shared.singletons as singles
+
+    old_llm = singles.services._services.get("llm")
+    singles.services.register("llm", _CaptureLLM())
+    try:
+        chats = [
+            {"role": "user", "text": "今天天气怎么样", "time": "2026-09-23T10:00:00",
+             "disposition": "normal"},
+            {"role": "assistant", "text": "这轮没接上，稍后再试试", "time": "2026-09-23T10:00:05",
+             "disposition": "degraded"},
+            {"role": "assistant", "text": "晴天呢，出门带伞也别忘了防晒", "time": "2026-09-23T10:00:10",
+             "disposition": "normal"},
+        ]
+        diary = DiaryWriter()._compose(chats, session_id="r14c-diary")
+        assert diary == "今天没聊什么。"
+    finally:
+        singles.services.register("llm", old_llm)
+
+    t = captured["content"]
+    assert "（这轮回复失败）：这轮没接上" in t, "降级轮必须带客观标注"
+    assert "晴天呢" in t

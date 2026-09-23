@@ -210,9 +210,12 @@ class SessionStore:
             created_at=datetime.now().isoformat(timespec="seconds"),
         )
 
-    def get_recent(self, session_id: str, n: int = 10) -> list:
-        """拿最近 n 条记录，进程重启后恢复短期记忆用。"""
-        return get_db().get_recent_chat(session_id, n)
+    def get_recent(self, session_id: str, n: int = 10, learnable: bool = False) -> list:
+        """拿最近 n 条记录，进程重启后恢复短期记忆用。
+
+        R14c：learnable=True 只取可学习的已提交正常轮（学习素材专用读口）。
+        """
+        return get_db().get_recent_chat(session_id, n, learnable=learnable)
 
     def get_chats_between(self, session_id: str, start_iso: str, end_iso: str) -> list:
         """按时间段捞记录（含头不含尾），写日记就靠这个把某天的对话整段拎出来。"""

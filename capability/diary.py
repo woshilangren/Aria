@@ -231,8 +231,12 @@ class DiaryWriter:
             name = self_identity.display_name(session_id) or "我"
         except Exception:
             pass
+        # R14c：降级轮是"回复失败"的客观记录，不是她真的说了一段有意义的话——
+        # 进日记时明确标注，模板兜底话不许被提炼成她的人格叙事。
         transcript = "\n".join(
-            f"{'他' if c.get('role') == 'user' else name}：{c.get('text', '')}"
+            f"{name}（这轮回复失败）：{c.get('text', '')}"
+            if c.get("disposition") == "degraded" and c.get("role") != "user"
+            else f"{'他' if c.get('role') == 'user' else name}：{c.get('text', '')}"
             for c in chats
         )[-3000:]
         system = self._diary_system(session_id)

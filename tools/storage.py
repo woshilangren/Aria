@@ -795,15 +795,19 @@ class KVStoreTool:
         return self._session.chat_log_hour_distribution(session_id, days)
 
 
-    def recent_chat(self, session_id: str, n: int = 100) -> list:
+    def recent_chat(self, session_id: str, n: int = 100, learnable: bool = False) -> list:
         """取某会话最近 n 条聊天记录。
 
         read("session", key) 的条数**跟着 `memory.max_turns_short_term` 走**（默认 12；
         以前是写死的 20，那才是这条 docstring 原来描述的毛病，早已解耦），它表达的是
         "她醒来时记得多少"，而且传不进 n。api.py 拉历史要的是另一个条数（默认 100），
         语义不同，所以走这个专门的口子，不去动 read() 的含义。
+
+        R14c：learnable=True 只取可学习的已提交正常轮——身份/画像/事实提炼的
+        学习素材一律走这个口子；降级轮的兜底正文不许变成人格证据。旧记录分类
+        字段为空的 legacy 行按可学习对待（不假装能自动辨认旧污染）。
         """
-        return self._session.get_recent(session_id, n)
+        return self._session.get_recent(session_id, n, learnable=learnable)
 
     # ---- J9：磁盘只增不减 —— 保留期修剪口子 ----
     #
