@@ -890,6 +890,30 @@ class SQLiteStorage:
                 (self._keep_cache_key(session_id, field, value_key),),
             )
 
+    # ------------------- R18b：派生任务完成标记的原子裁决 -------------------
+    #
+    # derived_task_done 的 task_key 主键就是原子闸：INSERT OR IGNORE 谁抢到
+    # rowcount=1 谁就是本次的执行者——并发领取由存储裁决，不靠进程内约定。
+    # 顺序语义：**先领取、再应用、失败退回**。应用成功前标记已在，进程死在
+    # 中间只会丢一次学习任务（安全侧），绝不会"状态已改、标记没写"地重复
+    # 改状态；跨重启的可靠排队与租约是 R19 pending_writes 的活，这里不越位。
+    #
+    # 应用失败退回标记的原因：领取不等于完成，失败了下次（重试/重放）还该能跑。
+
+    def claim_task(self, task_key: str) -> bool:
+        """原子领取：返回 True 表示本次调用拥有执行权，False=已被应用过。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO derived_task_done (task_key, done_at) VALUES (?, ?)",
+                (task_key, datetime.now().isoformat(timespec="seconds")),
+            )
+            return cur.rowcount > 0
+
+    def release_task(self, task_key: str) -> None:
+        """退回领取标记（应用失败时）：下次重试/重放还能执行。"""
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM derived_task_done WHERE task_key = ?", (task_key,))
+
     def mark_candidate_promoted(self, cand_id: int) -> None:
         with self._lock, self._conn:
             self._conn.execute(

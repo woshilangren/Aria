@@ -524,3 +524,69 @@ def test_post_commit_deferred_writes_only_on_committed_normal(kv, register_servi
     coord.post_commit(deg, {"status": "committed", "turn_id": deg.turn_id})
     assert touched == ["m1", "m2"]
     assert burned == [("r17d", "那本书")]
+
+# ------------------- R18b：重复执行不重复改变状态 -------------------
+
+def test_claim_task_atomic_and_releasable(kv):
+    """R18b：领取由存储原子裁决——并发只有一个赢；失败退回后可重领。"""
+    db = get_db()
+    assert db.claim_task("r18b-k1") is True
+    assert db.claim_task("r18b-k1") is False, "同键第二次领取必须失败"
+    db.release_task("r18b-k1")
+    assert db.claim_task("r18b-k1") is True, "退回后必须能重新领取"
+
+
+def test_schedule_claim_guard_prevents_double_apply(kv, register_services):
+    """R18b：调度入口包领取守卫——
+
+    - 应用成功后同键任务重放/并发 → 领取失败，不再执行（不重复改状态）；
+    - 应用失败 → 退回标记 → 还能重试（领取≠完成）；
+    - 任务键带目标范围（turn_id:kind:target）。
+    """
+    from orchestration import writeback as wb
+    from shared.types import DeferredTask
+
+    register_services(kv_store=kv)
+    assert wb.make_task_key("t1", "portrait", "42") == "t1:portrait:42"
+
+    state = {"n": 0}
+
+    def fx():
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RuntimeError("首次应用失败")
+
+    receipt = {"status": "committed", "turn_id": "t-r18b"}
+    run = wb.schedule_commit_tasks(
+        receipt, [DeferredTask(kind=wb.TASK_PORTRAIT, target="w1", fn=fx)]
+    )
+    assert len(run) == 1
+    try:
+        run[0]()
+    except RuntimeError:
+        pass
+    assert state["n"] == 1
+    # 失败退回：重试能重新领取并执行
+    run[0]()
+    assert state["n"] == 2
+    # 已成功应用：同键再执行（重放）→ 领取失败 → 不再跑
+    run[0]()
+    assert state["n"] == 2, "已应用过的任务不许重复执行"
+
+
+def test_task_key_target_scopes_portrait_window(kv, register_services):
+    """R18b：目标范围进任务键——不同窗口的同 kind 任务互不遮蔽。"""
+    from orchestration import writeback as wb
+    from shared.types import DeferredTask
+
+    register_services(kv_store=kv)
+    ran = []
+    receipt = {"status": "committed", "turn_id": "t-r18b-w"}
+    run = wb.schedule_commit_tasks(receipt, [
+        DeferredTask(kind=wb.TASK_PORTRAIT, target="100", fn=lambda: ran.append("w100")),
+        DeferredTask(kind=wb.TASK_PORTRAIT, target="105", fn=lambda: ran.append("w105")),
+    ])
+    assert len(run) == 2, "不同目标范围是不同任务，不许互相幂等掉"
+    for fn in run:
+        fn()
+    assert sorted(ran) == ["w100", "w105"]

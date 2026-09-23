@@ -8,6 +8,7 @@
 - RelationshipTracker：亲密度好感度这些数值的增减
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -53,7 +54,8 @@ def _enqueue_retry(kind: str, payload: dict) -> None:
 
 def remember_note(session_id: str, content: str, kind: str = "event",
                   importance: int = 3, feeling: str = "", appraisal: str = "",
-                  valence: float = 0.0, arousal: float = 0.3) -> None:
+                  valence: float = 0.0, arousal: float = 0.3,
+                  memory_id: str = "") -> None:
     """往长期记忆写一条。全项目**只有这里**负责构造 MemoryItem + 落向量库 + 失败补偿。
 
     抽成模块级公开函数而不是留在 ConversationDistiller 里：G5 要在
@@ -64,7 +66,9 @@ def remember_note(session_id: str, content: str, kind: str = "event",
     self_identity.display_name 用的也是同一招）。
     """
     item = MemoryItem(
-        memory_id=uuid.uuid4().hex,
+        # R18b：调用方给得出稳定 ID 就用稳定 ID——重试/重放对同一对象是
+        # upsert 覆盖而不是新增一条；不给才退回随机（老调用方行为不变）。
+        memory_id=memory_id or uuid.uuid4().hex,
         session_id=session_id,
         kind=kind,
         content=content,
@@ -898,16 +902,21 @@ class ConversationDistiller:
         S1 启发式：缺点/翻车是负向事件（效价负、唤醒中等），不用烧 LLM。
         """
         if flaw:
+            # R18b：稳定对象 ID——同一缺点重复记是 upsert 覆盖同一条，不会因
+            # 任务重试/重放在向量库里堆出重复条目。ID 由内容决定，可复算。
+            digest = hashlib.sha1(flaw.encode("utf-8")).hexdigest()[:16]
             self._remember(session_id, f"他的缺点/翻车：{flaw}", "user_flaw", 4,
-                           valence=-0.6, arousal=0.5)
+                           valence=-0.6, arousal=0.5,
+                           memory_id=f"flaw-{session_id}-{digest}")
 
     def _remember(self, session_id: str, content: str, kind: str, importance: int,
                   feeling: str = "", appraisal: str = "",
-                  valence: float = 0.0, arousal: float = 0.3) -> None:
+                  valence: float = 0.0, arousal: float = 0.3,
+                  memory_id: str = "") -> None:
         """沉淀一条长期记忆。真身在模块级 remember_note（G5 也要用，见那里的注释）。"""
         remember_note(session_id, content, kind=kind, importance=importance,
                       feeling=feeling, appraisal=appraisal,
-                      valence=valence, arousal=arousal)
+                      valence=valence, arousal=arousal, memory_id=memory_id)
 
 
 def _arc_from_entries(entries: list, limit: int = 3, now=None) -> str:

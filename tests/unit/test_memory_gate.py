@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from capability import char_life, self_identity
-from capability.memory import MemoryGatekeeper, PortraitBuilder
+from capability.memory import ConversationDistiller, MemoryGatekeeper, PortraitBuilder
 from tools.storage import KVStoreTool
 
 
@@ -676,3 +676,41 @@ def test_update_verdict_drops_keep_cache(kv):
     g.process("t11j", "city", "杭州", quote="户口都迁过去了", confidence=0.9,
               source_message_id="m4")
     assert get_db()._conn.execute("SELECT COUNT(*) FROM arbitration_keep").fetchone()[0] == 0
+
+# ------------------- R18b：外部向量 upsert 用稳定对象 ID -------------------
+
+def test_remember_flaw_stable_object_id(kv, register_services):
+    """R18b：同一缺点重复记忆必须落在同一个稳定对象 ID 上（重试=upsert 覆盖，
+    不是新增一条）。"""
+    captured = []
+
+    class _CapVS:
+        def upsert_memory(self, item):
+            captured.append(item.memory_id)
+            return True
+
+    register_services(vector_store=_CapVS())
+    ConversationDistiller().remember_flaw("t18b", "总是迟到")
+    ConversationDistiller().remember_flaw("t18b", "总是迟到")
+    ConversationDistiller().remember_flaw("t18b", "说话不算数")
+    assert len(captured) == 3
+    assert captured[0] == captured[1], "同一缺点两次记忆必须同一 ID"
+    assert captured[0].startswith("flaw-t18b-")
+    assert captured[2] != captured[0], "不同缺点是不同对象"
+
+
+def test_revision_memory_stable_object_id(kv, register_services):
+    """R18b：改口记忆的稳定 ID 由（槽位+旧值+新值）决定，重试不堆重复。"""
+    captured = []
+
+    class _CapVS:
+        def upsert_memory(self, item):
+            captured.append(item.memory_id)
+            return True
+
+    register_services(vector_store=_CapVS())
+    ev = {"key": "name", "old": "小雪", "new": "柚子"}
+    self_identity._remember_revision("t18c", dict(ev))
+    self_identity._remember_revision("t18c", dict(ev))
+    assert len(captured) == 2 and captured[0] == captured[1]
+    assert captured[0].startswith("rev-t18c-")

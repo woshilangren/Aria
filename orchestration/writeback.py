@@ -54,18 +54,44 @@ def schedule_commit_tasks(receipt: dict, tasks: list) -> list:
 
     不能继续把"旧 handle 被新轮取消"当作丢弃旧已提交任务的理由：
     调度资格只看回执，不看 handle 状态（取消语义归 CommitGate）。
+
+    R18b：幂等升级为**存储原子裁决**——每个待办包一层领取守卫（claim→执行→
+    失败退回），任务键带目标范围。重试/重放/重启后同键任务最多应用一次；
+    并发领取由 derived_task_done 的主键裁决，不靠进程内约定。
     """
     if receipt.get("status") != "committed":
         return []
     turn_id = receipt.get("turn_id") or ""
     runnable = []
     for task in tasks:
-        key = make_task_key(turn_id, task.kind)
+        key = make_task_key(turn_id, task.kind, getattr(task, "target", ""))
         if key in _COMMIT_TASK_REGISTRY:
             continue  # 幂等：同轮同类任务只登记一次
         _COMMIT_TASK_REGISTRY[key] = {"turn_id": turn_id, "kind": task.kind}
-        runnable.append(task.fn)
+        runnable.append(_claimed(key, task.fn))
     return runnable
+
+
+def _claimed(key: str, fn) -> object:
+    """给待办包领取守卫（R18b）：领取成功才执行，失败退回标记再抛。
+
+    生成（LLM 抽取等）可重复，但"应用结果"必须幂等：同键任务第二次进来
+    领取失败直接跳过，不重复命中候选、不重复修订身份、不重复追加事件记忆。
+    """
+
+    def _run():
+        from data.sqlite_store import get_db
+
+        db = get_db()
+        if not db.claim_task(key):
+            return  # 已被应用过（重放/并发领取失败）：什么都不做
+        try:
+            fn()
+        except BaseException:
+            db.release_task(key)  # 领取≠完成：失败退回，下次还能重试
+            raise
+
+    return _run
 
 
 def pending_commit_tasks() -> dict:
@@ -246,6 +272,7 @@ class WritebackCoordinator:
                 ]
                 tasks.append(DeferredTask(
                     kind=TASK_PORTRAIT,
+                    target=str(ctx[-1]["id"]) if ctx else "",  # R18b：来源范围=窗口末条消息
                     fn=lambda: PortraitBuilder().refresh(turn.session_id, ctx)))
             her_lines = [
                 r.get("text", "")

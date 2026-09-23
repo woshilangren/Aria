@@ -50,6 +50,7 @@ class DeferredTask:
 
     kind: str
     fn: Callable
+    target: str = ""  # R18b：目标版本/来源范围（如画像窗口的最后一条消息 id）
 
 
 @dataclass

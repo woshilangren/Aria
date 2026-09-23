@@ -29,6 +29,7 @@ G 批次的核心教训（12 轮真机 turn 1 实测）：她一句话交代了�
 （compose 注入"由你定下"的指令，她随时可以在预算内补）。
 """
 
+import hashlib
 import re
 
 from shared.singletons import services
@@ -221,7 +222,13 @@ def _remember_revision(session_id: str, ev: dict) -> None:
         # 延迟 import 破环：memory → quirks → char_life → self_identity
         from capability.memory import remember_note
 
-        remember_note(session_id, line, kind="event", importance=4)
+        # R18b：稳定对象 ID（改口事件 = 槽位+旧值+新值 决定，可复算）——
+        # 身份冻结任务重试不会在向量库里堆出重复的改口记忆。
+        digest = hashlib.sha1(
+            f"{key}|{ev.get('old') or ''}|{ev.get('new') or ''}".encode("utf-8")
+        ).hexdigest()[:16]
+        remember_note(session_id, line, kind="event", importance=4,
+                      memory_id=f"rev-{session_id}-{digest}")
     except Exception:
         pass
 
