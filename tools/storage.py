@@ -875,6 +875,48 @@ class KVStoreTool:
             print(f"[kv] 关系账本修剪失败（保持原样，一条没删）：{exc}")
             return 0
 
+    # ------------------- R19a：持久待办队列门面 -------------------
+    #
+    # J12 补偿队列的真身（pending_writes 表，v4 迁移）。设计要点：
+    # - task_id 由生产方**确定性构造**，主键防重复登记——重复 enqueue 是幂等
+    #   的（返回 False），不是错误；
+    # - payload 是**本地数据保护对象**：完整可重建字段，只在这张表里，绝不进
+    #   日志、不进 /health 返回；
+    # - 消费/租约/退避在 R19c 接线，本批先提供登记、查询与人工重新入队。
+
+    def enqueue_pending(self, task_id: str, kind: str, payload: dict,
+                        source_turn_id: str = "", payload_version: int = 1) -> bool:
+        """登记一条待办。重复 task_id 幂等跳过（返回 False），不覆盖旧载荷。"""
+        from data.sqlite_store import get_db
+        from datetime import datetime as _dt
+
+        if not task_id or not kind:
+            raise ValueError(f"pending_writes 登记 task_id/kind 不能为空: {task_id!r}/{kind!r}")
+        now = _dt.now().isoformat(timespec="seconds")
+        return get_db().enqueue_pending(
+            task_id=task_id, kind=kind, payload=payload,
+            source_turn_id=source_turn_id, payload_version=payload_version, now=now,
+        )
+
+    def get_pending(self, task_id: str):
+        """按 task_id 查询待办（含完整 payload）。返回 dict 或 None。
+
+        ⚠ payload 含业务原文：只供补偿/修复路径取用，禁止打日志。"""
+        from data.sqlite_store import get_db
+
+        return get_db().get_pending(task_id)
+
+    def requeue_pending(self, task_id: str) -> bool:
+        """人工重新入队：status 回 pending、当前预算清零重新计，累计审计保留。
+
+        旧尝试的审计（attempts_total、last_error、updated_at）不清除——
+        "人工重试保留旧尝试审计并开始一轮明确的自动重试预算"。"""
+        from data.sqlite_store import get_db
+        from datetime import datetime as _dt
+
+        return get_db().requeue_pending(
+            task_id, now=_dt.now().isoformat(timespec="seconds"))
+
     def prune_candidates(self, days: int = 14) -> int:
         """放弃入池超过 N 天还没晋升的记忆候选，返回清理条数（E1）。
 

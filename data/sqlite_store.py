@@ -199,6 +199,33 @@ _MIGRATIONS: tuple = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_keep_session ON arbitration_keep(session_id, field)",
     ),
+    (
+    # ---------------- R19a：持久待办队列（跨重启的可靠补偿） ----------------
+    # J12/R04 的补偿挂点从"探测门面、没有就退化成日志"升级为真表。task_id 由
+    # 生产方**确定性构造**（同语义任务同 ID），主键天然防重复登记。
+    # 状态机：pending →（领取执行）→ done / exhausted；格式坏 → blocked（保留
+    # 原文待人工，不无限烧 API）。attempts=当前重试预算计数（人工重试清零），
+    # attempts_total=累计审计（永不清零）。任务原文受本地数据保护：
+    # **不进日志、不进 health 返回**——门面只按 task_id 取用。
+    """
+    CREATE TABLE IF NOT EXISTS pending_writes (
+        task_id         TEXT PRIMARY KEY,
+        kind            TEXT NOT NULL,
+        source_turn_id  TEXT DEFAULT '',
+        payload_version INTEGER NOT NULL DEFAULT 1,
+        payload         TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        attempts_total  INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        lease_until     TEXT DEFAULT '',
+        last_error      TEXT DEFAULT '',
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_pw_status_time ON pending_writes(status, next_attempt_at)",
+    ),
 )
 
 # 当前代码期望的 schema 版本 = 迁移批次数（每批把版本 +1）
@@ -919,6 +946,61 @@ class SQLiteStorage:
             self._conn.execute(
                 "UPDATE memory_candidates SET promoted=1 WHERE id=?", (cand_id,)
             )
+
+    # ------------------- R19a：pending_writes 数据层 -------------------
+
+    def enqueue_pending(self, *, task_id: str, kind: str, payload: dict,
+                        source_turn_id: str = "", payload_version: int = 1,
+                        now: str) -> bool:
+        """登记待办。task_id 主键防重复：已存在返回 False（幂等，不覆盖旧载荷）。"""
+        import json as _json
+
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO pending_writes "
+                "(task_id, kind, source_turn_id, payload_version, payload, status, "
+                " attempts, attempts_total, next_attempt_at, lease_until, last_error, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, '', '', ?, ?)",
+                (task_id, kind, source_turn_id, payload_version,
+                 _json.dumps(payload, ensure_ascii=False), now, now, now),
+            )
+            return cur.rowcount > 0
+
+    def get_pending(self, task_id: str):
+        """按 task_id 取待办（payload 反序列化回 dict）。没有返回 None。"""
+        import json as _json
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id, kind, source_turn_id, payload_version, payload, status, "
+                "attempts, attempts_total, next_attempt_at, lease_until, last_error, "
+                "created_at, updated_at FROM pending_writes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = _json.loads(row[4])
+        except ValueError:
+            payload = None  # 载荷坏了交给消费侧标 blocked，这里不抛
+        return {
+            "task_id": row[0], "kind": row[1], "source_turn_id": row[2],
+            "payload_version": row[3], "payload": payload, "status": row[5],
+            "attempts": row[6], "attempts_total": row[7],
+            "next_attempt_at": row[8], "lease_until": row[9],
+            "last_error": row[10], "created_at": row[11], "updated_at": row[12],
+        }
+
+    def requeue_pending(self, task_id: str, now: str) -> bool:
+        """人工重新入队：当前预算清零（attempts_total 审计保留），立即到期。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE pending_writes SET status='pending', attempts=0, "
+                "next_attempt_at=?, lease_until='' WHERE task_id = ?",
+                (now, task_id),
+            )
+            return cur.rowcount > 0
 
     def prune_candidates(self, days: int = 14) -> int:
         """入池超过 N 天还没晋升的候选：放弃（证据不足）。返回清理条数。
