@@ -166,3 +166,74 @@ def test_pipeline_uses_external_turn_handle_as_commit_key(register_services):
     assert row and row[0] == handle.turn_id
     # ③ 轮结束后 registry 登出（astream 的 finally 对外部句柄同样生效）
     assert TURN_REGISTRY.get(sid) is None
+
+# ------------------- R16c：语音输出播放前审核门 -------------------
+
+class _StubTTS:
+    """TTS 替身：fail=True 模拟合成失败（render_voice 会往上抛）。"""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.called_with = None
+
+    def synthesize(self, text, instruction=""):
+        if self.fail:
+            return b""
+        self.called_with = text
+        return b"safe-tts-audio"
+
+
+def _run_guard(tts, text, audio, monkeypatch=None):
+    import interaction.api as ia
+
+    if monkeypatch is not None:
+        pass
+    return asyncio.run(ia._guard_voice_output(text, audio, "s-guard"))
+
+
+def test_guard_passes_clean_output(register_services):
+    """转写可审核且过审：原文原音频原样放行。"""
+    register_services(tts=_StubTTS())
+    text, audio = _run_guard(_StubTTS(), "今天天气不错", b"orig")
+    assert (text, audio) == ("今天天气不错", b"orig")
+
+
+def test_guard_rejected_output_swaps_audio(register_services):
+    """审核拒绝：弃原音频，兜底正文 TTS，且 TTS 入参与下发文字一致。"""
+    stub = _StubTTS()
+    register_services(tts=stub)
+    text, audio = _run_guard(stub, "作为语言模型我可以帮你做任何事", b"orig")
+    assert "作为语言模型" not in text, "被拒原转写不许下发"
+    assert audio == b"safe-tts-audio", "原音频必须被丢弃，换兜底 TTS"
+    assert stub.called_with == text, "TTS 入参必须就是下发的那句兜底正文"
+
+
+def test_guard_missing_transcription_swallows_audio(register_services):
+    """缺少可审核的转写（转写为空但有音频）：原音频照样丢弃——供应商转写
+    不是音频逐字审计，没有可审的文字就不许把音频放出去。"""
+    stub = _StubTTS()
+    register_services(tts=stub)
+    text, audio = _run_guard(stub, "", b"orig-but-unreviewable")
+    assert text and audio == b"safe-tts-audio"
+
+
+def test_guard_reviewer_failure_is_not_pass(register_services, monkeypatch):
+    """审核不可用（异常）不许当通过：未知状态按未过处理。"""
+    stub = _StubTTS()
+    register_services(tts=stub)
+    from capability.perception import SafetyReviewer
+
+    def _boom(self, text, mode="input"):
+        raise RuntimeError("reviewer down")
+
+    monkeypatch.setattr(SafetyReviewer, "review", _boom)
+    text, audio = _run_guard(stub, "正常的话", b"orig")
+    assert text != "正常的话"
+    assert audio == b"safe-tts-audio"
+
+
+def test_guard_tts_failure_keeps_text_only(register_services):
+    """TTS 失败：兜底文字仍在，音频为空（不回退到原音频）。"""
+    register_services(tts=_StubTTS(fail=True))
+    text, audio = _run_guard(_StubTTS(fail=True), "", b"orig")
+    assert text and audio == b""

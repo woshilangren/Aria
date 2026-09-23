@@ -517,6 +517,42 @@ async def upload_file(file: UploadFile = File(...)) -> dict:
 voice_router = APIRouter(prefix="/api/voice", tags=["voice"])
 
 
+async def _guard_voice_output(reply_text: str, audio: bytes, session_id: str) -> tuple:
+    """R16c：语音输出在原音频下发前的统一审核门（e2e/realtime 路由共用）。
+
+    cascade 走管道句级审核，不经这里。规则（R16c）：
+    - 助手转写可审核且过审 → 原文原音频放行；
+    - 缺少可审核的转写 / 审核拒绝 / 审核不可用（异常=未知状态，**不许当通过**）
+      → 丢弃原音频，用同一安全兜底正文重新 TTS；
+    - TTS 失败只保留文字；
+    - 绝不用原音频承载修改后的文字。
+    """
+    text = (reply_text or "").strip()
+    ok = False
+    if text:
+        try:
+            from capability.perception import SafetyReviewer
+
+            ok, _reason = await asyncio.to_thread(SafetyReviewer().review, text, "output")
+        except Exception as exc:
+            logging.getLogger("aria").warning("[voice] 语音输出审核不可用，按未过处理: %r", exc)
+            ok = False
+    if ok:
+        return reply_text, audio
+    from orchestration.managers import FallbackController
+
+    safe_text = FallbackController().fallback_reply("voice_route")
+    safe_audio = b""
+    try:
+        safe_audio = await asyncio.to_thread(
+            _get_gateway()["renderer"].render_voice, safe_text, session_id
+        )
+    except Exception as exc:
+        # TTS 失败只保留文字（兜底正文本身是固定安全文案）
+        logging.getLogger("aria").warning("[voice] 兜底正文 TTS 失败，只发文字: %r", exc)
+    return safe_text, safe_audio
+
+
 @voice_router.websocket("/stream")
 async def voice_stream(websocket: WebSocket) -> None:
     """实时语音双向通道，三条路由共用这个端点。
@@ -602,6 +638,9 @@ async def voice_stream(websocket: WebSocket) -> None:
                 await asyncio.to_thread(
                     _realtime_writeback, session_id, user_text, reply_text, emotion
                 )
+                # R16c：原音频下发前过审核门（拒绝/缺转写/审核不可用→
+                # 弃原音频换兜底正文 TTS）
+                reply_text, audio = await _guard_voice_output(reply_text, audio, session_id)
             elif route == ROUTE_REALTIME:
                 from tools.realtime import RealtimeDialogClient
                 from tools.misc import ClockTool
@@ -633,6 +672,8 @@ async def voice_stream(websocket: WebSocket) -> None:
                 )
                 if user_text:
                     await stream.send_text(f"我听到的是：{user_text}")
+                # R16c：原音频下发前过审核门
+                reply_text, audio = await _guard_voice_output(reply_text, audio, session_id)
             else:
                 gateway = _get_gateway()
                 message = await asyncio.to_thread(
