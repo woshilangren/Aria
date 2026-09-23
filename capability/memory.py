@@ -586,30 +586,10 @@ class PortraitBuilder:
             limit = mem_cfg["portrait_tag_limit"]
             threshold = float(mem_cfg.get("profile_confidence_threshold", 0.6))
 
-            gate = MemoryGatekeeper()  # E5：无状态小对象，用到才建
             distiller = None
-            # 硬事实入库（S4/E3）：标量和列表**都**走"候选→晋升→仲裁"闸门，绝不直接入档。
-            # 列表字段逐项入池（apply_fact 的合并语义在晋升后由闸门以 [项] 传值保留）——
-            # 以前列表单次 LLM 输出直通入档+入向量库，是幻觉焊死最宽的一扇门
-            for fact in data.get("hard_facts") or []:
-                if not isinstance(fact, dict):
-                    continue
-                try:
-                    confidence = float(fact.get("confidence", 0))
-                except (TypeError, ValueError):
-                    continue
-                field = str(fact.get("field", "")).strip()
-                value = fact.get("value")
-                if not field or value in (None, ""):
-                    continue
-                quote = str(fact.get("quote") or "")  # E5：原话一路带到仲裁员面前
-                if isinstance(value, list):
-                    for item in value:
-                        item = str(item or "").strip()
-                        if item:
-                            gate.process(session_id, field, item, quote=quote, confidence=confidence)
-                else:
-                    gate.process(session_id, field, str(value), quote=quote, confidence=confidence)
+            # 硬事实入库（S4/E3）：标量和列表**都**走"候选→晋升→仲裁"闸门，绝不直接入档
+            # （闸门与同批去重见 _emit_facts，R11a 抽出）
+            self._emit_facts(session_id, data.get("hard_facts") or [])
 
             # 画像整包读改写走原子闭包（F3）：锁内只做纯合并计算，
             # 期间别的写方（语音写回/巡检）落的字段不会被这次覆盖掉
@@ -647,6 +627,42 @@ class PortraitBuilder:
                 distiller.remember_flaw(session_id, flaw)
         except Exception as exc:
             logger.warning(f"[memory] 画像刷新失败（下轮再试，指纹未计数会自动重试）: {exc}")
+
+    def _emit_facts(self, session_id: str, facts: list) -> None:
+        """把一次抽取出的 hard_facts 逐项送进闸门（R11a 重构出独立方法）。
+
+        R11a：同批去重——同一次抽取里同字段同值（按与 candidate_hit **同一套**
+        归一化，杭州/杭州市算同一件）最多命中一次。以前一个窗口里模型把"杭州"
+        提两遍就 hits=2 直达晋升门槛，"≥2 次独立出现"被同批重复架空；列表字段
+        内部重复、列表与标量混报同样覆盖。
+        """
+        if not facts:
+            return
+        from data.sqlite_store import get_db
+
+        gate = MemoryGatekeeper()  # E5：无状态小对象，用到才建
+        seen_in_batch: set = set()
+        for fact in facts:
+            if not isinstance(fact, dict):
+                continue
+            try:
+                confidence = float(fact.get("confidence", 0))
+            except (TypeError, ValueError):
+                continue
+            field = str(fact.get("field", "")).strip()
+            value = fact.get("value")
+            if not field or value in (None, ""):
+                continue
+            quote = str(fact.get("quote") or "")  # E5：原话一路带到仲裁员面前
+            items = [str(x or "").strip() for x in value] if isinstance(value, list)                 else [str(value)]
+            for item in items:
+                if not item:
+                    continue
+                batch_key = (field, get_db().candidate_key(item))
+                if batch_key in seen_in_batch:
+                    continue
+                seen_in_batch.add(batch_key)
+                gate.process(session_id, field, item, quote=quote, confidence=confidence)
 
     @staticmethod
     def _merge(old_list, new_list, limit: int) -> list:

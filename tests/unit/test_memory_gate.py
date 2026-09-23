@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from capability import char_life, self_identity
-from capability.memory import MemoryGatekeeper
+from capability.memory import MemoryGatekeeper, PortraitBuilder
 from tools.storage import KVStoreTool
 
 
@@ -476,3 +476,41 @@ def test_diary_compose_marks_degraded_rows(kv):
     t = captured["content"]
     assert "（这轮回复失败）：这轮没接上" in t, "降级轮必须带客观标注"
     assert "晴天呢" in t
+
+# ------------------- R11a：同批去重止损 -------------------
+
+def test_same_batch_duplicate_counts_once(kv):
+    """R11a：同一次抽取里同字段同值最多命中一次——同批重复不许凑次数。
+
+    以前一个窗口里模型把"杭州"提两遍（两条 fact / 列表里两项）就 hits=2
+    直达晋升门槛，"≥2 次独立出现"被同批重复架空。杭州/杭州市按 candidate_hit
+    同一套归一化算同一件。"""
+    from data.sqlite_store import get_db
+
+    PortraitBuilder()._emit_facts("t11a", [
+        {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
+        {"field": "city", "value": "杭州市", "confidence": 0.9, "quote": "我住在杭州"},
+        {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
+        {"field": "likes", "value": ["咖啡", "咖啡"], "confidence": 0.9, "quote": "我只喝咖啡"},
+    ])
+    rows = get_db()._conn.execute(
+        "SELECT field, content, hits FROM memory_candidates WHERE session_id='t11a' ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2, f"同批去重后只应剩 city+likes 两条候选，实测 {rows}"
+    assert all(r[2] == 1 for r in rows), f"每条候选 hits 必须=1，实测 {rows}"
+
+
+def test_cross_batch_still_accumulates(kv):
+    """R11a 只砍同批重复：跨批次（两次独立抽取）照样正常累积，不误伤晋升闸。"""
+    from data.sqlite_store import get_db
+
+    PortraitBuilder()._emit_facts("t11b", [
+        {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
+    ])
+    PortraitBuilder()._emit_facts("t11b", [
+        {"field": "city", "value": "杭州市", "confidence": 0.9, "quote": "我住杭州市"},
+    ])
+    rows = get_db()._conn.execute(
+        "SELECT hits FROM memory_candidates WHERE session_id='t11b'"
+    ).fetchall()
+    assert rows == [(2,)], f"跨批两次独立出现应累积 hits=2，实测 {rows}"

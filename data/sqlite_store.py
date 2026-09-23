@@ -275,6 +275,16 @@ def _candidate_key(text: str) -> str:
 class SQLiteStorage:
     """项目唯一的 SQLite 入口：建库、迁移 schema、读写都从这走。"""
 
+    @staticmethod
+    def candidate_key(text: str) -> str:
+        """候选命中归一化 key 的公开门面（R11a）。
+
+        capability 层做"同批同字段同值只数一次"的批内去重时，必须用与
+        candidate_hit **同一套**归一化（杭州/杭州市算同一件事），否则两套
+        口径会互相打架。这是只读纯函数，不走锁。
+        """
+        return _candidate_key(text)
+
     def __init__(self):
         cfg = get_settings()
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
