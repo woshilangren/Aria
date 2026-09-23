@@ -526,8 +526,13 @@ async def voice_stream(websocket: WebSocket) -> None:
     主对话管道再合成音频，realtime 直连实时专线（连接时注入记忆、每轮写回）。
     文本帧除了 END 还可以发 {"voice": "音色名"}，给实时专线当场换音色。
     回复文字和音频分帧推回去。
+
+    R16a：接收与生成分离——VoiceReceiver 是这条连接唯一的 receive 协程，
+    把音频/文本帧/断连分发成事件；生成期间断连立刻可见（不再等几十秒的
+    ASR+LLM 跑完才收摊），连续上传的音频受原 10 MB 防线约束，超限明确
+    丢弃。cascade 轮的句柄由连接自己持有，断连时按轮 ID 点名取消。
     """
-    from interaction.voice import VoiceStreamIO
+    from interaction.voice import VoiceReceiver, VoiceStreamIO
     from orchestration.managers import ROUTE_E2E, ROUTE_REALTIME, VoiceRouteManager
     from tools.speech import strip_emotion_marks
 
@@ -542,186 +547,190 @@ async def voice_stream(websocket: WebSocket) -> None:
 
     _conn_start = _time.time()
 
+    receiver = VoiceReceiver(stream, max_pending_bytes=_MAX_VOICE_BUFFER_BYTES)
+    receiver.start()
     buffer = b""
     realtime_client = None  # 实时专线客户端跟着这条连接走，切走路由就关掉省资源
+    turn_box = {"handle": None}  # R16a：cascade 轮句柄，连接持有自己的轮 ID
+    overflow_notified = False  # 生成期间上传溢出告知过一次就不再刷屏
+
+    async def _process_round(buf: bytes):
+        """跑一轮语音生成，返回 (reply_text, audio)。路由分发与降级/错误分流
+        原样保留；realtime_client 经 nonlocal 回写，轮句柄进 turn_box。"""
+        nonlocal realtime_client
+
+        route = manager.current_route(session_id)
+        # 切走实时专线就关连接；切回来时会重建，顺便把最新记忆重新注入一遍
+        if route != ROUTE_REALTIME and realtime_client is not None:
+            await realtime_client.close()
+            realtime_client = None
+        try:
+            if route == ROUTE_E2E:
+                from capability.perception import PerceptionPipeline
+                from capability.skills import SpeechDialogEngine
+                from orchestration.pipeline import KEEPER
+
+                # ASR+LLM+TTS 是几十秒的同步网络调用，必须扔线程池，
+                # 不然语音通话期间整个事件循环（所有请求）一起卡死
+                out = await asyncio.to_thread(
+                    SpeechDialogEngine().handle, buf, session_id, audio_fmt, audio_rate
+                )
+                user_text, reply_text, audio = (
+                    out["user_text"],
+                    out["reply_text"],
+                    out["reply_audio"],
+                )
+                print(f"[voice] e2e 识别: {user_text[:40]} | 回复: {reply_text[:40]} | 音频 {len(audio)} bytes")
+                # e2e 也得留痕：感知一次拿情绪标签，写回交给共用的落账函数
+                emotion = ""
+                try:
+                    pipeline = PerceptionPipeline()
+                    # run() 返回 4 元组 (intent, emotion, subtext, extras)——
+                    # 这里以前按 3 个解包，每轮必抛 ValueError 被下面的 except
+                    # 吞掉，e2e 语音写回的 emotion 因此**一直是空串**。
+                    # session_id 要传：感知侧靠它取人设与关系阶段（C5）。
+                    _intent, emo, _subtext, _extras = await asyncio.to_thread(
+                        pipeline.run, user_text,
+                        KEEPER.get_context(session_id)[-4:], session_id
+                    )
+                    emotion = emo.emotion
+                except Exception as exc:
+                    # 感知是补网，挂了不该拦着这轮语音；但**不许静默**——
+                    # 上面那个解包 bug 就是被 pass 藏了不知多久（J2）。
+                    logging.getLogger("aria").warning(
+                        "[voice] e2e 感知失败，本轮 emotion 落空: %r", exc)
+                await asyncio.to_thread(
+                    _realtime_writeback, session_id, user_text, reply_text, emotion
+                )
+            elif route == ROUTE_REALTIME:
+                from tools.realtime import RealtimeDialogClient
+                from tools.misc import ClockTool
+
+                if realtime_client is None:
+                    # instructions 内含向量召回（网络调用），扔线程池——
+                    # 在 WS 协程里同步跑会把整个事件循环冻结数秒（F15）
+                    instructions = await asyncio.to_thread(
+                        _build_realtime_instructions, session_id
+                    )
+                    realtime_client = RealtimeDialogClient(
+                        session_id,
+                        instructions=instructions,
+                    )
+                    await realtime_client.connect()
+                # 每轮刷新时段提示：通话跨时段（深夜别问吃饭）时她才反应得过来
+                _c = ClockTool()
+                realtime_client.set_time_hint(
+                    f"【当前时间】现在是{_c.now()}（{_c.period()}）。{_c.time_guidance()}".rstrip()
+                )
+                await realtime_client.refresh_time_config()
+                out = await realtime_client.round_trip(buf)
+                user_text, reply_text = out["user_text"], out["reply_text"]
+                audio = out.get("reply_audio") or b""
+                print(f"[voice] realtime 识别: {user_text[:40]} | 回复: {reply_text[:40]} | 音频 {len(audio)} bytes")
+                # 写回里有向量库/SQLite 网络与磁盘动作，同样别堵事件循环
+                await asyncio.to_thread(
+                    _realtime_writeback, session_id, user_text, reply_text, out.get("emotion", "")
+                )
+                if user_text:
+                    await stream.send_text(f"我听到的是：{user_text}")
+            else:
+                gateway = _get_gateway()
+                message = await asyncio.to_thread(
+                    gateway["receiver"].receive_voice, buf, session_id, audio_fmt, audio_rate
+                )
+                print(f"[voice] cascade 识别OK: {message.text[:40]}")
+                await stream.send_text(f"我听到的是：{message.text}")
+                # cascade 轮仍登记进轮次表（F10）：挂断/切后台即取消，
+                # 不再"对着空气说完整段话"并写记忆。
+                # R16a：连接自己 start 轮、把句柄递进 handle()——断连时按
+                # 这个轮 ID 点名取消。以前是"主循环里拿 registry 当前轮来
+                # 猜"（I9 实测踩中：外层 start 会把内层顶掉、id 不匹配被
+                # 拒）；现在 astream 接受 turn_handle，不再自己 start。
+                from orchestration.cancellation import TURN_REGISTRY
+
+                turn_box["handle"] = TURN_REGISTRY.start(session_id)
+                task = asyncio.create_task(
+                    _get_orchestrator().handle(message, turn_handle=turn_box["handle"])
+                )
+                reply = await task
+                print(f"[voice] cascade 回复OK: {reply.text[:40]}")
+                audio = b""
+                try:
+                    # 合成用原文：TTS 会把开头的情绪标记拆出来转成指令
+                    audio = await asyncio.to_thread(
+                        gateway["renderer"].render_voice, reply.text, session_id
+                    )
+                    print(f"[voice] cascade TTSOK: {len(audio)} bytes")
+                except Exception:
+                    audio = b""
+                # 标签只给合成器用：推给前端的文字剥干净，不展示标记
+                reply_text = strip_emotion_marks(reply.text)
+        except ExternalServiceError as exc:
+            # R27c：外部服务失败——按供应商故障计路由失败（连续挂够会
+            # 自动降级到级联），用户拿到人设兜底话
+            logging.getLogger("aria").warning(
+                "[voice] 外部服务失败（%s/%s）: %r", exc.source, exc.reason_code, exc)
+            manager.report_failure(session_id)
+            from orchestration.managers import FallbackController
+
+            reply_text = FallbackController().fallback_reply("voice_route")
+            audio = b""
+            # 实时专线这轮砸了，连接可能已经脏了，关掉下轮重建
+            if realtime_client is not None:
+                await realtime_client.close()
+                realtime_client = None
+        except Exception:
+            # R27c：本地缺陷（解析/装配 TypeError 等）——**不计**路由失败、
+            # **不自动切路**（程序错误不是供应商故障，切路救不了它）；
+            # 大声留痕 + 对用户发固定安全文案，绝不冒充外部故障
+            import traceback
+
+            print("[voice] 这一轮内部错误（internal_error）：",
+                  traceback.format_exc(limit=3))
+            reply_text = "这轮没接上，稍后再试试"
+            audio = b""
+            if realtime_client is not None:
+                await realtime_client.close()
+                realtime_client = None
+
+
+        return reply_text, audio
+
     try:
         while True:
-            chunk = await stream.read_chunk()
-            # 空帧是客户端的控制信号，END 表示这段话说完了
-            if not chunk:
-                # 文本帧里可能藏着控制指令（比如换音色），先拆一下再看
-                if stream.last_text:
-                    control = _parse_voice_control(stream.last_text)
-                    stream.last_text = ""
-                    if control:
-                        if realtime_client is not None:
-                            try:
-                                await realtime_client.set_voice(control["voice"])
-                                await stream.send_text(f"音色已换成 {control['voice']}")
-                            except Exception as exc:
-                                # R27a：对外只发固定安全文案——str(exc) 可能带内部
-                                # 细节/供应商响应，经 WS 直接推给客户端等于外泄。
-                                # 原始异常留日志排查。
-                                logging.getLogger("aria").warning("[voice] 换音色失败: %r", exc)
-                                await stream.send_text("换音色没成功，稍后再试试")
-                        else:
-                            await stream.send_text("当前不在实时专线路由上，换音色指令没生效")
-                        continue
+            # 生成期间被预算挡掉的上传：告知一次，别让用户以为说出去的都被接住了
+            if receiver.dropped_bytes and not overflow_notified:
+                overflow_notified = True
+                try:
+                    await stream.send_text("刚才你说的话有一部分没接住，重说一次吧")
+                except Exception:
+                    pass
 
+            kind, payload = await receiver.get()
+            if kind == "disconnect":
+                break
+            if kind == "text":
+                # 文本帧：END / ping / 控制指令——语义与旧循环一致（非控制的
+                # 文本帧在缓冲非空时按"说完了"处理，ping 落在空缓冲时无害）
+                control = _parse_voice_control(payload)
+                if control:
+                    if realtime_client is not None:
+                        try:
+                            await realtime_client.set_voice(control["voice"])
+                            await stream.send_text(f"音色已换成 {control['voice']}")
+                        except Exception as exc:
+                            # R27a：对外只发固定安全文案——str(exc) 可能带内部
+                            # 细节/供应商响应，经 WS 直接推给客户端等于外泄。
+                            # 原始异常留日志排查。
+                            logging.getLogger("aria").warning("[voice] 换音色失败: %r", exc)
+                            await stream.send_text("换音色没成功，稍后再试试")
+                    else:
+                        await stream.send_text("当前不在实时专线路由上，换音色指令没生效")
+                    continue
                 if not buffer:
                     continue
-                route = manager.current_route(session_id)
-                # 切走实时专线就关连接；切回来时会重建，顺便把最新记忆重新注入一遍
-                if route != ROUTE_REALTIME and realtime_client is not None:
-                    await realtime_client.close()
-                    realtime_client = None
-                try:
-                    if route == ROUTE_E2E:
-                        from capability.perception import PerceptionPipeline
-                        from capability.skills import SpeechDialogEngine
-                        from orchestration.pipeline import KEEPER
-
-                        # ASR+LLM+TTS 是几十秒的同步网络调用，必须扔线程池，
-                        # 不然语音通话期间整个事件循环（所有请求）一起卡死
-                        out = await asyncio.to_thread(
-                            SpeechDialogEngine().handle, buffer, session_id, audio_fmt, audio_rate
-                        )
-                        user_text, reply_text, audio = (
-                            out["user_text"],
-                            out["reply_text"],
-                            out["reply_audio"],
-                        )
-                        print(f"[voice] e2e 识别: {user_text[:40]} | 回复: {reply_text[:40]} | 音频 {len(audio)} bytes")
-                        # e2e 也得留痕：感知一次拿情绪标签，写回交给共用的落账函数
-                        emotion = ""
-                        try:
-                            pipeline = PerceptionPipeline()
-                            # run() 返回 4 元组 (intent, emotion, subtext, extras)——
-                            # 这里以前按 3 个解包，每轮必抛 ValueError 被下面的 except
-                            # 吞掉，e2e 语音写回的 emotion 因此**一直是空串**。
-                            # session_id 要传：感知侧靠它取人设与关系阶段（C5）。
-                            _intent, emo, _subtext, _extras = await asyncio.to_thread(
-                                pipeline.run, user_text,
-                                KEEPER.get_context(session_id)[-4:], session_id
-                            )
-                            emotion = emo.emotion
-                        except Exception as exc:
-                            # 感知是补网，挂了不该拦着这轮语音；但**不许静默**——
-                            # 上面那个解包 bug 就是被 pass 藏了不知多久（J2）。
-                            logging.getLogger("aria").warning(
-                                "[voice] e2e 感知失败，本轮 emotion 落空: %r", exc)
-                        await asyncio.to_thread(
-                            _realtime_writeback, session_id, user_text, reply_text, emotion
-                        )
-                    elif route == ROUTE_REALTIME:
-                        from tools.realtime import RealtimeDialogClient
-                        from tools.misc import ClockTool
-
-                        if realtime_client is None:
-                            # instructions 内含向量召回（网络调用），扔线程池——
-                            # 在 WS 协程里同步跑会把整个事件循环冻结数秒（F15）
-                            instructions = await asyncio.to_thread(
-                                _build_realtime_instructions, session_id
-                            )
-                            realtime_client = RealtimeDialogClient(
-                                session_id,
-                                instructions=instructions,
-                            )
-                            await realtime_client.connect()
-                        # 每轮刷新时段提示：通话跨时段（深夜别问吃饭）时她才反应得过来
-                        _c = ClockTool()
-                        realtime_client.set_time_hint(
-                            f"【当前时间】现在是{_c.now()}（{_c.period()}）。{_c.time_guidance()}".rstrip()
-                        )
-                        await realtime_client.refresh_time_config()
-                        out = await realtime_client.round_trip(buffer)
-                        user_text, reply_text = out["user_text"], out["reply_text"]
-                        audio = out.get("reply_audio") or b""
-                        print(f"[voice] realtime 识别: {user_text[:40]} | 回复: {reply_text[:40]} | 音频 {len(audio)} bytes")
-                        # 写回里有向量库/SQLite 网络与磁盘动作，同样别堵事件循环
-                        await asyncio.to_thread(
-                            _realtime_writeback, session_id, user_text, reply_text, out.get("emotion", "")
-                        )
-                        if user_text:
-                            await stream.send_text(f"我听到的是：{user_text}")
-                    else:
-                        gateway = _get_gateway()
-                        message = await asyncio.to_thread(
-                            gateway["receiver"].receive_voice, buffer, session_id, audio_fmt, audio_rate
-                        )
-                        print(f"[voice] cascade 识别OK: {message.text[:40]}")
-                        await stream.send_text(f"我听到的是：{message.text}")
-                        # cascade 轮也登记进轮次表（F10）：生成期间轮询连接状态，
-                        # 挂断/切后台即取消——不再"对着空气说完整段话"并写记忆。
-                        # 注意：这里**不要**自己 start——handle() 内部会 start 内层轮，
-                        # 外层 start 会立刻把内层顶掉、且挂断时按外层 id 取消必然
-                        # id 不匹配被拒（I9，实测踩中）。用 get() 拿当前活跃轮来取消。
-                        from orchestration.cancellation import TURN_REGISTRY
-
-                        task = asyncio.create_task(_get_orchestrator().handle(message))
-                        try:
-                            while not task.done():
-                                done, _pending = await asyncio.wait({task}, timeout=1.0)
-                                if not stream.alive:
-                                    active = TURN_REGISTRY.get(session_id)
-                                    if active is not None:
-                                        TURN_REGISTRY.cancel(session_id, active.turn_id)
-                            reply = await task
-                        finally:
-                            active = TURN_REGISTRY.get(session_id)
-                            if active is not None and not task.cancelled():
-                                pass  # 内层轮由 handle 自己的 finally finish，这里不动
-                        print(f"[voice] cascade 回复OK: {reply.text[:40]}")
-                        audio = b""
-                        try:
-                            # 合成用原文：TTS 会把开头的情绪标记拆出来转成指令
-                            audio = await asyncio.to_thread(
-                                gateway["renderer"].render_voice, reply.text, session_id
-                            )
-                            print(f"[voice] cascade TTSOK: {len(audio)} bytes")
-                        except Exception:
-                            audio = b""
-                        # 标签只给合成器用：推给前端的文字剥干净，不展示标记
-                        reply_text = strip_emotion_marks(reply.text)
-                except ExternalServiceError as exc:
-                    # R27c：外部服务失败——按供应商故障计路由失败（连续挂够会
-                    # 自动降级到级联），用户拿到人设兜底话
-                    logging.getLogger("aria").warning(
-                        "[voice] 外部服务失败（%s/%s）: %r", exc.source, exc.reason_code, exc)
-                    manager.report_failure(session_id)
-                    from orchestration.managers import FallbackController
-
-                    reply_text = FallbackController().fallback_reply("voice_route")
-                    audio = b""
-                    # 实时专线这轮砸了，连接可能已经脏了，关掉下轮重建
-                    if realtime_client is not None:
-                        await realtime_client.close()
-                        realtime_client = None
-                except Exception:
-                    # R27c：本地缺陷（解析/装配 TypeError 等）——**不计**路由失败、
-                    # **不自动切路**（程序错误不是供应商故障，切路救不了它）；
-                    # 大声留痕 + 对用户发固定安全文案，绝不冒充外部故障
-                    import traceback
-
-                    print("[voice] 这一轮内部错误（internal_error）：",
-                          traceback.format_exc(limit=3))
-                    reply_text = "这轮没接上，稍后再试试"
-                    audio = b""
-                    if realtime_client is not None:
-                        await realtime_client.close()
-                        realtime_client = None
-
-                # 回复前客户端可能已经断开（切后台/浏览器杀连接）：
-                # 硬发会炸出 RuntimeError 还刷日志，软处理丢弃结果即可
-                try:
-                    await stream.send_text(reply_text)
-                    if audio:
-                        await stream.play_chunk(audio)
-                except Exception:
-                    print(f"[voice] 回复没送出去：客户端断开了（连接持续 {_time.time() - _conn_start:.0f}s）")
-                buffer = b""
             else:
-                buffer += chunk
+                buffer += payload
                 # 客户端一直发二进制帧却从不发 END，buffer 会无界增长到 OOM：
                 # 到上限就清空并提醒用户，异常咽掉别炸连接
                 if len(buffer) > _MAX_VOICE_BUFFER_BYTES:
@@ -730,6 +739,52 @@ async def voice_stream(websocket: WebSocket) -> None:
                         await stream.send_text("语音太长了，我先截断了，你分几次说吧")
                     except Exception:
                         pass
+                continue
+
+            # ---- 缓冲里有一段完整语音：生成（R16a：断连立刻可见）----
+            # 生成前先看一眼断连：END 后立刻挂断的边角，别对着死连接跑几十秒
+            if receiver.disconnected.is_set():
+                break
+            round_buf, buffer = buffer, b""
+            gen_task = asyncio.create_task(_process_round(round_buf))
+            disc_task = asyncio.ensure_future(receiver.disconnected.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {gen_task, disc_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                if not disc_task.done():
+                    disc_task.cancel()
+            if disc_task in done and not gen_task.done():
+                # 断连先赢：这轮当没发生过。cascade 轮按连接持有的轮 ID 点名
+                # 取消（生成在下一个检查点停）；e2e/realtime 直接弃置结果，
+                # 写回在生成之后才发生，走不到就是没发生。
+                h = turn_box["handle"]
+                if h is not None:
+                    from orchestration.cancellation import TURN_REGISTRY
+
+                    TURN_REGISTRY.cancel(session_id, h.turn_id)
+                gen_task.cancel()
+                try:
+                    await gen_task
+                except BaseException:
+                    pass  # 断连路径：结果本来就不要了（吸收子任务的取消）
+                break
+            try:
+                reply_text, audio = gen_task.result()
+            except Exception:
+                # _process_round 内部已按 R27c 分流；能漏出来的是装配级意外，
+                # 给固定安全文案，不让 WS 循环死掉
+                reply_text, audio = "这轮没接上，稍后再试试", b""
+
+            # 回复前客户端可能已经断开（切后台/浏览器杀连接）：
+            # 硬发会炸出 RuntimeError 还刷日志，软处理丢弃结果即可
+            try:
+                await stream.send_text(reply_text)
+                if audio:
+                    await stream.play_chunk(audio)
+            except Exception:
+                print(f"[voice] 回复没送出去：客户端断开了（连接持续 {_time.time() - _conn_start:.0f}s）")
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -738,8 +793,10 @@ async def voice_stream(websocket: WebSocket) -> None:
         print(f"[voice] 连接断开：{exc}（连接持续 {_time.time() - _conn_start:.0f}s）")
     finally:
         print(f"[voice] 连接关闭（持续 {_time.time() - _conn_start:.0f}s）")
-        # close() 可能抛异常，各自独立包裹：绝不能让它把后面的连接簿清理一起跳过，
-        # 否则 ConnectionKeeper 里会残留死会话
+        # R16a：接收协程/队列/生成任务在此完整清理；close() 可能抛异常，各自
+        # 独立包裹：绝不能让它把后面的连接簿清理一起跳过，否则 ConnectionKeeper
+        # 里会残留死会话
+        receiver.stop()
         if realtime_client is not None:
             try:
                 await realtime_client.close()

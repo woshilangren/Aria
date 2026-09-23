@@ -582,8 +582,11 @@ class DialoguePipeline:
         self._writeback_coord = WritebackCoordinator(keeper=KEEPER)
 
     # ================= 消费者：非流式入口 =================
-    async def handle(self, message: InputMessage) -> FinalReply:
+    async def handle(self, message: InputMessage, turn_handle=None) -> FinalReply:
         """处理一条用户消息，返回最终回复（主入口）。
+
+        turn_handle：R16a，调用方自带的轮句柄（语音连接持有自己的轮 ID 用），
+        原样透传给 astream。
 
         自己不做逻辑，只是 `astream` 的消费者：把事件收起来重拼成 FinalReply。
         text 保留带 `<voice>` 的原文，交给 renderer 去剥标签 + 合成语音，
@@ -602,7 +605,9 @@ class DialoguePipeline:
         # astream 内部 finally 会调 TURN_REGISTRY.finish（详见 CLAUDE.md 关键单例）；
         # 显式 try/finally 保证 error 分支提前 return 时也立即收尾，
         # 避免靠 GC 终结器兜底让登记项短暂滞留。
-        _astream = self.astream(message, synthesize_voice=False, want_voice=False)
+        _astream = self.astream(
+            message, synthesize_voice=False, want_voice=False, turn_handle=turn_handle
+        )
         try:
             async for ev in _astream:
                 t = ev.get("type")
@@ -680,6 +685,7 @@ class DialoguePipeline:
         message: InputMessage,
         synthesize_voice: bool = False,
         want_voice: bool = False,
+        turn_handle=None,
     ) -> AsyncIterator[dict]:
         """处理一条用户消息，逐事件产出（SSE 端点用）。
 
@@ -698,15 +704,22 @@ class DialoguePipeline:
             voice_mode=message.input_mode == "voice",
             user_image=message.image_url or "",
         )
-        # R17b：轮/请求的持久标识——turn_id 跨重启唯一（uuid），request_id 由
-        # 前端带或服务端补（补生成时明确无跨重试去重）；digest 用于同请求
+        # 轮/请求的持久标识：turn_id 跨重启唯一（shared/ids uuid），request_id
+        # 由前端带或服务端补（补生成时明确无跨重试去重）；digest 用于同请求
         # 重放/冲突裁决
-        state.turn_id = new_turn_id()
         state.request_id = message.request_id or f"srv-{new_turn_id()}"
         state.request_digest = hashlib.sha256(
             f"{state.session_id}|{state.request_id}|{message.text or ''}".encode("utf-8")
         ).hexdigest()
-        handle = self._turns.start(message.session_id)
+        # R16a：turn_handle 允许调用方（语音连接）自带轮句柄——连接持有
+        # 自己的轮 ID，断连时点名取消，不用拿 registry 当前轮来猜。给句柄的
+        # 调用方负责先经 TURN_REGISTRY.start 注册（生命周期收尾仍走下面 finally）。
+        handle = turn_handle or self._turns.start(message.session_id)
+        # 轮 ID 的**一把键**：registry 句柄、提交门、PreparedTurn、chat_log、
+        # 前端 start 事件全用这同一个 uuid。R17b 曾在这里另发一个 state.turn_id，
+        # 结果客户端取消的键（handle.turn_id）永远裁不到提交门里的键——注释
+        # 声称"同一把键"而代码有两把（R16a 收口，文档≠代码的又一例）。
+        state.turn_id = handle.turn_id
         seq = itertools.count(1)
         display_parts = []
         voice_emitted = False
