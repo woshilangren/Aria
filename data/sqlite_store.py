@@ -539,11 +539,13 @@ class SQLiteStorage:
                 # ③ 正式记录：user / assistant（空转写不造假行）
                 message_ids = []
                 if user_text:
+                    # R17c：user 行 mode 用本轮参数——文字轮同为 "text" 行为不变，
+                    # 语音轮（ASR 转写）不再被冒充成打字。
                     cur = self._conn.execute(
                         "INSERT INTO chat_log (session_id, role, content, intent, emotion, "
                         "mode, created_at, turn_id, disposition, source_review_status, reason_code) "
                         "VALUES (?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (session_id, user_text, intent, emotion, "text", now,
+                        (session_id, user_text, intent, emotion, mode, now,
                          turn_id, disposition, source_review_status, reason_code),
                     )
                     message_ids.append(cur.lastrowid)

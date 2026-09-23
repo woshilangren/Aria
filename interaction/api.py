@@ -100,47 +100,67 @@ def _build_realtime_instructions(session_id: str) -> str:
     return "\n\n".join(parts)
 
 
-def _realtime_writeback(session_id: str, user_text: str, reply_text: str, emotion: str) -> None:
-    """实时专线聊完一轮，按主对话管道的写回规矩落账。
+_VOICE_COORD = None  # R17c：语音写回协调器（懒建，与文字主链共用 KEEPER/提交门）
 
-    短期记忆、聊天记录、硬事实沉淀、亲密度一样别落，
-    和文字聊天共用同一份短期记忆，两条线才连得起来。
+
+def _voice_writeback_coord():
+    global _VOICE_COORD
+    if _VOICE_COORD is None:
+        from orchestration.pipeline import KEEPER
+        from orchestration.writeback import WritebackCoordinator
+
+        _VOICE_COORD = WritebackCoordinator(keeper=KEEPER)
+    return _VOICE_COORD
+
+
+def _commit_voice_turn(*, session_id: str, user_text: str, reply_text: str,
+                       emotion: str, disposition: str,
+                       source_review_status: str, reason_code: str = "") -> None:
+    """R17c：语音轮写回——e2e/realtime 构造与文字主链相同的 PreparedTurn 走新契约
+    （cascade 轮在管道内部已有完整写回，不经这里）。
+
+    - 缺 emotion/intensity 明确为未知（空串/默认值），**不伪造 neutral 来领取
+      正常更新资格**（writeback 侧对 normal+空 emotion 不发关系增量/账本）；
+    - 提交先行（CommitGate→commit_turn 事务），KEEPER/派生任务在提交成功后由
+      post_commit 按副作用表分流——被拒/降级轮零学习；
+    - 取消/提交失败同样收口在门上，无半轮历史。
     """
-    from capability.memory import ConversationDistiller, RelationshipTracker
+    import hashlib
+
     from orchestration.pipeline import KEEPER
-    from shared.singletons import services
+    from shared.ids import new_turn_id
+    from shared.types import PreparedTurn
     from tools.speech import strip_emotion_marks
 
     if not user_text and not reply_text:
         return
     # 模型就算违规把情绪标记写进了转写文字，落库前也剥干净
-    reply_text = strip_emotion_marks(reply_text)
+    reply_text = strip_emotion_marks(reply_text or "")
+    turn_id = new_turn_id()
+    request_id = f"srv-{new_turn_id()}"
+    digest = hashlib.sha256(
+        f"{session_id}|{request_id}|{user_text or ''}".encode("utf-8")
+    ).hexdigest()
+    turn = PreparedTurn(
+        session_id=session_id,
+        turn_id=turn_id,
+        request_id=request_id,
+        request_digest=digest,
+        user_text=user_text or "",
+        assistant_text=reply_text,
+        disposition=disposition,
+        source_review_status=source_review_status,
+        reason_code=reason_code,
+        intent="",              # 语音路由无意图解析：明确未知
+        emotion=emotion or "",  # 缺=未知，不伪造 neutral
+        mode="voice",
+    )
+    coord = _voice_writeback_coord()
+    await_free = True
+    # KEEPER 冷启动首轮要把整段会话记录捞回内存（与文字主链 astream 同款）
     KEEPER.restore(session_id)
-    if user_text:
-        KEEPER.append(session_id, "user", user_text)
-    if reply_text:
-        KEEPER.append(session_id, "assistant", reply_text)
-
-    try:
-        kv = services.get("kv_store")
-        if user_text:
-            kv.write(
-                "session", session_id,
-                {"role": "user", "text": user_text, "intent": "", "emotion": emotion or "", "mode": "voice"},
-            )
-        if reply_text:
-            kv.write(
-                "session", session_id,
-                {"role": "assistant", "text": reply_text, "intent": "", "emotion": emotion or "", "mode": "voice"},
-            )
-    except Exception:
-        pass  # 落库失败不打断通话
-
-    try:
-        ConversationDistiller().distill_turn(session_id, user_text)
-        RelationshipTracker().update(session_id, emotion or "neutral")
-    except Exception:
-        pass
+    receipt = coord.commit_prepared(turn)
+    coord.post_commit(turn, receipt)
 
 
 def _parse_voice_control(text: str) -> dict:
@@ -518,7 +538,7 @@ voice_router = APIRouter(prefix="/api/voice", tags=["voice"])
 
 
 async def _guard_voice_output(reply_text: str, audio: bytes, session_id: str) -> tuple:
-    """R16c：语音输出在原音频下发前的统一审核门（e2e/realtime 路由共用）。
+    """R16c/R17c：语音输出在原音频下发前的统一审核门（e2e/realtime 路由共用）。
 
     cascade 走管道句级审核，不经这里。规则（R16c）：
     - 助手转写可审核且过审 → 原文原音频放行；
@@ -526,9 +546,14 @@ async def _guard_voice_output(reply_text: str, audio: bytes, session_id: str) ->
       → 丢弃原音频，用同一安全兜底正文重新 TTS；
     - TTS 失败只保留文字；
     - 绝不用原音频承载修改后的文字。
+
+    返回 (下发正文, 下发音频, 审核分类, 原因码)——审核分类随写回进
+    PreparedTurn.source_review_status（R17c：文字与语音同分类契约）。
     """
     text = (reply_text or "").strip()
     ok = False
+    reason_code = ""
+    review_status = "accepted"
     if text:
         try:
             from capability.perception import SafetyReviewer
@@ -537,8 +562,16 @@ async def _guard_voice_output(reply_text: str, audio: bytes, session_id: str) ->
         except Exception as exc:
             logging.getLogger("aria").warning("[voice] 语音输出审核不可用，按未过处理: %r", exc)
             ok = False
+            review_status = "unavailable"
+            reason_code = "voice_review_unavailable"
+    else:
+        review_status = "unavailable"
+        reason_code = "voice_transcription_missing"
     if ok:
-        return reply_text, audio
+        return reply_text, audio, "accepted", ""
+    if review_status == "accepted":
+        review_status = "rejected"
+        reason_code = "voice_output_review_blocked"
     from orchestration.managers import FallbackController
 
     safe_text = FallbackController().fallback_reply("voice_route")
@@ -550,7 +583,7 @@ async def _guard_voice_output(reply_text: str, audio: bytes, session_id: str) ->
     except Exception as exc:
         # TTS 失败只保留文字（兜底正文本身是固定安全文案）
         logging.getLogger("aria").warning("[voice] 兜底正文 TTS 失败，只发文字: %r", exc)
-    return safe_text, safe_audio
+    return safe_text, safe_audio, review_status, reason_code
 
 
 @voice_router.websocket("/stream")
@@ -635,12 +668,19 @@ async def voice_stream(websocket: WebSocket) -> None:
                     # 上面那个解包 bug 就是被 pass 藏了不知多久（J2）。
                     logging.getLogger("aria").warning(
                         "[voice] e2e 感知失败，本轮 emotion 落空: %r", exc)
-                await asyncio.to_thread(
-                    _realtime_writeback, session_id, user_text, reply_text, emotion
-                )
                 # R16c：原音频下发前过审核门（拒绝/缺转写/审核不可用→
-                # 弃原音频换兜底正文 TTS）
-                reply_text, audio = await _guard_voice_output(reply_text, audio, session_id)
+                # 弃原音频换兜底正文 TTS），审核分类随 R17c 进写回
+                reply_text, audio, review_status, review_reason = await _guard_voice_output(
+                    reply_text, audio, session_id
+                )
+                # R17c：写回统一走 PreparedTurn（审核分类决定副作用表）
+                await asyncio.to_thread(
+                    _commit_voice_turn,
+                    session_id=session_id, user_text=user_text, reply_text=reply_text,
+                    emotion=emotion,
+                    disposition="normal" if review_status == "accepted" else "degraded",
+                    source_review_status=review_status, reason_code=review_reason,
+                )
             elif route == ROUTE_REALTIME:
                 from tools.realtime import RealtimeDialogClient
                 from tools.misc import ClockTool
@@ -666,14 +706,19 @@ async def voice_stream(websocket: WebSocket) -> None:
                 user_text, reply_text = out["user_text"], out["reply_text"]
                 audio = out.get("reply_audio") or b""
                 print(f"[voice] realtime 识别: {user_text[:40]} | 回复: {reply_text[:40]} | 音频 {len(audio)} bytes")
-                # 写回里有向量库/SQLite 网络与磁盘动作，同样别堵事件循环
-                await asyncio.to_thread(
-                    _realtime_writeback, session_id, user_text, reply_text, out.get("emotion", "")
-                )
                 if user_text:
                     await stream.send_text(f"我听到的是：{user_text}")
-                # R16c：原音频下发前过审核门
-                reply_text, audio = await _guard_voice_output(reply_text, audio, session_id)
+                # R16c：原音频下发前过审核门；R17c 分类随写回进 PreparedTurn
+                reply_text, audio, review_status, review_reason = await _guard_voice_output(
+                    reply_text, audio, session_id
+                )
+                await asyncio.to_thread(
+                    _commit_voice_turn,
+                    session_id=session_id, user_text=user_text, reply_text=reply_text,
+                    emotion=out.get("emotion", ""),
+                    disposition="normal" if review_status == "accepted" else "degraded",
+                    source_review_status=review_status, reason_code=review_reason,
+                )
             else:
                 gateway = _get_gateway()
                 message = await asyncio.to_thread(
@@ -1103,7 +1148,7 @@ def _ws_origin_ok(scope) -> bool:
     `new WebSocket("ws://127.0.0.1:8000/api/voice/stream")`。而 `.env.example`
     推荐的"本机/内网自用可留空口令"模式下 `_TokenGuard` 是全站放行的，
     于是她浏览的任意恶意页面都能：烧掉真金白银的 ASR/LLM/TTS 额度、
-    并以她的身份往记忆和日记里写东西（`_realtime_writeback`）。
+    并以她的身份往记忆和日记里写东西（`_commit_voice_turn`，R17c 起）。
     这道门必须放在 token 判定**之前**，因为恰恰是 token 为空时最需要它。
 
     放行规则：

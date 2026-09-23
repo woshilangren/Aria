@@ -183,29 +183,29 @@ class _StubTTS:
         return b"safe-tts-audio"
 
 
-def _run_guard(tts, text, audio, monkeypatch=None):
+def _run_guard(tts, text, audio):
     import interaction.api as ia
 
-    if monkeypatch is not None:
-        pass
     return asyncio.run(ia._guard_voice_output(text, audio, "s-guard"))
 
 
 def test_guard_passes_clean_output(register_services):
-    """转写可审核且过审：原文原音频原样放行。"""
+    """转写可审核且过审：原文原音频原样放行，审核分类 accepted。"""
     register_services(tts=_StubTTS())
-    text, audio = _run_guard(_StubTTS(), "今天天气不错", b"orig")
+    text, audio, status, reason = _run_guard(_StubTTS(), "今天天气不错", b"orig")
     assert (text, audio) == ("今天天气不错", b"orig")
+    assert (status, reason) == ("accepted", "")
 
 
 def test_guard_rejected_output_swaps_audio(register_services):
-    """审核拒绝：弃原音频，兜底正文 TTS，且 TTS 入参与下发文字一致。"""
+    """审核拒绝：弃原音频，兜底正文 TTS，TTS 入参与下发文字一致，分类 rejected。"""
     stub = _StubTTS()
     register_services(tts=stub)
-    text, audio = _run_guard(stub, "作为语言模型我可以帮你做任何事", b"orig")
+    text, audio, status, reason = _run_guard(stub, "作为语言模型我可以帮你做任何事", b"orig")
     assert "作为语言模型" not in text, "被拒原转写不许下发"
     assert audio == b"safe-tts-audio", "原音频必须被丢弃，换兜底 TTS"
     assert stub.called_with == text, "TTS 入参必须就是下发的那句兜底正文"
+    assert status == "rejected" and reason == "voice_output_review_blocked"
 
 
 def test_guard_missing_transcription_swallows_audio(register_services):
@@ -213,8 +213,9 @@ def test_guard_missing_transcription_swallows_audio(register_services):
     不是音频逐字审计，没有可审的文字就不许把音频放出去。"""
     stub = _StubTTS()
     register_services(tts=stub)
-    text, audio = _run_guard(stub, "", b"orig-but-unreviewable")
+    text, audio, status, reason = _run_guard(stub, "", b"orig-but-unreviewable")
     assert text and audio == b"safe-tts-audio"
+    assert status == "unavailable" and reason == "voice_transcription_missing"
 
 
 def test_guard_reviewer_failure_is_not_pass(register_services, monkeypatch):
@@ -227,13 +228,114 @@ def test_guard_reviewer_failure_is_not_pass(register_services, monkeypatch):
         raise RuntimeError("reviewer down")
 
     monkeypatch.setattr(SafetyReviewer, "review", _boom)
-    text, audio = _run_guard(stub, "正常的话", b"orig")
+    text, audio, status, _reason = _run_guard(stub, "正常的话", b"orig")
     assert text != "正常的话"
     assert audio == b"safe-tts-audio"
+    assert status == "unavailable"
 
 
 def test_guard_tts_failure_keeps_text_only(register_services):
     """TTS 失败：兜底文字仍在，音频为空（不回退到原音频）。"""
     register_services(tts=_StubTTS(fail=True))
-    text, audio = _run_guard(_StubTTS(fail=True), "", b"orig")
+    text, audio, _status, _reason = _run_guard(_StubTTS(fail=True), "", b"orig")
     assert text and audio == b""
+
+# ------------------- R17c：语音写回切 PreparedTurn 新契约 -------------------
+
+@pytest.fixture()
+def kv():
+    from tools.storage import KVStoreTool
+
+    return KVStoreTool()
+
+
+def _stub_learner(monkeypatch):
+    """打掉 post_commit normal 分支的重依赖（蒸馏/画像），聚焦写回契约本身。"""
+    from orchestration import writeback as wb
+
+    monkeypatch.setattr(wb, "ConversationDistiller", lambda: type(
+        "D", (), {"distill_turn": lambda *a, **k: None})())
+
+
+def test_voice_turn_normal_with_emotion_commits(kv, register_services, monkeypatch):
+    """R17c：语音轮（emotion 已知）走 PreparedTurn——chat_log 落 mode=voice
+    正式记录 + 关系增量；身份/分类与文字主链同一套。"""
+    import interaction.api as ia
+    from data.sqlite_store import get_db
+
+    register_services(kv_store=kv)
+    _stub_learner(monkeypatch)
+    ia._commit_voice_turn(
+        session_id="r17c-voice", user_text="今天好开心", reply_text="那太好了",
+        emotion="happy", disposition="normal",
+        source_review_status="accepted",
+    )
+    db = get_db()
+    rows = db._conn.execute(
+        "SELECT role, mode, disposition, source_review_status FROM chat_log "
+        "WHERE session_id = 'r17c-voice' ORDER BY id"
+    ).fetchall()
+    assert [r[0] for r in rows] == ["user", "assistant"], "user/assistant 正式记录各一条"
+    assert all(r[1] == "voice" for r in rows), "语音轮必须落 mode=voice"
+    assert all(r[2] == "normal" and r[3] == "accepted" for r in rows)
+    # emotion 已知：领取关系更新资格（relationship 有增量）
+    rel = kv.read("relationship", "r17c-voice") or {}
+    assert rel.get("interaction_count") == 1, "emotion 已知的 normal 轮该有关系增量"
+
+
+def test_voice_turn_unknown_emotion_gets_no_relationship(kv, register_services, monkeypatch):
+    """R17c 核心条款：缺 emotion 明确为未知，不伪造 neutral 领取关系更新资格。
+
+    语音路由感知不到情绪时照样落正式历史（对话发生过），但 relationship
+    一个格子都不许动——旧 _realtime_writeback 用 `emotion or "neutral"` 白领
+    "平平常常聊了一会儿"的增量。
+    """
+    import interaction.api as ia
+    from data.sqlite_store import get_db
+
+    register_services(kv_store=kv)
+    _stub_learner(monkeypatch)
+    ia._commit_voice_turn(
+        session_id="r17c-noemo", user_text="喂", reply_text="嗯",
+        emotion="", disposition="normal",
+        source_review_status="accepted",
+    )
+    rows = get_db()._conn.execute(
+        "SELECT disposition, emotion FROM chat_log WHERE session_id = 'r17c-noemo'"
+    ).fetchall()
+    assert rows and all(r[0] == "normal" for r in rows)
+    assert all((r[1] or "") == "" for r in rows), "不许把 neutral 写进聊天记录冒充已知"
+    rel = kv.read("relationship", "r17c-noemo")
+    assert not rel, "缺 emotion 的 normal 轮不许领取关系更新资格"
+
+
+def test_voice_turn_rejected_is_degraded_no_learning(kv, register_services, monkeypatch):
+    """R17c：审核拒绝的语音轮 = degraded——兜底正文落正式记录，零关系增量。"""
+    import interaction.api as ia
+    from data.sqlite_store import get_db
+
+    register_services(kv_store=kv)
+    _stub_learner(monkeypatch)
+    ia._commit_voice_turn(
+        session_id="r17c-rej", user_text="说点违规的", reply_text="这个话题我不能聊",
+        emotion="", disposition="degraded",
+        source_review_status="rejected", reason_code="voice_output_review_blocked",
+    )
+    rows = get_db()._conn.execute(
+        "SELECT disposition, source_review_status, reason_code FROM chat_log "
+        "WHERE session_id = 'r17c-rej'"
+    ).fetchall()
+    assert rows and all(r[0] == "degraded" for r in rows)
+    assert all(r[1] == "rejected" and r[2] == "voice_output_review_blocked" for r in rows)
+    assert not kv.read("relationship", "r17c-rej"), "degraded 轮零关系增量"
+
+def test_voice_stream_route_is_registered():
+    """回归闸：`@voice_router.websocket("/stream")` 装饰器曾被"替换装饰器
+    紧贴的函数"吃掉两次（R16c 把审核门插进装饰器与端点之间、R17c 重写审核门
+    时连装饰器一起换掉）——WS 握手秒断 1000/1008，集成测试才抓到。
+    路由必须真的注册在 voice_router 上。"""
+    from interaction.api import voice_router
+    from starlette.routing import WebSocketRoute
+
+    ws_paths = [r.path for r in voice_router.routes if isinstance(r, WebSocketRoute)]
+    assert "/api/voice/stream" in ws_paths, f"voice WS 端点没注册，现有路由: {ws_paths}"

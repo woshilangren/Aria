@@ -167,6 +167,11 @@ class WritebackCoordinator:
         - normal：关系纯计算 + intimacy 账本（与正式记录同一事务）；
         - degraded / crisis：只落正式记录——无关系增量、无账本、无学习任务。
         """
+        # R17c：emotion 为空 = 调用方明确"未知"（语音路由常有）——不许在门内
+        # 伪造 neutral 领取关系更新资格：该轮照常落历史与学习，但无关系增量、
+        # 无账本。
+        normal = turn.disposition == "normal"
+        has_emotion = bool((turn.emotion or "").strip())
         return self._gate.run_commit(turn.turn_id, fn=lambda: self._kv().commit_turn(
             session_id=turn.session_id,
             turn_id=turn.turn_id,
@@ -180,9 +185,9 @@ class WritebackCoordinator:
             intent=turn.intent,
             emotion=turn.emotion,
             mode=turn.mode,
-            relation_fn=self._relation_fn(turn) if turn.disposition == "normal" else None,
+            relation_fn=self._relation_fn(turn) if (normal and has_emotion) else None,
             relation_ledger=(self._LEDGER_REASONS.get(turn.emotion or "neutral", "又聊了一轮")
-                             if turn.disposition == "normal" else ""),
+                             if (normal and has_emotion) else ""),
             ledger_event_id=turn.turn_id,
         ))
 
