@@ -182,11 +182,19 @@ def test_r15a_legacy_v1_db_upgraded_keeping_rows(tmp_path, monkeypatch):
 
     db_path = tmp_path / "knowledge.db"  # get_db() 只认这个名字
     conn = s3.connect(db_path)
-    # 手工搭 v1 schema：只建 chat_log 与账本（老列、无新列），user_version=1
+    # 手工搭 v1 schema：只建 chat_log / 账本 / 候选池（老列、无新列），user_version=1。
+    # R11b 起 v3 要给 memory_candidates 加列，所以这张 v0 表也必须在假库里——
+    # 不然升的不是"真实 v1 库"而是"残缺库"，迁移失败是假库的错不是代码的错。
     conn.execute(
         "CREATE TABLE chat_log (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,"
         " role TEXT NOT NULL, content TEXT NOT NULL, intent TEXT DEFAULT '', emotion TEXT DEFAULT '',"
         " mode TEXT DEFAULT '', created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE memory_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL, field TEXT NOT NULL, content TEXT NOT NULL,"
+        " quote TEXT DEFAULT '', hits INTEGER NOT NULL DEFAULT 1, first_seen TEXT NOT NULL,"
+        " promoted INTEGER NOT NULL DEFAULT 0)"
     )
     conn.execute(
         "CREATE TABLE affection_history (id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -249,3 +257,13 @@ def test_new_turn_id_never_collides():
     ids = {sm.new_turn_id() for _ in range(1000)}
     assert len(ids) == 1000
     assert all(isinstance(i, str) and len(i) == 32 for i in ids)
+
+def test_r11b_fresh_db_has_source_and_cache_structures():
+    """R11b/R11c：新库自带候选来源列与仲裁 keep 缓存表。"""
+    store = sm.get_db()
+    cols = [r[1] for r in store._conn.execute("PRAGMA table_info(memory_candidates)")]
+    assert "source_ids" in cols, f"候选表缺 source_ids 列: {cols}"
+    tables = _objects(store, "table")
+    assert "arbitration_keep" in tables
+    idx = _objects(store, "index")
+    assert "idx_keep_session" in idx

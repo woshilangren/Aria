@@ -400,8 +400,15 @@ class MemoryGatekeeper:
     _LIST_MERGE_FIELDS = frozenset({"likes", "dislikes", "notable_facts", "health_notes"})
 
     def process(self, session_id: str, field: str, content: str,
-                quote: str = "", confidence: float = 0.0) -> None:
+                quote: str = "", confidence: float = 0.0,
+                source_message_id: str = "") -> None:
         from data.sqlite_store import get_db
+
+        # R11b：无法归属到真实用户消息的抽取不算新增证据——直接不进池。
+        # 引文对不上原话的"事实"本来就该可疑（提示词承诺 quote 是真实原话）。
+        if not str(source_message_id or "").strip():
+            logger.info(f"[memory] 无来源消息 id 的抽取不入池（field={field}）")
+            return
 
         threshold = float(load_app_config()["memory"].get("profile_confidence_threshold", 0.6))
         try:
@@ -414,7 +421,8 @@ class MemoryGatekeeper:
         if not content:
             return
         try:
-            hits, cand_id = get_db().candidate_hit(session_id, field, content, quote)
+            hits, cand_id = get_db().candidate_hit(session_id, field, content, quote,
+                                                   source_message_id=source_message_id)
         except Exception as exc:
             logger.warning(f"[memory] 候选池写入失败，本轮放弃（field={field}）: {exc}")
             return  # 候选池挂了，本轮放弃（和记忆写入同一兜底哲学）
@@ -588,8 +596,16 @@ class PortraitBuilder:
 
             distiller = None
             # 硬事实入库（S4/E3）：标量和列表**都**走"候选→晋升→仲裁"闸门，绝不直接入档
-            # （闸门与同批去重见 _emit_facts，R11a 抽出）
-            self._emit_facts(session_id, data.get("hard_facts") or [])
+            # （闸门与同批去重见 _emit_facts，R11a 抽出）。
+            # R11b：证据必须能归属到真实用户消息——窗口里的 (消息id, 原文) 就是
+            # 归属池，quote 对不上的抽取不算新增证据，直接丢弃。
+            source_pool = [
+                (str(t.get("id") or ""), str(t.get("content") or ""))
+                for t in (recent_dialogues or [])
+                if t.get("role") == "user" and t.get("id")
+            ]
+            self._emit_facts(session_id, data.get("hard_facts") or [],
+                             source_pool=source_pool)
 
             # 画像整包读改写走原子闭包（F3）：锁内只做纯合并计算，
             # 期间别的写方（语音写回/巡检）落的字段不会被这次覆盖掉
@@ -628,16 +644,38 @@ class PortraitBuilder:
         except Exception as exc:
             logger.warning(f"[memory] 画像刷新失败（下轮再试，指纹未计数会自动重试）: {exc}")
 
-    def _emit_facts(self, session_id: str, facts: list) -> None:
+    @staticmethod
+    def _attribute_source(quote: str, source_pool: list) -> str:
+        """把抽取引文对应回真实用户消息，返回 chat_log 消息 id（R11b）。
+
+        匹配规则：引文（去空白后）是某条用户消息原文的子串，取**最早**命中的一条
+        ——引文是消息的节选，不是反过来。对不上的返回空串（调用方丢弃该抽取）。
+        绝不以内容哈希或数组下标冒充来源。
+        """
+        q = (quote or "").strip()
+        if not q:
+            return ""
+        for mid, content in source_pool:
+            if q in content:
+                return str(mid)
+        return ""
+
+    def _emit_facts(self, session_id: str, facts: list, source_pool: list = None) -> list:
         """把一次抽取出的 hard_facts 逐项送进闸门（R11a 重构出独立方法）。
 
         R11a：同批去重——同一次抽取里同字段同值（按与 candidate_hit **同一套**
         归一化，杭州/杭州市算同一件）最多命中一次。以前一个窗口里模型把"杭州"
         提两遍就 hits=2 直达晋升门槛，"≥2 次独立出现"被同批重复架空；列表字段
         内部重复、列表与标量混报同样覆盖。
+
+        R11b：source_pool 是窗口内用户消息的 (消息id, 原文) 列表——引文对应不上
+        真实消息的抽取**不算新增证据**，直接丢弃（提示词里本来就要求 quote 必须
+        是记录里真实出现过的原话，这里是对该承诺的机器校验）。返回被接受的
+        (field, item, source_id) 供测试观察。
         """
+        accepted: list = []
         if not facts:
-            return
+            return accepted
         from data.sqlite_store import get_db
 
         gate = MemoryGatekeeper()  # E5：无状态小对象，用到才建
@@ -654,6 +692,10 @@ class PortraitBuilder:
             if not field or value in (None, ""):
                 continue
             quote = str(fact.get("quote") or "")  # E5：原话一路带到仲裁员面前
+            source_id = self._attribute_source(quote, source_pool or [])
+            if not source_id:
+                logger.info(f"[memory] 抽取无法归属到真实用户消息，丢弃（field={field}）")
+                continue
             items = [str(x or "").strip() for x in value] if isinstance(value, list)                 else [str(value)]
             for item in items:
                 if not item:
@@ -662,7 +704,10 @@ class PortraitBuilder:
                 if batch_key in seen_in_batch:
                     continue
                 seen_in_batch.add(batch_key)
-                gate.process(session_id, field, item, quote=quote, confidence=confidence)
+                gate.process(session_id, field, item, quote=quote, confidence=confidence,
+                             source_message_id=source_id)
+                accepted.append((field, item, source_id))
+        return accepted
 
     @staticmethod
     def _merge(old_list, new_list, limit: int) -> list:

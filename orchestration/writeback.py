@@ -240,7 +240,8 @@ class WritebackCoordinator:
             learnable = kv.recent_chat(turn.session_id, 100, learnable=True)
             if rel.get("interaction_count", 0) % interval == 0:
                 ctx = [
-                    {"role": r.get("role"), "content": r.get("text", "")}
+                    {"role": r.get("role"), "content": r.get("text", ""),
+                     "id": r.get("id")}  # R11b：消息 id 供证据归属
                     for r in learnable[-6:]
                 ]
                 tasks.append(DeferredTask(

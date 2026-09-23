@@ -177,6 +177,28 @@ _MIGRATIONS: tuple = (
     lambda c: _add_column(c, "affection_history", "new_value", "TEXT DEFAULT ''"),
     lambda c: _add_column(c, "affection_history", "event_id", "TEXT DEFAULT ''"),
     ),
+    (
+    # ---------------- R11b/R11c：稳定来源证据与仲裁 keep 复用 ----------------
+    # 候选来源：每条候选记录给它投过票的 chat_log 消息 id（JSON 数组）——
+    # 同一来源消息重复命中（窗口重叠/重试/重启重放）不再增加 hits；
+    # 证据键 = (session, field, normalized_value, source_message_id)。
+    # 旧行 source_ids 读作 '[]'（legacy 候选按无来源对待，不回填假装能归属）。
+    lambda c: _add_column(c, "memory_candidates", "source_ids", "TEXT DEFAULT '[]'"),
+    # 仲裁 keep 复用缓存（R11c）：相同证据集合 + 相同档案版本复用 keep 裁决，
+    # 不再付费仲裁；新的独立证据或档案变化可重新仲裁。quotes 存归一化引文集。
+    """
+    CREATE TABLE IF NOT EXISTS arbitration_keep (
+        cache_key  TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        field      TEXT NOT NULL,
+        value_key  TEXT NOT NULL,
+        old_value  TEXT NOT NULL,
+        quotes     TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_keep_session ON arbitration_keep(session_id, field)",
+    ),
 )
 
 # 当前代码期望的 schema 版本 = 迁移批次数（每批把版本 +1）
@@ -733,7 +755,7 @@ class SQLiteStorage:
     # ---------- 记忆候选池（S4）：入池计数 / 晋升标记 / 过期清理 ----------
 
     def candidate_hit(self, session_id: str, field: str, content: str,
-                      quote: str = "") -> tuple:
+                      quote: str = "", source_message_id: str = "") -> tuple:
         """同内容候选命中一次：已在池则 hits+1，不在则入池。返回 (hits, id)。
 
         E6：命中判定走归一化 key（_normalize_candidate），**入池的 content 仍是原文**
@@ -741,27 +763,49 @@ class SQLiteStorage:
 
         为什么不用 SQL 直接比 content，而是把该 (session, field) 下未晋升的候选
         全捞出来在 Python 侧比：剥行政尾缀/全半角这类规则 SQL 表达不了；
-        另加一列存 key 又要动 schema（迁移批次）。而单个 field 的候选本来就被
-        prune_candidates 的 14 天过期压得很小（个位数量级），全捞不心疼。
+        而单个 field 的候选本来就被 prune_candidates 的 14 天过期压得很小
+        （个位数量级），全捞不心疼。
+
+        R11b：source_message_id 是本次证据的来源消息 id（chat_log.id）。同一来源
+        消息重复命中（窗口重叠/重试/重启重放）**不增加 hits**——证据键
+        (session, field, normalized_value, source_message_id) 天然去重；来源 id
+        记进候选的 source_ids，仲裁与审计都能对得上真实消息。source_message_id
+        为空时按旧行为计数（调用方 gate 已把"无法归属"的抽取挡在门外）。
         """
         key = _candidate_key(content)
+        now = datetime.now().isoformat(timespec="seconds")
         with self._lock, self._conn:
             rows = self._conn.execute(
-                "SELECT id, hits, content FROM memory_candidates "
+                "SELECT id, hits, content, source_ids FROM memory_candidates "
                 "WHERE session_id=? AND field=? AND promoted=0",
                 (session_id, field),
             ).fetchall()
-            for cand_id, hits, stored in rows:
-                if _candidate_key(stored) == key:
-                    self._conn.execute(
-                        "UPDATE memory_candidates SET hits=hits+1 WHERE id=?", (cand_id,)
-                    )
-                    return hits + 1, cand_id
+            for cand_id, hits, stored, source_ids_json in rows:
+                if _candidate_key(stored) != key:
+                    continue
+                try:
+                    source_ids = json.loads(source_ids_json or "[]")
+                    if not isinstance(source_ids, list):
+                        source_ids = []
+                except ValueError:
+                    source_ids = []
+                if source_message_id and source_message_id in source_ids:
+                    # R11b：同一来源消息的重复投票不算新证据
+                    return hits, cand_id
+                if source_message_id:
+                    source_ids.append(source_message_id)
+                self._conn.execute(
+                    "UPDATE memory_candidates SET hits=hits+1, source_ids=? WHERE id=?",
+                    (json.dumps(source_ids, ensure_ascii=False), cand_id),
+                )
+                return hits + 1, cand_id
             cur = self._conn.execute(
-                "INSERT INTO memory_candidates (session_id, field, content, quote, hits, first_seen) "
-                "VALUES (?, ?, ?, ?, 1, ?)",
-                (session_id, field, content, quote[:200],
-                 datetime.now().isoformat(timespec="seconds")),
+                "INSERT INTO memory_candidates "
+                "(session_id, field, content, quote, hits, first_seen, source_ids) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (session_id, field, content, quote[:200], now,
+                 json.dumps([source_message_id] if source_message_id else [],
+                            ensure_ascii=False)),
             )
             return 1, cur.lastrowid
 
@@ -884,7 +928,7 @@ class SQLiteStorage:
         用默认全量（降级轮的兜底正文是真实发布过的）。
         """
         with self._lock:
-            sql = ("SELECT role, content, intent, emotion, mode, created_at FROM chat_log "
+            sql = ("SELECT id, role, content, intent, emotion, mode, created_at FROM chat_log "
                    "WHERE session_id = ?")
             params: list = [session_id]
             if learnable:
@@ -896,12 +940,13 @@ class SQLiteStorage:
         # 倒序取的，翻回来才是对话本来的顺序
         return [
             {
-                "role": r[0],
-                "text": r[1],
-                "intent": r[2],
-                "emotion": r[3],
-                "mode": r[4],
-                "time": r[5],
+                "id": r[0],  # R11b：chat_log 行 id——证据归属的真实来源键
+                "role": r[1],
+                "text": r[2],
+                "intent": r[3],
+                "emotion": r[4],
+                "mode": r[5],
+                "time": r[6],
             }
             for r in reversed(rows)
         ]

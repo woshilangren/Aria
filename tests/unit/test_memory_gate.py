@@ -48,17 +48,17 @@ class _ScriptedLLM:
 def test_candidate_needs_two_hits(kv):
     g = MemoryGatekeeper()
     # 第一次：入池，不入档（证据不足）
-    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m1")
     assert not (kv.read("profile", "t1") or {}).get("city")
     # 第二次：达到门槛 → 仲裁 update → 入档
-    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m2")
     assert (kv.read("profile", "t1") or {}).get("city") == "杭州"
 
 
 def test_confidence_floor_rejects(kv):
-    MemoryGatekeeper().process("t1", "city", "杭州", confidence=0.3)
+    MemoryGatekeeper().process("t1", "city", "杭州", confidence=0.3, source_message_id="m1")
     kv_arb = MemoryGatekeeper()
-    kv_arb.process("t1", "city", "杭州", confidence=0.5)  # 两次都低置信
+    kv_arb.process("t1", "city", "杭州", confidence=0.5, source_message_id="m2")  # 两次都低置信
     assert not (kv.read("profile", "t1") or {}).get("city")
 
 
@@ -67,8 +67,8 @@ def test_arbitration_keep_preserves_old_value(kv):
     g = MemoryGatekeeper()
     kv.scripted_llm.arbitrate_action = "keep"
     # 第一次入池 + 第二次达到门槛 → 仲裁 keep → 旧值保留
-    g.process("t1", "city", "杭州", confidence=0.9)
-    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m1")
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m2")
     assert (kv.read("profile", "t1") or {}).get("city") == "上海"
 
 
@@ -76,8 +76,8 @@ def test_arbitration_update_replaces_old(kv):
     kv.write("profile", "t1", {"city": "上海"})
     g = MemoryGatekeeper()
     kv.scripted_llm.arbitrate_action = "update"
-    g.process("t1", "city", "杭州", confidence=0.9)
-    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m1")
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m2")
     assert (kv.read("profile", "t1") or {}).get("city") == "杭州"
 
 
@@ -91,8 +91,8 @@ def test_arbitration_failure_retries(kv):
     kv.write("profile", "t1", {"city": "上海"})
     kv.scripted_llm.arbitration_down = True
     g = MemoryGatekeeper()
-    g.process("t1", "city", "杭州", confidence=0.9)
-    g.process("t1", "city", "杭州", confidence=0.9)
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m1")
+    g.process("t1", "city", "杭州", confidence=0.9, source_message_id="m2")
     assert (kv.read("profile", "t1") or {}).get("city") == "上海"  # 旧值没动
     # 候选仍在池里（下次出现可重试）
     from data.sqlite_store import get_db
@@ -487,12 +487,13 @@ def test_same_batch_duplicate_counts_once(kv):
     同一套归一化算同一件。"""
     from data.sqlite_store import get_db
 
+    pool = [("101", "我住在杭州，气候还行"), ("102", "我只喝咖啡")]
     PortraitBuilder()._emit_facts("t11a", [
         {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
         {"field": "city", "value": "杭州市", "confidence": 0.9, "quote": "我住在杭州"},
         {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
         {"field": "likes", "value": ["咖啡", "咖啡"], "confidence": 0.9, "quote": "我只喝咖啡"},
-    ])
+    ], source_pool=pool)
     rows = get_db()._conn.execute(
         "SELECT field, content, hits FROM memory_candidates WHERE session_id='t11a' ORDER BY id"
     ).fetchall()
@@ -504,13 +505,74 @@ def test_cross_batch_still_accumulates(kv):
     """R11a 只砍同批重复：跨批次（两次独立抽取）照样正常累积，不误伤晋升闸。"""
     from data.sqlite_store import get_db
 
+    pool = [("201", "我住在杭州"), ("202", "我住杭州市，习惯了")]
     PortraitBuilder()._emit_facts("t11b", [
         {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "我住在杭州"},
-    ])
+    ], source_pool=pool)
     PortraitBuilder()._emit_facts("t11b", [
         {"field": "city", "value": "杭州市", "confidence": 0.9, "quote": "我住杭州市"},
-    ])
+    ], source_pool=pool)
     rows = get_db()._conn.execute(
         "SELECT hits FROM memory_candidates WHERE session_id='t11b'"
     ).fetchall()
     assert rows == [(2,)], f"跨批两次独立出现应累积 hits=2，实测 {rows}"
+
+# ------------------- R11b：稳定来源证据 -------------------
+
+def test_same_source_message_does_not_double_count(kv):
+    """R11b：同一来源消息重复命中（窗口重叠/重试/重放）不增加 hits。
+
+    证据键 = (session, field, normalized_value, source_message_id)——同一条
+    消息对同一候选只有一票。"""
+    from data.sqlite_store import get_db
+
+    db = get_db()
+    g = MemoryGatekeeper()
+    g.process("t11c", "city", "杭州", quote="我住在杭州", confidence=0.9,
+              source_message_id="m1")
+    hits1, _ = db.candidate_hit("t11c", "city", "杭州", source_message_id="m1")
+    hits2, _ = db.candidate_hit("t11c", "city", "杭州市", source_message_id="m1")
+    assert hits1 == 1 and hits2 == 1, f"同源重复不许涨 hits，实测 {hits1}/{hits2}"
+    # 换一条真实新消息：正常累积
+    hits3, _ = db.candidate_hit("t11c", "city", "杭州", source_message_id="m2")
+    assert hits3 == 2
+    # 来源 id 留痕可审计
+    row = db._conn.execute(
+        "SELECT source_ids FROM memory_candidates WHERE session_id='t11c'"
+    ).fetchone()
+    import json as _json
+
+    assert sorted(_json.loads(row[0])) == ["m1", "m2"]
+
+
+def test_unattributable_extraction_is_dropped(kv):
+    """R11b：引文对应不上真实用户消息的抽取不算新增证据——丢弃，不入池。"""
+    from data.sqlite_store import get_db
+
+    accepted = PortraitBuilder()._emit_facts("t11d", [
+        {"field": "city", "value": "杭州", "confidence": 0.9, "quote": "编造的原话"},
+        {"field": "city", "value": "上海", "confidence": 0.9, "quote": ""},
+    ], source_pool=[("301", "我住在杭州")])
+    assert accepted == [], f"对不上来源的抽取必须全弃，实测 {accepted}"
+    rows = get_db()._conn.execute(
+        "SELECT * FROM memory_candidates WHERE session_id='t11d'"
+    ).fetchall()
+    assert rows == [], "不许入池"
+
+
+def test_gate_rejects_missing_source_id(kv):
+    """R11b：闸门拒绝无来源消息 id 的抽取（守门不靠调用方自觉）。"""
+    from data.sqlite_store import get_db
+
+    MemoryGatekeeper().process("t11e", "city", "杭州", confidence=0.9)
+    rows = get_db()._conn.execute(
+        "SELECT * FROM memory_candidates WHERE session_id='t11e'"
+    ).fetchall()
+    assert rows == []
+
+
+def test_recent_chat_rows_carry_message_id(kv):
+    """R11b：历史读口带 chat_log 行 id——证据归属的真实来源键。"""
+    _insert_chat_row("t11f", "user", "我住在杭州", "normal")
+    rows = kv.recent_chat("t11f", 10)
+    assert rows and isinstance(rows[-1]["id"], int), f"行必须带 id，实测 {rows[-1]}"
