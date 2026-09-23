@@ -77,6 +77,9 @@ def _claimed(key: str, fn) -> object:
 
     生成（LLM 抽取等）可重复，但"应用结果"必须幂等：同键任务第二次进来
     领取失败直接跳过，不重复命中候选、不重复修订身份、不重复追加事件记忆。
+
+    R19b：应用成功后把 pending_writes 里同 ID 的登记行标 done——该任务不再
+    会被消费者重试；应用失败行留在 pending（attempts 由消费者累计）。
     """
 
     def _run():
@@ -90,6 +93,7 @@ def _claimed(key: str, fn) -> object:
         except BaseException:
             db.release_task(key)  # 领取≠完成：失败退回，下次还能重试
             raise
+        db.finish_pending(key)
 
     return _run
 
@@ -215,7 +219,52 @@ class WritebackCoordinator:
             relation_ledger=(self._LEDGER_REASONS.get(turn.emotion or "neutral", "又聊了一轮")
                              if (normal and has_emotion) else ""),
             ledger_event_id=turn.turn_id,
+            pending_tasks=self._planned_tasks(turn, has_emotion),
         ))
+
+    def _planned_tasks(self, turn: PreparedTurn, has_emotion: bool) -> list:
+        """R19b：预先可知的后台任务清单——作为 commit_turn 的提交参数在同一
+        短事务里 INSERT（禁止提交后单独 enqueue 冒充原子登记）。执行仍在提交后。
+
+        与 post_commit 的 DeferredTask 用**同一个 task_id**（make_task_key）：
+        执行成功 → pending 行标 done；失败/进程死 → 行留在 pending 给 R19c
+        消费者按预算重试。
+        """
+        if turn.disposition != "normal":
+            return []
+        tasks = []
+        try:
+            rel = self._kv().read("relationship", turn.session_id) or {}
+            # 正常轮提交即 interaction_count+1（R15b 纯计算），画像节拍按
+            # 提交后的计数判定——与 post_commit 原判定口径一致
+            new_count = rel.get("interaction_count", 0) + 1
+            if new_count % _portrait_interval() == 0:
+                tasks.append(self._pending_desc(
+                    turn, TASK_PORTRAIT,
+                    payload={"session_id": turn.session_id,
+                             "window_scope": "learnable_last_6"}))
+        except Exception as exc:
+            print(f"[writeback] 画像任务登记预判失败（本轮不登记画像任务）: {exc}")
+        tasks.append(self._pending_desc(
+            turn, TASK_IDENTITY_FREEZE,
+            payload={"session_id": turn.session_id, "has_emotion": has_emotion}))
+        try:
+            if self._keeper.has_pending_summary(turn.session_id):
+                tasks.append(self._pending_desc(
+                    turn, TASK_SUMMARY,
+                    payload={"session_id": turn.session_id}))
+        except Exception as exc:
+            print(f"[writeback] 摘要任务登记预判失败（本轮不登记摘要任务）: {exc}")
+        return tasks
+
+    @staticmethod
+    def _pending_desc(turn: PreparedTurn, kind: str, payload: dict) -> dict:
+        return {
+            "task_id": make_task_key(turn.turn_id, kind),
+            "kind": kind,
+            "source_turn_id": turn.turn_id,
+            "payload": payload,
+        }
 
     def post_commit(self, turn: PreparedTurn, receipt: dict) -> list:
         """提交成功后的内存与派生动作（8.11.3 原子边界 5：SQLite 成功才更新
@@ -272,7 +321,6 @@ class WritebackCoordinator:
                 ]
                 tasks.append(DeferredTask(
                     kind=TASK_PORTRAIT,
-                    target=str(ctx[-1]["id"]) if ctx else "",  # R18b：来源范围=窗口末条消息
                     fn=lambda: PortraitBuilder().refresh(turn.session_id, ctx)))
             her_lines = [
                 r.get("text", "")

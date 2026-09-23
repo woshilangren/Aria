@@ -906,6 +906,12 @@ class KVStoreTool:
 
         return get_db().get_pending(task_id)
 
+    def finish_pending(self, task_id: str) -> bool:
+        """应用成功标 done（R19b）：该任务不再会被消费者重试。"""
+        from data.sqlite_store import get_db
+
+        return get_db().finish_pending(task_id)
+
     def requeue_pending(self, task_id: str) -> bool:
         """人工重新入队：status 回 pending、当前预算清零重新计，累计审计保留。
 

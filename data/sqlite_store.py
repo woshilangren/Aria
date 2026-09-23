@@ -534,6 +534,7 @@ class SQLiteStorage:
                     relation_ledger: str = "",
                     ledger_event_id: str = "",
                     ledger: Optional[dict] = None,
+                    pending_tasks: Optional[List[dict]] = None,
                     created_at: Optional[str] = None) -> dict:
         """一轮提交 = **一个短事务**：请求登记 → user/assistant 正式记录 →
         关系原子更新 → 账本 → 提交回执。任何一步失败整体回滚——无半轮、
@@ -666,6 +667,22 @@ class SQLiteStorage:
                          json.dumps(ledger.get("old_value"), ensure_ascii=False)[:500],
                          json.dumps(ledger.get("new_value"), ensure_ascii=False)[:500],
                          ledger.get("event_id", "")),
+                    )
+                # ⑤.5 R19b：预先可知的后台任务在本事务内登记——提交与登记
+                # 同生共死：提交成功任务必然在册，回滚则登记一并消失。禁止
+                # "提交后单独 enqueue 冒充原子登记"。执行仍在提交后（R18b
+                # 领取守卫 + R19c 消费者）。
+                for pt in (pending_tasks or []):
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO pending_writes "
+                        "(task_id, kind, source_turn_id, payload_version, payload, status, "
+                        " attempts, attempts_total, next_attempt_at, lease_until, last_error, "
+                        " created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?, '', '', ?, ?)",
+                        (pt["task_id"], pt["kind"], pt.get("source_turn_id", ""),
+                         pt.get("payload_version", 1),
+                         json.dumps(pt.get("payload", {}), ensure_ascii=False),
+                         now, now, now),
                     )
                 # ⑥ 回执：COMMIT 成功才算正式历史（8.11.3 原子边界 3）
                 self._conn.execute(
@@ -991,6 +1008,19 @@ class SQLiteStorage:
             "next_attempt_at": row[8], "lease_until": row[9],
             "last_error": row[10], "created_at": row[11], "updated_at": row[12],
         }
+
+    def finish_pending(self, task_id: str, now: str = "") -> bool:
+        """应用成功：标 done。消费者/执行守卫共用的收口。"""
+        from datetime import datetime as _dt
+
+        now = now or _dt.now().isoformat(timespec="seconds")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE pending_writes SET status='done', lease_until='', updated_at=? "
+                "WHERE task_id = ?",
+                (now, task_id),
+            )
+            return cur.rowcount > 0
 
     def requeue_pending(self, task_id: str, now: str) -> bool:
         """人工重新入队：当前预算清零（attempts_total 审计保留），立即到期。"""

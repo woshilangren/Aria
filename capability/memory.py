@@ -31,25 +31,32 @@ from tools.misc import ClockTool, parse_llm_json
 logger = logging.getLogger("aria")
 
 
-def _enqueue_retry(kind: str, payload: dict) -> None:
-    """J12"静默遗忘需要补偿队列"的挂点：记忆写入类失败在这里落待重试标记。
+def _enqueue_retry(kind: str, payload: dict, source_turn_id: str = "") -> bool:
+    """J12"静默遗忘需要补偿队列"的挂点——R19b 起落**真表**（pending_writes）。
 
-    队列表归 data 层（迁移机制在别的批次落地），所以只探测门面有没有
-    enqueue_retry(kind, payload_json)：有就入队等巡检消费；没有就退化成一条
-    带内容的告警日志——宁可吵，不可哑（本项目已发生三次"吞异常=功能静默死亡"）。
+    - task_id 确定性构造：vector_memory 用 MemoryItem 的稳定 memory_id
+      （重试复用同一载荷与稳定 ID，绝不重新编一份覆盖）；其余按 payload
+      内容哈希——同语义任务重放天然幂等。
+    - 返回 True=已入队（或早已在队，幂等）；False/异常=**存储也坏了**，
+      调用方必须按"无法恢复"告警，绝不谎称已经排队。
     """
     try:
-        from data.sqlite_store import get_db
-
-        enqueue = getattr(get_db(), "enqueue_retry", None)
-        if callable(enqueue):
-            enqueue(kind, json.dumps(payload, ensure_ascii=False)[:2000])
-            return
+        if kind == "vector_memory" and payload.get("memory_id"):
+            task_id = f"vm-{payload['memory_id']}"
+        else:
+            digest = hashlib.sha1(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:24]
+            task_id = f"{kind}-{digest}"
+        ok = services.get("kv_store").enqueue_pending(
+            task_id, kind, payload, source_turn_id=source_turn_id)
+        if not ok:
+            logger.info(f"[memory] 补偿任务已在队（{kind}/{task_id}），幂等跳过")
+        return True
     except Exception as exc:
-        logger.warning(f"[memory] 补偿队列写入失败（kind={kind}）: {exc}")
-        return
-    logger.warning(f"[memory] 补偿队列未落地，待重试留痕于此（kind={kind}）: "
-                   f"{json.dumps(payload, ensure_ascii=False)[:200]}")
+        logger.error(f"[memory] 补偿队列写入失败——该次更新**无法恢复**"
+                     f"（kind={kind}）: {exc}")
+        return False
 
 
 def remember_note(session_id: str, content: str, kind: str = "event",
@@ -248,10 +255,17 @@ class SessionMemoryKeeper:
             # J12：摘要失败不再"丢掉最老一半、当没发生过"——待办由调用方塞回重试，
             # 这里补一条持久化的待重试标记（静默遗忘需要补偿队列）
             logger.warning(f"[memory] 会话 {session_id} 摘要失败（{len(old_part)} 条待重试）: {exc}")
-            _enqueue_retry("session_summarize", {
-                "session_id": session_id, "n_msgs": len(old_part),
-                "head": old_text[:200],
+            # R19b：落**完整原文快照**——head[:200] 那种截断载荷重建不出摘要，
+            # 属于"看似排了队、实际丢了原文"。原文此刻还在内存里（old_part），
+            # 必须在它被丢弃前完整落待办；队列也坏就按"无法恢复"告警。
+            enqueued = _enqueue_retry("session_summarize", {
+                "session_id": session_id,
+                "msgs": [{"role": m.get("role"), "content": m.get("content", "")}
+                         for m in old_part],
             })
+            if not enqueued:
+                logger.error(f"[memory] 会话 {session_id} 摘要原文无法恢复："
+                             f"队列与内存双双失败（{len(old_part)} 条）")
             return False
         with self._lock:
             if needs_recompress:
