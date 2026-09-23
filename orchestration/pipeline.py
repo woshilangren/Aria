@@ -817,7 +817,9 @@ class DialoguePipeline:
                 request_digest=state.request_digest,
                 user_text=state.user_text,
                 assistant_text=state.canonical_text,
-                disposition="crisis" if (state.emotion and state.emotion.is_crisis) else "normal",
+                disposition=("crisis" if (state.emotion and state.emotion.is_crisis)
+                             else "degraded" if state.review_status == "unavailable"
+                             else "normal"),
                 source_review_status=state.review_status,
                 reason_code=state.reason_code,
                 intent=state.intent.intent if state.intent else "",
@@ -1094,6 +1096,11 @@ class DialoguePipeline:
             # 而兜底文本还会被写回记忆，污染"她说过什么"。降级行为本身是对的
             # （兜底哲学：聊天不能断），但**不能哑**——至少要留下来源与 traceback。
             _log_exc(f"_astream_chat 外部服务失败降级（{exc.source}/{exc.reason_code}）")
+            # R17b 补漏（真机记录04 实锤）：这条路径的兜底正文以前按正常轮提交，
+            # 还领关系增量——8.11.2 要求外部失败的兜底提交标 degraded。打上
+            # unavailable 标记，提交点据此分流。
+            state.review_status = "unavailable"
+            state.reason_code = exc.reason_code
             if streamer.emitted_content:
                 # 已经推过内容：接不上，按现有内容收尾
                 async for ev in self._emit_frags(streamer.finish(), state, handle, synthesize_voice, seq):

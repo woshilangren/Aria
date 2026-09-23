@@ -128,6 +128,58 @@ def test_pipeline_handle_does_not_crash(tmp_path, monkeypatch, register_services
     # 由下一条测试负责：那条不允许兜底，reply 必须一字不差等于脚本应答。
 
 
+def test_all_providers_down_commits_degraded_no_learning(register_services):
+    """R17b 补漏（真机记录04 实锤）：外部失败的本地模板兜底轮必须按 **degraded**
+    提交——历史落正式记录但零关系增量、零账本；不许冒充 normal 领更新资格。
+
+    修复前：_astream_chat 的 ExternalServiceError 处理器用本地 generate() 顶上
+    时没打降级标记，兜底轮按 normal 提交且 intimacy +1（真机 storage 复现）。
+    """
+    import asyncio
+    import sqlite3
+
+    from data.sqlite_store import get_db
+    from orchestration.pipeline import DialoguePipeline
+    from shared.types import ExternalServiceError
+    from tools.storage import KVStoreTool
+
+    class _AllProvidersDownLLM:
+        async def astream_chat(self, messages, **kwargs):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+            yield  # pragma: no cover
+
+        def chat(self, messages, temperature=None, max_tokens=None):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+
+        def chat_with_tools(self, messages, tools_catalog):  # noqa: ARG002
+            raise ExternalServiceError("llm", "all_providers_failed")
+
+    register_services(kv_store=KVStoreTool(), llm=_AllProvidersDownLLM())
+    sid = "b3-degraded-contract"
+    reply = asyncio.run(
+        DialoguePipeline().handle(InputMessage(text="你好", session_id=sid))
+    )
+    assert reply.text != "", "降级轮必须有人设兜底正文"
+
+    db = get_db()
+    rows = db._conn.execute(
+        "SELECT role, disposition, source_review_status, reason_code FROM chat_log "
+        "WHERE session_id = ?", (sid,)
+    ).fetchall()
+    assert rows, "降级轮也要落正式历史（对话发生过该留痕）"
+    assert all(r[1] == "degraded" for r in rows), f"必须是 degraded，实测 {rows}"
+    assert all(r[2] == "unavailable" for r in rows)
+    assert all(r[3] == "all_providers_failed" for r in rows)
+    rel = db._conn.execute(
+        "SELECT value FROM relationship WHERE session_id = ?", (sid,)
+    ).fetchone()
+    assert rel is None, "降级轮零关系增量（不许预创建/预增）"
+    ledger = db._conn.execute(
+        "SELECT * FROM affection_history WHERE session_id = ?", (sid,)
+    ).fetchall()
+    assert ledger == [], "降级轮零账本"
+
+
 def test_fake_llm_registers_and_handle_uses_services(monkeypatch, fake_services):
     """轻量版：只验 FakeLLM 被 services 注册后 services.get('llm') 能取回。"""
     from shared.singletons import services

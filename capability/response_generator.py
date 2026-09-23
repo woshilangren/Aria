@@ -26,7 +26,13 @@
 import random
 
 from shared.singletons import get_llm, services
-from shared.types import FinalReply, MemoryBundle, PromptPackage, ToolCallResult
+from shared.types import (
+    ExternalServiceError,
+    FinalReply,
+    MemoryBundle,
+    PromptPackage,
+    ToolCallResult,
+)
 
 from capability.quirks import _NEGATIVE_MOODS
 from capability.persona_engine import PersonaEngine
@@ -362,6 +368,11 @@ def persona_wrap(
 
     try:
         text = (get_llm().chat(messages) or "").strip()
+    except ExternalServiceError:
+        # R27b 窄载体向上放行（真机记录04 实锤）：工具轮的 LLM 全挂不许在这里
+        # 私了成兜底正文——那样该轮会按 normal 提交还领关系增量。放行给
+        # astream 的外部失败分流，按 degraded 提交（8.11.2）。
+        raise
     except Exception:
         text = ""
 
