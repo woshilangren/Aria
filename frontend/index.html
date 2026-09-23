@@ -1034,19 +1034,30 @@ let pcmCapHit = false;
 
 function setWsState(text) { const el = $("wsState"); if (el) el.textContent = "通道：" + text; }
 
+let wsGen = 0;    // R16b：连接代际——旧连接的迟到回调一律忽略，新通话不被旧回调关闭
+let wsHangup = false;  // R16b：用户主动挂断后不自动重连（有意建立的连接才清这个标记）
 function openVoiceWS() {
+  wsGen++;
+  const gen = wsGen;
+  wsHangup = false;  // 有意建连（新通话/按麦说话）即恢复自动重连资格
   setWsState("连接中…");
   const _tok = localStorage.getItem("ariaToken") || "";
-  ws = new WebSocket("/api/voice/stream" + (_tok ? "?token=" + encodeURIComponent(_tok) : ""));
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => { wsOpen = true; setWsState("已连接"); wsRetryDelay = 3000; wsNextRetry = 0; };
-  ws.onmessage = onVoiceMsg;
-  ws.onclose = ev => {
+  const sock = new WebSocket("/api/voice/stream" + (_tok ? "?token=" + encodeURIComponent(_tok) : ""));
+  ws = sock;
+  sock.binaryType = "arraybuffer";
+  sock.onopen = () => {
+    if (gen !== wsGen) { try { sock.close(); } catch (e) {} return; }  // 过期连接：直接关，不碰状态
+    wsOpen = true; setWsState("已连接"); wsRetryDelay = 3000; wsNextRetry = 0;
+  };
+  sock.onmessage = ev => { if (gen !== wsGen) return; onVoiceMsg(ev); };
+  sock.onclose = ev => {
+    if (gen !== wsGen) return;  // 旧连接的迟到 close 不许动新连接的状态
     wsOpen = false; setLive("off");
     // close code 是唯一的真相：1006 = 连接没建立成功（证书/网络被掐），1000 = 正常关闭
     setWsState("断开(" + (ev && ev.code ? ev.code : "?") + ")");
   };
-  ws.onerror = () => {
+  sock.onerror = () => {
+    if (gen !== wsGen) return;
     wsOpen = false; setLive("off"); setWsState("出错");
     // 别让错误悄悄吞掉：通话中直接把原因写到通话界面上，用户能告诉我发生了什么
     if (inCall) $("callTip").textContent = "语音通道出错，正在重连……";
@@ -1059,6 +1070,8 @@ function openVoiceWS() {
 // 改指数退避封顶 30 秒；连上就在 onopen 里复位，所以真断线时恢复速度不受影响。
 let wsRetryDelay = 3000, wsNextRetry = 0;
 setInterval(() => {
+  // R16b：用户主动挂断后不自动重连——挂断是"结束"，不是"掉线"
+  if (wsHangup) return;
   if (ws && !wsOpen && ws.readyState === WebSocket.CLOSED) {
     const now = Date.now();
     if (now < wsNextRetry) return;
@@ -1100,6 +1113,7 @@ async function onVoiceMsg(ev) {
 // 表现就是"通话里有回复文字但一点声音都没有"。解法是第一次按住说话时
 // 顺手解锁一个输出专用的 AudioContext，之后 WS 推来的语音都从它走，畅通。
 let outCtx = null;
+let audioEl = null;  // R16b：<audio> 兜底播放的当前实例（挂断停止用）
 function unlockOutput() {
   try {
     if (!outCtx) outCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1155,6 +1169,8 @@ async function playAudioBytes(buf) {
     const bk = new Blob([buf], { type: isWav ? "audio/wav" : "audio/mpeg" });
     const url = URL.createObjectURL(bk);
     const au = new Audio(url);
+    audioEl = au;  // R16b：挂断要能停掉正在播的兜底音频
+    au.onended = () => { if (audioEl === au) audioEl = null; };
     await au.play();
     setTimeout(() => URL.revokeObjectURL(url), 15000);
   } catch (e) {
@@ -1321,6 +1337,26 @@ window.addEventListener("beforeunload", releaseMic);
 
 // ========== 实时通话 ==========
 let inCall = false, callTimer = null, callSec = 0, callMuted = false, callCurrentRoute = "cascade";
+let callWaitWS = null;  // R16b：toggleCall 里等 WS 就绪的 interval，挂断时必须清——
+                        // 否则下一次通话会被旧回调重复开计时器
+
+// R16b：挂断路径专用——丢弃未提交的录音。绝不能复用 recStop 的"停止→发送"
+// 路径：用户挂断的意思是"这段作废"，把没说完的话发出去等于替用户做主。
+// 采集链路（audioCtx/micStream）保留：ensureMic 的复用语义与用户手势解锁不变。
+function discardRecording() {
+  if (!recording) return;
+  recording = false;
+  $("mic").classList.remove("mic-live"); $("recbar").classList.remove("on");
+  clearInterval(recTimer);
+  pcmChunks = []; pcmBytes = 0; pcmCapHit = false;
+}
+
+// R16b：挂断即停——正在播的回复音频立刻收摊。outCtx 关掉即停（下次播放自动
+// 重建，解锁语义不变）；<audio> 兜底实例暂停。
+function stopCallAudio() {
+  if (outCtx) { try { outCtx.close(); } catch (e) {} outCtx = null; }
+  if (audioEl) { try { audioEl.pause(); } catch (e) {} audioEl = null; }
+}
 let replyWatch = null, gotVoiceReply = true; // 假死看门狗：发了语音却等不到回话时明说
 
 async function setVoiceRoute(route) {
@@ -1368,9 +1404,11 @@ async function toggleCall() {
   callSec = 0;
   $("callTip").textContent = cur === "realtime" ? "实时专线：直连多模态，Aria会即时回话" : "普通语音：按一句Aria回一句（级联）";
   // 等 WS 就绪后开始计时、提示通话中
-  const waitWS = setInterval(() => {
+  if (callWaitWS) clearInterval(callWaitWS);
+  callWaitWS = setInterval(() => {
+    if (!inCall) { clearInterval(callWaitWS); callWaitWS = null; return; }  // R16b：过期等待不碰新状态
     if (wsOpen) {
-      clearInterval(waitWS);
+      clearInterval(callWaitWS); callWaitWS = null;
       $("callName").textContent = "Aria · 通话中";
       callTimer = setInterval(() => {
         callSec++;
@@ -1414,10 +1452,23 @@ async function callEnd() {
   $("callBtn").classList.remove("live");
   $("callOverlay").classList.remove("on");
   clearInterval(callTimer);
+  if (callWaitWS) { clearInterval(callWaitWS); callWaitWS = null; }
   // 不强制切回路由：保留用户自主选择的语音模式
   $("callMute").classList.remove("off");
   $("callMute").innerHTML = '<span class="ic">🔇</span>静音';
-  if (recording) recStop();
+  // R16b：挂断路径三件事——
+  // ① 丢弃未提交录音（走 discardRecording，绝不复用 recStop 的发送路径）；
+  // ② 停掉正在播的音频；
+  // ③ 关闭本次通话连接，且用户主动挂断不自动重连（wsHangup 挡住重连循环，
+  //    连接代际 ++ 让旧连接的迟到回调全部失效——新通话不被旧回调关闭）。
+  discardRecording();
+  stopCallAudio();
+  wsHangup = true;
+  if (ws) {
+    const sock = ws;
+    ws = null; wsOpen = false; wsGen++;
+    try { sock.close(1000, "hangup"); } catch (e) {}
+  }
 }
 
 // 关闭通话界面时若在通话中则结束
